@@ -1,0 +1,42 @@
+# 이 스택 전체의 프로젝트/리소스 이름 접두사
+name: stock_stack
+
+x-common: &common
+  build:
+    context: .
+  restart: always
+  env_file:
+    - ./config/.env
+  volumes:
+    - ./src:/app/src
+
+services:
+  integrated_manager:
+    <<: *common
+    container_name: my_trading_bot_integrated
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./output:/app/output
+    command: python /app/run_integrated_manager.py
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  background_risk_manager:
+    <<: *common
+    container_name: my_trading_bot_risk_manager
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./output:/app/output
+    command: python /app/run_background_risk_manager.py
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M

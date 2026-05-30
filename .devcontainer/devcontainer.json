@@ -1,0 +1,19 @@
+{
+  "name": "DS920 Trading Bot",
+  "dockerHost": "ssh://ds920-nas",
+  "image": "python:3.11",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=/volume1/docker/trading_bot,target=/workspace,type=bind",
+  "remoteUser": "root",
+  "forwardPorts": [8501],
+  "postCreateCommand": "pip install -U pip && if [ -f requirements.txt ]; then pip install -r requirements.txt; fi",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}

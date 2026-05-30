@@ -1,0 +1,212 @@
+{
+  "trading_environment": "prod",
+  "kis_limits": {
+    "max_rps": 3,
+    "max_concurrency": 2
+  },
+  "screener_params": {
+    "min_market_cap": 50000000000,
+    "min_trading_value_5d_avg": 200000000000,
+    "top_n": 10,
+    "fin_weight": 0.25,
+    "tech_weight": 0.35,
+    "mkt_weight": 0.1,
+    "sector_weight": 0.1,
+    "sector_cap": 0.35,
+    "sector_source_priority": ["kis", "pykrx"],
+    "max_market_cap": 50000000000000,
+    "vol_kki_weight": 0.05,
+    "pos_52w_weight": 0.05,
+    "exclude_newly_listed_days": 20,
+    "exclude_consecutive_up_days": 4,
+    "min_score_threshold": 0.52,
+    "require_positive_momentum": true,
+    "exclude_high_volatility": true,
+    "volatility_threshold": 0.75,
+    "min_history_bars": 50,
+    "affordability_filter": true,
+    "affordability_buffer": 0.05
+  },
+  "risk_params": {
+    "max_positions": 8,
+    "cooldown_period_days": 20,
+    "atr_period": 14,
+    "atr_k_stop": 2.0,
+    "reward_risk": 3.0,
+    "max_daily_loss_pct": 0.02,
+    "max_daily_loss_amount": 500000,
+    "stop_trading_on_consecutive_losses": 2,
+    "stop_pct": 0.03,
+    "cooldown_fail_threshold": 2,
+    "strategy_mode": "hybrid",
+    "enable_advanced_strategies": true,
+    "auto_sell": {
+      "enabled": true,
+      "stop_loss_pct": 0.045,
+      "target_pct": 0.07,
+      "partial_profit_pct": 0.025,
+      "partial_profit_ratio": 0.5,
+      "emergency_drop_pct": 0.03,
+      "direct_execute": true,
+      "cooldown_sec_per_ticker": 20
+    },
+    "rsi_take_profit": 82.0,
+    "prev_close_break_sell": false,
+    "rsi_min_profit_pct": 0.012,
+    "rsi_take_profit_early": 85.0,
+    "rsi_sell_strategy": {
+      "enabled": false,
+      "warning_level": 75.0,
+      "sell_candidate_level": 80.0,
+      "full_exit_level": 70.0,
+      "confirm_conditions_required": 2,
+      "mode": "partial",
+      "partial_ratio": 0.3,
+      "check_divergence": true,
+      "check_trend_weakening": true,
+      "check_volume_weakening": true
+    }
+  },
+  "gpt_params": {
+    "openai_model": "gpt-4o-mini",
+    "budget_guard": true,
+    "max_entry_price_ratio": 0.2,
+    "analysis_expansion": {
+      "enabled": true,
+      "max_primary_candidates": 10,
+      "max_total_analysis": 15
+    }
+  },
+  "strategy_params": {
+    "stop_loss_pct": 0.03,
+    "take_profit_pct": 0.06,
+    "atr_k_stop": 2.5,
+    "atr_k_profit": 4.0,
+    "strategy_weights": {
+      "RsiReversalStrategy": 0.6,
+      "TrendFollowingStrategy": 0.8,
+      "AdvancedTechnicalStrategy": 0.6,
+      "DynamicAtrStrategy": 0.7,
+      "BaseStrategy": 0.5
+    },
+    "sell_threshold": 1.0
+  },
+  "trading_params": {
+    "buy_enabled": true,
+    "allow_rebuy": false,
+    "max_legs_per_ticker": 1,
+    "post_partial_sell_buy_cooldown_days": 5,
+    "partial_sell_flag_ttl_days": 7,
+    "per_ticker_max_weight": 0.12,
+    "min_holding_hours": 72,
+    "min_order_cash": 50000,
+    "rebuy_atr_k": 0.5,
+    "rebuy_rsi_ceiling": 72.0,
+    "cash_buffer_ratio": 0.02,
+    "min_cash_reserve": 0,
+    "dynamic_cash_management": {
+      "enabled": true,
+      "market_regime_adjustment": {
+        "bull_market": 0.1,
+        "sideways_market": 0.15,
+        "bear_market": 0.35,
+        "volatile_market": 0.3
+      },
+      "volatility_threshold": 0.25,
+      "rebalance_frequency_hours": 6
+    },
+    "buy_time_windows": ["09:10-13:00"],
+    "sell_time_windows": ["09:05-15:10"],
+    "split_buy": {
+      "enabled": false,
+      "slices": 5,
+      "weights": [0.4, 0.3, 0.15, 0.1, 0.05],
+      "ladder_ticks": [0, 1, 2, 3, 4],
+      "interval_sec": 0.3,
+      "jitter_sec": 0.1,
+      "min_qty": 200,
+      "min_cash_per_slice": 30000
+    },
+    "fee_buffer_pct": 0.003,
+    "retry_on_reject": true,
+    "max_retries": 2,
+    "retry_delay_ms": 400,
+    "slippage_bps": 10,
+    "commission_rate": 0.00015,
+    "securities_tax_rate": 0.0023,
+    "agricultural_tax_rate": 0.0015,
+    "slippage_rate": 0.001,
+    "order_execution": {
+      "execution_timeout_sec": 45,
+      "execution_check_interval": 2,
+      "execution_check_retries": 5,
+      "dynamic_tick_enabled": true,
+      "max_tick_adjustment": 3,
+      "market_order_fallback": true,
+      "retry_on_partial_execution": true,
+      "low_priority_threshold": 2,
+      "cancel_pendings_before_fallback": true,
+      "confirm_previous_done": true,
+      "fallback_only_remaining_qty": true,
+      "split_timebox_sec": 20,
+      "split_step_min_delay_sec": 1.0
+    }
+  },
+  "notifications": {
+    "discord_cooldown_sec": 60,
+    "snapshot_change_threshold_pct": 1.0
+  },
+  "trading_guards": {
+    "auto_shrink_slots": true,
+    "min_total_cash_to_trade": 100000,
+    "skip_when_low_funds": true,
+    "enforce_per_ticker_limit": true
+  },
+  "reporting": {
+    "coherent_summary": true,
+    "include_cash_breakdown": true
+  },
+  "prompting": {
+    "core_questions": true
+  },
+  "rotation": {
+    "enabled": false,
+    "min_holding_days": 10,
+    "delta_score_min": 0.12
+  },
+  "daily_summary": {
+    "enabled": true,
+    "balance_open_time": "09:00",
+    "balance_close_time": "15:30",
+    "summary_send_time": "15:35"
+  },
+  "schedule_times": {
+    "screener_time": "09:10",
+    "pipeline_time": "10:15"
+  },
+  "monthly_maintenance": {
+    "day": 1,
+    "time": "16:00"
+  },
+  "integrated_analysis": {
+    "enabled": true,
+    "gpt_weight": 0.65,
+    "internal_weight": 0.35,
+    "respect_gpt_hold": true,
+    "enhanced_logging": true,
+    "log_gpt_rotation_suggestions": true,
+    "min_confidence_for_rotation": 0.9,
+    "decision_transparency": {
+      "enabled": true
+    }
+  },
+  "rebalance_params": {
+    "use_gpt_analysis": true,
+    "screener_top_n": 10,
+    "min_score_threshold": 0.7
+  },
+  "batch_execution_check": {
+    "enabled": true,
+    "check_time": "15:20"
+  }
+}

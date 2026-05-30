@@ -1,0 +1,43 @@
+# Secrets & local config
+config/.env
+.env
+*.env.local
+config/kis_devlp.yaml
+
+# Runtime output (pipeline writes here at run time)
+output/*
+!output/.gitkeep
+
+# Database & caches
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.mst
+
+# Logs & debug artifacts
+*.log
+*.csv
+
+# Tests (local only)
+tests/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Docker local overrides
+docker-compose.override.yml
