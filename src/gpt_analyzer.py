@@ -1377,7 +1377,7 @@ def get_gpt_enhanced_rebalance_candidates(
     
     if not gpt_analysis:
         logger.warning("[DEBUG] GPT 분석 실패 - 기존 로직으로 폴백")
-        return fallback_rebalance_logic(holdings, all_stock_data)
+        return fallback_rebalance_logic(holdings, all_stock_data, settings)
     
     # 3. GPT 분석 결과 파싱 및 적용
     to_sell_list, to_buy_plans = parse_gpt_rebalance_decisions(
@@ -1390,62 +1390,77 @@ def get_gpt_enhanced_rebalance_candidates(
     
     return to_sell_list, to_buy_plans
 
-def fallback_rebalance_logic(holdings: List[Dict], all_stock_data: Dict) -> Tuple[List[Dict], List[Dict]]:
-    """GPT 실패 시 기존 로직으로 폴백"""
-    logger.info("[FALLBACK] GPT 분석 실패 - 기존 점수 기반 리밸런싱 사용")
-    
-    # trader.py의 _determine_rebalance_swaps 로직을 직접 구현
-    # (순환 import 방지를 위해 여기서 직접 구현)
+def fallback_rebalance_logic(
+    holdings: List[Dict],
+    all_stock_data: Dict,
+    settings: Optional[Dict] = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    """GPT 실패 시 점수 기반 폴백 (rotation.delta_score_min·rebalance_params 정합)."""
+    from rotation_policy import delta_score_min
+
+    logger.info("[FALLBACK] GPT 분석 실패 - 점수 기반 리밸런싱 사용")
+    cfg = settings or {}
+    delta_thr = delta_score_min(cfg)
+    min_candidate = float((cfg.get("rebalance_params") or {}).get("min_score_threshold", 0.6))
+
     try:
-        # 간단한 점수 기반 리밸런싱 로직
-        # 보유 종목에서 점수가 낮은 종목을 매도 대상으로 선정
-        to_sell_list = []
-        to_buy_plans = []
-        
-        # 보유 종목 점수 기준 정렬 (낮은 점수부터)
+        to_sell_list: List[Dict] = []
+        to_buy_plans: List[Dict] = []
+
         holdings_with_scores = []
         for h in holdings:
-            score = float(h.get("current_score", 0.0))
+            score = float(h.get("current_score", h.get("fin_score", 0.0)) or 0.0)
             if score > 0:
                 holdings_with_scores.append((h, score))
-        
         holdings_with_scores.sort(key=lambda x: x[1])
-        
-        # 상위 후보 선정 (점수 기준)
+
         candidates = []
+        held = {str(h.get("pdno", "")).zfill(6) for h in holdings}
         for ticker, data in all_stock_data.items():
+            if str(ticker).zfill(6) in held:
+                continue
             score = float(data.get("Score", 0.0))
-            if score > 0.6:  # 최소 점수 임계치
+            if score >= min_candidate:
                 candidates.append(data)
-        
         candidates.sort(key=lambda x: float(x.get("Score", 0.0)), reverse=True)
-        
-        # 매칭 로직 (간단한 구현)
-        max_pairs = min(len(holdings_with_scores), len(candidates), 3)
-        for i in range(max_pairs):
-            if i < len(holdings_with_scores) and i < len(candidates):
-                holding, old_score = holdings_with_scores[i]
-                candidate = candidates[i]
-                new_score = float(candidate.get("Score", 0.0))
-                
-                # 점수 차이가 충분한 경우에만 매칭
-                if new_score - old_score > 0.1:
-                    to_sell_list.append({
-                        "ticker": str(holding.get("pdno", "")).zfill(6),
-                        "name": holding.get("prdt_name", "N/A"),
-                        "qty": holding.get("hldg_qty", 0),
-                        "reason": f"점수 하락 ({old_score:.3f} → {new_score:.3f})"
-                    })
-                    to_buy_plans.append({
-                        "stock_info": candidate,
-                        "reason": f"점수 상승 ({new_score:.3f})"
-                    })
-        
-        logger.debug(f"[FALLBACK] 폴백 리밸런싱 완료 - 매도: {len(to_sell_list)}건, 매수: {len(to_buy_plans)}건")
+
+        for holding, old_score in holdings_with_scores:
+            if not candidates:
+                break
+            candidate = candidates.pop(0)
+            new_score = float(candidate.get("Score", 0.0))
+            if new_score - old_score < delta_thr:
+                break
+            ticker = str(holding.get("pdno", "")).zfill(6)
+            qty = int(holding.get("hldg_qty", 0) or 0)
+            pr = int(holding.get("prpr", 0) or 0)
+            to_sell_list.append({
+                "ticker": ticker,
+                "name": holding.get("prdt_name", "N/A"),
+                "qty": qty,
+                "old_score": old_score,
+                "new_score": new_score,
+                "score_delta": new_score - old_score,
+                "new_ticker": str(candidate.get("Ticker", "")).zfill(6),
+                "est_proceeds": pr * qty,
+                "reason": f"점수 교체 ({old_score:.3f} → {new_score:.3f})",
+            })
+            to_buy_plans.append({
+                "stock_info": candidate,
+                "reason": f"점수 상승 ({new_score:.3f})",
+            })
+            break
+
+        logger.debug(
+            "[FALLBACK] 폴백 리밸런싱 완료 - 매도: %d건, 매수: %d건 (Δ≥%.2f)",
+            len(to_sell_list),
+            len(to_buy_plans),
+            delta_thr,
+        )
         return to_sell_list, to_buy_plans
-        
+
     except Exception as e:
-        logger.error(f"폴백 리밸런싱 실패: {e}")
+        logger.error("폴백 리밸런싱 실패: %s", e)
         return [], []
 
 if __name__ == "__main__":

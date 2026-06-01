@@ -48,6 +48,11 @@ from api.kis_auth import KIS
 from risk_manager import RiskManager
 from settings import settings
 from rotation_manager import RotationManager
+from rotation_policy import (
+    apply_rotation_policy,
+    max_pairs_per_run,
+    pair_gpt_rebalance_lists,
+)
 
 # recorder: DB 초기화/기록 + 마지막 매수 조회(FIFO 연결)
 from recorder import (
@@ -285,8 +290,8 @@ class Trader:
         self.post_partial_sell_buy_cooldown_days = int(self.trading_params.get("post_partial_sell_buy_cooldown_days", 1))
         self.partial_sell_flag_ttl_days = int(self.trading_params.get("partial_sell_flag_ttl_days", 7))
 
-        # 회전 중복 방지 셋
-        # 회전 매매 상태는 RotationManager에서 관리
+        # 회전 매매: run_buy_logic 1회당 최대 페어 수 (rotation.max_pairs_per_run)
+        self._rotation_pairs_done_this_run = 0
 
         # 런타임 ID
         self.run_id = os.getenv("RUN_ID") or (datetime.now(KST).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
@@ -1825,6 +1830,37 @@ class Trader:
         """config.json의 rotation.enabled 값을 안전하게 확인한다."""
         return bool((self.settings.get("rotation") or {}).get("enabled", False))
 
+    def _rotation_quota_remaining(self) -> int:
+        cap = max_pairs_per_run(self.settings)
+        return max(0, cap - int(self._rotation_pairs_done_this_run))
+
+    def _consume_rotation_quota(self, count: int = 1) -> None:
+        self._rotation_pairs_done_this_run += max(0, int(count))
+
+    def _finalize_rotation_candidates(
+        self,
+        to_sell_list: List[Dict],
+        to_buy_plans: List[Dict],
+        usable_cash: int,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """공통 정책(최소 보유일·Δscore·비용) 적용 후 남은 회전 한도만큼만 반환."""
+        limit = self._rotation_quota_remaining()
+        if limit <= 0 or not to_sell_list or not to_buy_plans:
+            return [], []
+        market_state = getattr(self.rotation_manager, "_current_market_state", None)
+        analyzer = getattr(self.rotation_manager, "market_analyzer", None)
+        to_buy, to_sell = apply_rotation_policy(
+            to_sell_list,
+            to_buy_plans,
+            self.settings,
+            usable_cash=usable_cash,
+            max_pairs=limit,
+            market_state=market_state,
+            market_analyzer=analyzer,
+            check_economics=True,
+        )
+        return to_sell, to_buy
+
     def try_rotation(self, candidates: List[Dict[str, Any]], holdings: List[Dict[str, Any]], usable_cash: int) -> bool:
         """
         회전 매매 시도 (RotationManager 위임)
@@ -1834,7 +1870,13 @@ class Trader:
         if not self._is_rotation_enabled():
             logger.info("회전 매매 비활성화(rotation.enabled=false) → 회전 매매 시도 생략")
             return False
-        return self.rotation_manager.try_rotation(candidates, holdings, usable_cash)
+        if self._rotation_quota_remaining() <= 0:
+            logger.info("이번 매수 사이클 회전 한도 소진 → try_rotation 생략")
+            return False
+        ok = self.rotation_manager.try_rotation(candidates, holdings, usable_cash)
+        if ok:
+            self._consume_rotation_quota(1)
+        return ok
     
     def get_rotation_performance(self) -> Dict[str, Any]:
         """회전 매매 성과 조회"""
@@ -3626,94 +3668,50 @@ class Trader:
         return validated
     # Phase 1: 최소 보유기간 체크 로직은 utils.check_min_holding_period로 통일됨
 
-    def _get_enhanced_rebalance_candidates(self, holdings: List[Dict], gpt_decisions: Dict) -> List[Dict]:
-        """향상된 리밸런싱 후보 선정 (GPT 분석 반영)"""
+    def _get_enhanced_rebalance_candidates(
+        self,
+        holdings: List[Dict],
+        gpt_decisions: Dict,
+        usable_cash: int = 0,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """리밸런싱 후보: GPT 우선, 실패 시에만 점수 기반 폴백 + 공통 정책."""
         self._log_analysis_step("리밸런싱 후보 선정 시작")
-        logger.debug(f"[DEBUG] 리밸런싱 시작 - 보유종목: {len(holdings)}개, GPT분석: {len(gpt_decisions)}개")
-        
-        # GPT 기반 리밸런싱 사용 여부 확인
+        logger.debug(
+            "[DEBUG] 리밸런싱 시작 - 보유 %d, GPT분석 %d",
+            len(holdings),
+            len(gpt_decisions),
+        )
+
+        to_sell_list: List[Dict] = []
+        to_buy_plans: List[Dict] = []
         use_gpt_rebalance = self.settings.get("rebalance_params", {}).get("use_gpt_analysis", True)
-        
+        gpt_used = False
+
         if use_gpt_rebalance:
-            logger.debug(f"[DEBUG] GPT 기반 리밸런싱 모드 활성화")
             try:
-                # gpt_analyzer.py의 함수 호출
                 to_sell_list, to_buy_plans = get_gpt_enhanced_rebalance_candidates(
-                    holdings, 
-                    self.all_stock_data, 
-                    self.settings
+                    holdings,
+                    self.all_stock_data,
+                    self.settings,
                 )
-                
-                # 데이터 검증 및 정리
-                logger.debug(f"[DEBUG] GPT 리밸런싱 데이터 검증 시작")
                 to_sell_list = self._validate_to_sell_list(to_sell_list)
                 to_buy_plans = self._validate_to_buy_plans(to_buy_plans)
-                logger.debug(f"[DEBUG] GPT 리밸런싱 데이터 검증 완료 - 매도: {len(to_sell_list)}건, 매수: {len(to_buy_plans)}건")
-                
+                to_sell_list, to_buy_plans = pair_gpt_rebalance_lists(to_sell_list, to_buy_plans)
+                gpt_used = bool(to_sell_list and to_buy_plans)
             except Exception as e:
-                logger.error(f"GPT 기반 리밸런싱 실패: {e}", exc_info=True)
-                logger.info("[FALLBACK] GPT 리밸런싱 실패 - 기존 점수 기반 리밸런싱으로 폴백")
-                to_sell_list, to_buy_plans = fallback_rebalance_logic(holdings, self.all_stock_data)
-        else:
-            logger.debug(f"[DEBUG] 기존 점수 기반 리밸런싱 모드")
-            # 기존 로직 사용
-            to_sell_list, to_buy_plans = self._determine_rebalance_swaps([], holdings)
-            
-            # 원본 데이터 로깅
-            for i, item in enumerate(to_sell_list):
-                logger.debug(f"[DEBUG] 원본 매도 {i}: {item}")
-            for i, plan in enumerate(to_buy_plans):
-                stock_info = plan.get("stock_info", {})
-                logger.debug(f"[DEBUG] 원본 매수 {i}: {stock_info.get('Name', 'N/A')}({stock_info.get('Ticker', 'N/A')})")
-            
-            # 데이터 검증 및 정리
-            logger.debug(f"[DEBUG] 데이터 검증 시작")
-            to_sell_list = self._validate_to_sell_list(to_sell_list)
-            to_buy_plans = self._validate_to_buy_plans(to_buy_plans)
-            logger.debug(f"[DEBUG] 데이터 검증 완료 - 매도: {len(to_sell_list)}건, 매수: {len(to_buy_plans)}건")
-            
-            # GPT 분석 결과 반영 (기존 로직)
-            if gpt_decisions:
-                logger.debug(f"[DEBUG] GPT 분석 결과 반영 시작 - {len(gpt_decisions)}개 분석")
-                # 매수 후보에 GPT 분석 결과 추가
-                enhanced_buy_plans = []
-                for plan in to_buy_plans:
-                    ticker = str(plan.get("stock_info", {}).get("Ticker", "")).zfill(6)
-                    logger.debug(f"[DEBUG] GPT 분석 확인 중: {ticker}")
-                    if ticker in gpt_decisions:
-                        gpt_info = gpt_decisions[ticker]
-                        plan["gpt_analysis"] = gpt_info
-                        plan["integrated_score"] = self._calculate_integrated_score(
-                            ticker, 
-                            plan.get("stock_info", {}).get("Score", 0.0),
-                            gpt_info.get("decision", "")
-                        )
-                        logger.debug(f"[DEBUG] GPT 분석 적용: {ticker} - {gpt_info.get('decision', 'N/A')} (통합점수: {plan['integrated_score']:.3f})")
-                        enhanced_buy_plans.append(plan)
-                    else:
-                        # GPT 분석 없는 종목은 내부 점수만 사용
-                        plan["integrated_score"] = plan.get("stock_info", {}).get("Score", 0.0)
-                        logger.debug(f"[DEBUG] GPT 분석 없음: {ticker} - 내부점수만 사용 (점수: {plan['integrated_score']:.3f})")
-                        enhanced_buy_plans.append(plan)
-                
-                # 통합 점수 기준으로 정렬
-                enhanced_buy_plans.sort(key=lambda x: x.get("integrated_score", 0.0), reverse=True)
-                to_buy_plans = enhanced_buy_plans
-                logger.debug(f"[DEBUG] GPT 분석 반영 완료 - 정렬된 매수계획: {len(to_buy_plans)}건")
-            else:
-                logger.debug(f"[DEBUG] GPT 분석 결과 없음 - 내부 점수만 사용")
-            
-            # GPT 보류 결정 반영
-            logger.debug(f"[DEBUG] GPT 보류 결정 필터링 시작")
-            original_count = len(to_buy_plans)
-            to_buy_plans = self._filter_gpt_hold_decisions(to_buy_plans)
-            filtered_count = original_count - len(to_buy_plans)
-            if filtered_count > 0:
-                logger.debug(f"[DEBUG] GPT 보류 결정으로 {filtered_count}건 제외")
-        
-        self._log_analysis_step(f"리밸런싱 후보 선정 완료: 매도 {len(to_sell_list)}건, 매수 {len(to_buy_plans)}건")
-        logger.debug(f"[DEBUG] 최종 리밸런싱 결과 - 매도: {len(to_sell_list)}건, 매수: {len(to_buy_plans)}건")
-        
+                logger.error("GPT 리밸런싱 실패: %s", e, exc_info=True)
+
+        if not gpt_used:
+            logger.info("[FALLBACK] GPT 미사용/실패 → 점수 기반 리밸런싱")
+            to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)
+
+        to_sell_list, to_buy_plans = self._finalize_rotation_candidates(
+            to_sell_list, to_buy_plans, usable_cash
+        )
+
+        self._log_analysis_step(
+            f"리밸런싱 후보 선정 완료: 매도 {len(to_sell_list)}건, 매수 {len(to_buy_plans)}건"
+        )
         return to_sell_list, to_buy_plans
 
     def _log_decision_transparency(self, to_sell_list: List[Dict], to_buy_plans: List[Dict], gpt_decisions: Dict):
@@ -3937,6 +3935,7 @@ class Trader:
             return
         
         logger.info(f"--------- 신규/추가 매수 로직 실행 (가용 예산: {available_cash:,} 원) ---------")
+        self._rotation_pairs_done_this_run = 0
 
         # Phase 2: 일일 손실 제한 체크
         daily_loss_ok, daily_loss_msg = self._check_daily_loss_limit()
@@ -4440,23 +4439,33 @@ class Trader:
                 logger.info("신규 슬롯 없음 & 회전매매 비활성화(rotation.enabled=false) → 신규 매수 생략")
                 return
 
-            # 보유 최저 점수 vs 신규 후보 비교 → 교체(리밸런싱)
+            if self._rotation_quota_remaining() <= 0:
+                logger.info("이번 매수 사이클 회전 한도(%d페어) 소진 → 리밸런싱 스킵",
+                            max_pairs_per_run(self.settings))
+                return
+
             logger.info("=== 회전 매매(리밸런싱) 시작 ===")
-            
-            # GPT 분석 결과 로드
+            try:
+                self.rotation_manager._current_market_state = (
+                    self.rotation_manager.market_analyzer.analyze_market_state()
+                )
+            except Exception as e:
+                logger.warning("리밸런싱용 시장 분석 실패: %s", e)
+
             gpt_decisions = self._load_gpt_analysis_results()
-            
-            # 통합 분석 시스템 사용
-            if self.integrated_analysis.get("enabled", True):
-                try:
-                    to_sell_list, to_buy_plans = self._get_enhanced_rebalance_candidates(holdings, gpt_decisions)
-                except Exception as e:
-                    logger.error(f"향상된 리밸런싱 후보 선정 실패: {e}", exc_info=True)
-                    # 폴백: 기존 로직 사용
-                    to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)
-            else:
-                # 기존 로직 (하위 호환성)
+            to_sell_list: List[Dict] = []
+            to_buy_plans: List[Dict] = []
+            try:
+                to_sell_list, to_buy_plans = self._get_enhanced_rebalance_candidates(
+                    holdings, gpt_decisions, available_cash
+                )
+            except Exception as e:
+                logger.error("리밸런싱 후보 선정 실패: %s", e, exc_info=True)
                 to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)
+                to_sell_list, to_buy_plans = self._finalize_rotation_candidates(
+                    to_sell_list, to_buy_plans, available_cash
+                )
+
             if to_sell_list:
                 logger.info(f"회전 매매 대상 발견: 매도 {len(to_sell_list)}건, 매수 {len(to_buy_plans)}건")
                 
@@ -4554,10 +4563,12 @@ class Trader:
                         
                         _execute_buy_batch(buy_now, batch_name="REBALANCE_NEW")
                         logger.info("회전 매매 매수 완료")
+                        self._consume_rotation_quota(1)
                         logger.info("=== 회전 매매(리밸런싱) 완료 ===")
                     else:
                         logger.info("리밸런스 이후에도 신규 슬롯이 없어 매수 생략.")
                         _notify_text("ℹ️ 리밸런스 후 신규 슬롯 0 → 매수 생략", key=f"phase:rebalance_no_slots_after:{self.run_id}", cooldown=120)
+                        self._consume_rotation_quota(1)
                         logger.info("=== 회전 매매(리밸런싱) 완료 ===")
             else:
                 logger.info("회전 매매 기준을 충족하는 교체 대상이 없어 신규 매수는 생략합니다.")

@@ -170,9 +170,13 @@
     "core_questions": true
   },
   "rotation": {
-    "enabled": false,
+    "enabled": true,
     "min_holding_days": 10,
-    "delta_score_min": 0.12
+    "delta_score_min": 0.12,
+    "max_pairs_per_run": 1,
+    "use_dynamic_threshold": true,
+    "min_profit_rate": 0.02,
+    "min_cost_effectiveness": 2.0
   },
   "daily_summary": {
     "enabled": true,

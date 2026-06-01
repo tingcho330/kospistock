@@ -19,6 +19,7 @@
 2. [주요 기능](#2-주요-기능)
 3. [시스템 아키텍처](#3-시스템-아키텍처-및-데이터-흐름)
 4. [모듈 설명](#4-모듈-설명)
+   - [4.1 회전 매매 (Rotation)](#41-회전-매매-rotation)
 5. [기술 스택](#5-기술-스택)
 6. [파이프라인 사전 준비](#6-파이프라인-사전-준비)
 7. [설치 및 실행](#7-설치-및-실행)
@@ -56,6 +57,7 @@
 - **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·전략 믹서 기반 매도
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
+- **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
 ---
@@ -215,8 +217,9 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `recorder.py` | SQLite `trading_data.db`, upsert/backfill API |
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
-| `reviewer.py` | FIFO 손익·승률·`config.json` 자동 튜닝 (월간) |
-| `rotation_manager.py` | 회전 매매 (`rotation.enabled`) |
+| `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
+| `rotation_manager.py` | 현금 부족 시 회전 시도·시장 동적 임계값·실행 |
+| `trader.py` | 슬롯 꽉 참 시 리밸런싱·`run_buy_logic` 회전 한도 관리 |
 | `account.py` | 잔고·요약 JSON |
 | `cleanup_output.py` | 오래된 `output/` 정리 (월간) |
 
@@ -232,6 +235,95 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `db_debug.py` | DB 디버그 로그 (`DB_RECORD_DEBUG=1`) |
 | `api/kis_auth.py` | KIS 인증·토큰 캐시 |
 | `api/domestic_stock/domestic_stock_functions.py` | 시세·주문 REST 래퍼 |
+
+### 4.1 회전 매매 (Rotation)
+
+포트폴리오 **슬롯이 꽉 찼거나** (`max_positions`) **신규 매수 예산이 부족**할 때, 스크리너 점수가 낮은 보유 종목을 매도하고 고득점 후보를 매수하는 **리밸런싱(스왑)** 기능입니다.  
+기본값은 **비활성** (`rotation.enabled: false`)이며, 실전 적용 전 모의투자에서 충분히 검증하세요.
+
+#### 마스터 스위치
+
+| 설정 | 기본값 | 설명 |
+|------|--------|------|
+| `rotation.enabled` | `false` | `true`일 때만 회전·리밸런싱 실행. `false`이면 슬롯이 꽉 차도 신규 매수만 생략 |
+
+#### 진입 조건 (`trader.run_buy_logic`)
+
+| 상황 | 경로 | 설명 |
+|------|------|------|
+| 가용 현금 부족 + `screener_params.affordability_filter` | `RotationManager.try_rotation` | 1페어 스왑 시도 후 잔고 갱신·매수 재개 |
+| 보유 슬롯이 꽉 참 | GPT 리밸런싱 → 실패 시 점수 기반 | `_get_enhanced_rebalance_candidates` |
+
+한 번의 `run_buy_logic` 호출(매수 파이프라인 1회)당 **최대 1페어**만 실행합니다 (`rotation.max_pairs_per_run`, 기본 `1`).  
+`try_rotation`으로 이미 1회 회전했으면 같은 사이클에서 슬롯 리밸런싱은 **스킵**됩니다.
+
+#### 후보 선정 우선순위
+
+1. **`rebalance_params.use_gpt_analysis: true`** (기본) — GPT가 보유 vs 스크리너 상위 후보 비교 (`gpt_analyzer.get_gpt_enhanced_rebalance_candidates`)
+2. **GPT 실패·빈 결과 시에만** — `trader._determine_rebalance_swaps` (점수 최약 보유 ↔ 점수 최강 후보, 1:1 페어)
+
+GPT SELL/BUY 목록은 `pair_gpt_rebalance_lists`로 **1:1 페어**로 맞춘 뒤, 공통 정책을 적용합니다(고아 BUY/SELL 제거).
+
+#### 공통 정책 (`rotation_policy.py`)
+
+모든 경로는 실행 전 아래 검증을 **동일하게** 거칩니다.
+
+| 검증 | 설정·동작 |
+|------|-----------|
+| 최소 보유일 | `rotation.min_holding_days` (기본 `10`). **미충족 종목은 회전 매도 불가** — `RiskManager` 손절·RSI 익절 등과 동일한 `check_min_holding_period` 사용 |
+| 점수 차이 | `신규 점수 − 보유 점수 ≥ delta_score_min` (기본 `0.12`). `use_dynamic_threshold: true` 시 KOSPI 레짐·변동성에 따라 임계값 조정 |
+| 예산 | `(가용 현금 + 매도 예상 대금) × (1 − fee_buffer_pct)` 로 매수 1주 가격 감당 가능 |
+| 거래 비용 | `min_profit_rate`, `min_cost_effectiveness` — 순수익·비용 대비 효과 (`screener_core.calculate_net_profit_rotation`) |
+| 페어 상한 | `max_pairs_per_run` (기본 `1`) |
+
+리밸런싱 매도 전에는 **스왑 시뮬레이션**(매도 후 현금·슬롯으로 매수 1주 가능 여부)을 통과해야 실제 주문이 나갑니다.
+
+#### 설정 예시 (`config/config.json`)
+
+```json
+"rotation": {
+  "enabled": false,
+  "min_holding_days": 10,
+  "delta_score_min": 0.12,
+  "max_pairs_per_run": 1,
+  "use_dynamic_threshold": true,
+  "min_profit_rate": 0.02,
+  "min_cost_effectiveness": 2.0
+},
+"rebalance_params": {
+  "use_gpt_analysis": true,
+  "screener_top_n": 10,
+  "min_score_threshold": 0.7
+},
+"integrated_analysis": {
+  "enabled": true,
+  "min_confidence_for_rotation": 0.9
+}
+```
+
+| 키 | 구분 | 설명 |
+|----|------|------|
+| `rotation.*` | 회전 | 위 공통 정책·한도 |
+| `rebalance_params.min_score_threshold` | GPT 후보 | 리밸런싱용 스크리너 상위 후보 최소 점수 (기본 `0.7`) |
+| `screener_params.min_score_threshold` | 스크리너 | 1차 스크리닝 통과 최소 점수 (별도, 기본 `0.52` 등) |
+| `integrated_analysis.min_confidence_for_rotation` | 로그 | GPT 회전 **샌드박스 제안** 로그 필터용 (실행 경로 필터와는 별도) |
+
+#### 모듈 역할
+
+```
+trader.run_buy_logic
+  ├─ (현금 부족) rotation_manager.try_rotation  ─┐
+  └─ (슬롯 꽉 참)  _get_enhanced_rebalance_candidates ─┤
+                                                      ├→ rotation_policy.apply_rotation_policy
+                                                      └→ 매도(REBALANCE_SWAP / ROTATION_SWAP) → 매수
+```
+
+#### 단위 테스트
+
+```bash
+pip install -r requirements.txt
+PYTHONPATH=src python3 -m unittest tests.test_rotation_policy -v
+```
 
 ---
 
@@ -439,6 +531,8 @@ kospistock/
 │   └── kis_devlp.yaml           # 로컬 KIS 기본값 (Git 제외, 선택)
 ├── output/
 │   └── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
+├── tests/
+│   └── test_rotation_policy.py  # 회전 정책 단위 테스트
 ├── src/
 │   ├── api/
 │   │   ├── kis_auth.py
@@ -449,7 +543,8 @@ kospistock/
 │   ├── screener.py / screener_core.py / kis_master.py
 │   ├── health_check.py / news_collector.py / gpt_analyzer.py / trader.py
 │   ├── recorder.py / order_reconciler.py / reviewer.py
-│   ├── rotation_manager.py / account.py / strategies.py
+│   ├── rotation_policy.py / rotation_manager.py
+│   ├── account.py / strategies.py
 │   ├── settings.py / env_loader.py / utils.py / notifier.py
 │   ├── cleanup_output.py / db_debug.py
 │   └── ...
