@@ -33,6 +33,23 @@ try:
 except Exception:  # pragma: no cover
     pd = None
 
+
+def is_completed_sell(trade: Any) -> bool:
+    """체결 완료 매도 여부 (reviewer·집계 공통)."""
+    action = str(getattr(trade, "action", "")).upper()
+    if action != "SELL":
+        return False
+    status = str(getattr(trade, "order_status", "executed") or "").lower()
+    if status in ("pending", "partial", "cancelled", "failed", "submitted"):
+        return False
+    exe = int(getattr(trade, "executed_qty", 0) or 0)
+    qty = int(getattr(trade, "quantity", 0) or 0)
+    price = float(getattr(trade, "price", 0) or 0)
+    if exe > 0:
+        return True
+    return status == "executed" and qty > 0 and price > 0
+
+
 @dataclass
 class TradeRecord:
     """거래 기록"""
@@ -499,6 +516,11 @@ class DataRecorder:
                     order_status=order_status,
                     rows_affected=n,
                 )
+                if n and str(order_status).lower() == "executed":
+                    try:
+                        self.recompute_profit_loss_for_order_id(order_id)
+                    except Exception as pe:
+                        self.logger.debug(f"체결 후 PnL 재계산 스킵: {pe}")
                 return n
         except Exception as e:
             self.logger.error(f"order_status 업데이트 실패: {e}")
@@ -833,6 +855,35 @@ class DataRecorder:
             self.logger.error(f"시장 데이터 저장 실패: {e}")
             return False
     
+    @staticmethod
+    def _trade_record_from_row(row: tuple) -> TradeRecord:
+        """SQLite trade_records 행 → TradeRecord."""
+        order_status = (row[15] or "executed") if len(row) > 15 else "executed"
+        return TradeRecord(
+            timestamp=datetime.fromisoformat(row[1]),
+            ticker=row[2],
+            action=row[3],
+            quantity=row[4],
+            price=row[5],
+            amount=row[6],
+            commission=row[7],
+            tax=row[8],
+            total_cost=row[9],
+            net_amount=row[10],
+            profit_loss=float(row[11] or 0.0),
+            holding_period_days=row[12] or 0,
+            sector=row[13] or "",
+            market_regime=row[14] or "",
+            order_status=order_status,
+            order_id=(row[16] or "") if len(row) > 16 else "",
+            requested_qty=int(row[17] or 0) if len(row) > 17 else 0,
+            executed_qty=int(row[18] or 0) if len(row) > 18 else 0,
+            last_status_update_ts=(row[19] or "") if len(row) > 19 else "",
+            sell_reason=(row[20] or "") if len(row) > 20 else "",
+            reason_code=(row[21] or "") if len(row) > 21 else "",
+            structured_context=(row[22] or "") if len(row) > 22 else "",
+        )
+
     def get_trade_records(
         self, 
         start_date: Optional[datetime] = None,
@@ -840,7 +891,7 @@ class DataRecorder:
         ticker: Optional[str] = None,
         action: Optional[str] = None
     ) -> List[TradeRecord]:
-        """거래 기록 조회"""
+        """거래 기록 조회 (주문·사유 메타 포함)."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -862,39 +913,117 @@ class DataRecorder:
                 
                 if action:
                     query += " AND action = ?"
-                    params.append(action)
+                    params.append(action.upper())
                 
                 query += " ORDER BY timestamp DESC"
                 
                 cursor.execute(query, params)
                 rows = cursor.fetchall()
-                
-                trade_records = []
-                for row in rows:
-                    order_status = (row[15] or "executed") if len(row) > 15 else "executed"
-                    trade_records.append(TradeRecord(
-                        timestamp=datetime.fromisoformat(row[1]),
-                        ticker=row[2],
-                        action=row[3],
-                        quantity=row[4],
-                        price=row[5],
-                        amount=row[6],
-                        commission=row[7],
-                        tax=row[8],
-                        total_cost=row[9],
-                        net_amount=row[10],
-                        profit_loss=row[11],
-                        holding_period_days=row[12],
-                        sector=row[13],
-                        market_regime=row[14],
-                        order_status=order_status
-                    ))
-                
-                return trade_records
+                return [self._trade_record_from_row(row) for row in rows]
                 
         except Exception as e:
             self.logger.error(f"거래 기록 조회 실패: {e}")
             return []
+
+    def get_completed_sell_records(
+        self,
+        *,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> List[TradeRecord]:
+        """체결 완료된 매도만 조회 (reviewer·PnL 집계용)."""
+        trades = self.get_trade_records(start_date=start_date, end_date=end_date, action="SELL")
+        out = [t for t in trades if is_completed_sell(t)]
+        return out[: int(limit)]
+
+    def compute_fifo_sell_pnl(
+        self,
+        *,
+        ticker: str,
+        sell_qty: int,
+        sell_price: float,
+        sell_timestamp: Optional[datetime] = None,
+    ) -> Tuple[float, int]:
+        """매도 1건에 대한 FIFO 손익·보유일수 (가장 최근 선행 매수 기준)."""
+        ticker = str(ticker).zfill(6)
+        sell_qty = int(sell_qty)
+        sell_price = float(sell_price)
+        if sell_qty <= 0 or sell_price <= 0:
+            return 0.0, 0
+
+        all_trades = self.get_trade_records(ticker=ticker)
+        buys = [
+            t for t in all_trades
+            if str(t.action).upper() == "BUY"
+            and int(t.quantity or 0) > 0
+            and float(t.price or 0) > 0
+        ]
+        if sell_timestamp is not None:
+            buys = [b for b in buys if b.timestamp <= sell_timestamp]
+        if not buys:
+            return 0.0, 0
+
+        last_buy = sorted(buys, key=lambda x: x.timestamp)[-1]
+        buy_price = float(last_buy.price)
+        pnl = (sell_price - buy_price) * sell_qty
+        hold_days = 0
+        if sell_timestamp is not None:
+            hold_days = max(0, (sell_timestamp - last_buy.timestamp).days)
+        return round(pnl, 2), hold_days
+
+    def recompute_profit_loss_for_order_id(self, order_id: str) -> int:
+        """체결 매도 행의 profit_loss·holding_period_days 재계산."""
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, timestamp, ticker, action, quantity, price, executed_qty, order_status
+                    FROM trade_records WHERE order_id = ? LIMIT 1
+                    """,
+                    (order_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return 0
+            row_id, ts, ticker, action, qty, price, exe_qty, status = row
+            if str(action).upper() != "SELL":
+                return 0
+            if str(status or "").lower() not in ("executed", "completed", "partial"):
+                return 0
+            sell_qty = int(exe_qty or qty or 0)
+            sell_price = float(price or 0)
+            if sell_qty <= 0 or sell_price <= 0:
+                return 0
+            sell_ts = datetime.fromisoformat(ts) if ts else None
+            pnl, hold_days = self.compute_fifo_sell_pnl(
+                ticker=str(ticker),
+                sell_qty=sell_qty,
+                sell_price=sell_price,
+                sell_timestamp=sell_ts,
+            )
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE trade_records
+                    SET profit_loss = ?, holding_period_days = ?
+                    WHERE id = ?
+                    """,
+                    (pnl, hold_days, int(row_id)),
+                )
+                n = cur.rowcount
+                conn.commit()
+            if n:
+                self.logger.info(f"매도 PnL 재계산: {ticker} order_id={order_id} pnl={pnl:,.0f}")
+            return n
+        except Exception as e:
+            self.logger.error(f"PnL 재계산 실패 order_id={order_id}: {e}")
+            return 0
     
     def get_portfolio_snapshots(
         self,

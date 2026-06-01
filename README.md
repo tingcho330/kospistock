@@ -164,6 +164,20 @@ Git에는 `output/.gitkeep`만 추적합니다.
 
 > 컨테이너 이미지에 `sqlite3` CLI가 없습니다. DB 확인은 아래 [7.3](#73-수동--단발-실행) Python 예시를 사용하세요.
 
+### 3.8 GPT 월간 회고 (`reviewer.py`)
+
+| 항목 | 내용 |
+|------|------|
+| 스케줄 | 월 1회 유지보수 (`reviewer.py` → `cleanup_output.py`) |
+| 입력 | 체결 매도 승패·`sell_reason`/`structured_context`·포트폴리오 스냅샷·`gpt_trades_*.json` 대조·코스피 뉴스 |
+| 출력 | `config.json` 튜닝 제안, `output/review_log.json`, Discord 요약 |
+| 최소 표본 | `REVIEWER_MIN_SELL_TRADES`(기본 10) 체결 매도 — 미만 시 skip (`REVIEWER_ALLOW_PARTIAL=1`이면 보수 GPT) |
+
+```bash
+# 수동 회고 (드라이런)
+REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manager python -u /app/src/reviewer.py
+```
+
 ### 3.6 KIS API 계층
 
 `api/kis_auth.KIS` → `api/domestic_stock/domestic_stock_functions.DomesticStock`  
@@ -200,6 +214,7 @@ Git에는 `output/.gitkeep`만 추적합니다.
 |------|------|
 | `recorder.py` | SQLite `trading_data.db`, upsert/backfill API |
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
+| `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
 | `reviewer.py` | FIFO 손익·승률·`config.json` 자동 튜닝 (월간) |
 | `rotation_manager.py` | 회전 매매 (`rotation.enabled`) |
 | `account.py` | 잔고·요약 JSON |
@@ -402,6 +417,11 @@ python run_integrated_manager.py --once
 | `LOG_LEVEL` | `DEBUG` / `INFO` (기본 `INFO`) |
 | `DB_RECORD_DEBUG` | `1` 시 DB 기록 추적 로그 (`[DB_DEBUG]`) |
 | `DB_DEBUG_LOG_FILE` | DB 디버그 로그 경로 (기본 `output/debug/db_record_debug.log`) |
+| `REVIEWER_LOOKBACK_DAYS` | 회고 조회 기간(일, 기본 30) |
+| `REVIEWER_MIN_SELL_TRADES` | 체결 매도 최소 건수 (기본 10, 구 `REVIEWER_MIN_TRADES` 호환) |
+| `REVIEWER_ALLOW_PARTIAL` | `1`이면 표본 부족해도 보수 GPT 회고 |
+| `REVIEWER_MAX_DIGEST` | GPT 프롬프트 매도 샘플 상한 (기본 15) |
+| `REVIEWER_DRY_RUN` | `1`이면 config 미적용 |
 | `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃(초) |
 | `SCRIPT_TIMEOUT_SEC` | 기타 스크립트 타임아웃 |
 

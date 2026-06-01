@@ -367,19 +367,261 @@ TUNABLE_SECTIONS = ("screener_params", "risk_params", "strategy_params")
 DEFAULT_MAX_REL_CHANGE = 0.30
 # 프롬프트에 포함할 코스피 뉴스 최대 개수
 NEWS_MAX_ITEMS = 40
+DEFAULT_MIN_SELL_TRADES = 10
+DEFAULT_MAX_DIGEST = 15
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
-    """매도 거래 기록으로부터 승패 통계를 계산한다.
+def _parse_structured_context(trade: Any) -> Dict[str, Any]:
+    raw = getattr(trade, "structured_context", "") or ""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return {}
 
-    trade_records 의 각 항목은 .action / .profit_loss / .timestamp 속성을
-    가지면 되므로 reviewer.TradeRecord, recorder.TradeRecord 모두 호환된다.
-    """
-    sells = [t for t in trade_records if str(getattr(t, "action", "")).lower() == "sell"]
+
+def _sell_reason_text(trade: Any) -> str:
+    sr = str(getattr(trade, "sell_reason", "") or "").strip()
+    if sr:
+        return sr[:200]
+    ctx = _parse_structured_context(trade)
+    return str(ctx.get("reason") or ctx.get("type") or "")[:200]
+
+
+def _sell_reason_code(trade: Any) -> str:
+    rc = str(getattr(trade, "reason_code", "") or "").strip()
+    if rc:
+        return rc
+    ctx = _parse_structured_context(trade)
+    return str(ctx.get("type") or ctx.get("reason_code") or "UNKNOWN")[:64]
+
+
+def _sell_type(trade: Any) -> str:
+    ctx = _parse_structured_context(trade)
+    return str(ctx.get("type") or "UNKNOWN")[:64]
+
+
+def filter_completed_sells(trade_records: List[Any]) -> List[Any]:
+    try:
+        from recorder import is_completed_sell
+    except ImportError:
+        is_completed_sell = lambda t: str(getattr(t, "action", "")).upper() == "SELL"
+    return [t for t in trade_records if is_completed_sell(t)]
+
+
+def analyze_by_reason_code(sells: List[Any]) -> Dict[str, Any]:
+    """사유 코드·유형별 건수·승률."""
+    by_code: Dict[str, Dict[str, Any]] = {}
+    by_type: Dict[str, Dict[str, Any]] = {}
+    for t in sells:
+        code = _sell_reason_code(t)
+        typ = _sell_type(t)
+        pnl = float(getattr(t, "profit_loss", 0.0) or 0.0)
+        for bucket, key in ((by_code, code), (by_type, typ)):
+            if key not in bucket:
+                bucket[key] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            bucket[key]["count"] += 1
+            if pnl > 0:
+                bucket[key]["wins"] += 1
+            elif pnl < 0:
+                bucket[key]["losses"] += 1
+            bucket[key]["net_pnl"] = round(bucket[key]["net_pnl"] + pnl, 2)
+    for bucket in (by_code, by_type):
+        for k, v in bucket.items():
+            c = v["count"]
+            v["win_rate"] = round(v["wins"] / c, 4) if c else 0.0
+    return {"by_reason_code": by_code, "by_sell_type": by_type}
+
+
+def summarize_sell_context(sells: List[Any]) -> Dict[str, Any]:
+    """GPT·Discord용 매도 사유 요약."""
+    reason_stats = analyze_by_reason_code(sells)
+    top_codes = sorted(
+        reason_stats["by_reason_code"].items(),
+        key=lambda x: x[1]["count"],
+        reverse=True,
+    )[:5]
+    top_types = sorted(
+        reason_stats["by_sell_type"].items(),
+        key=lambda x: x[1]["count"],
+        reverse=True,
+    )[:5]
+    return {
+        "completed_sell_count": len(sells),
+        "top_reason_codes": [{"code": k, **v} for k, v in top_codes],
+        "top_sell_types": [{"type": k, **v} for k, v in top_types],
+        **reason_stats,
+    }
+
+
+def build_trade_digest(sells: List[Any], *, max_items: int = DEFAULT_MAX_DIGEST) -> List[Dict[str, Any]]:
+    """대표 매도 거래 목록 (최근 + 극단 PnL)."""
+    if not sells:
+        return []
+
+    def _row(t: Any) -> Dict[str, Any]:
+        ts = getattr(t, "timestamp", None)
+        date_s = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+        qty = int(getattr(t, "executed_qty", 0) or getattr(t, "quantity", 0) or 0)
+        return {
+            "date": date_s,
+            "ticker": str(getattr(t, "ticker", "")).zfill(6),
+            "qty": qty,
+            "price": round(float(getattr(t, "price", 0) or 0), 2),
+            "pnl": round(float(getattr(t, "profit_loss", 0.0) or 0.0), 2),
+            "reason_code": _sell_reason_code(t),
+            "sell_type": _sell_type(t),
+            "reason": _sell_reason_text(t),
+            "holding_days": int(getattr(t, "holding_period_days", 0) or 0),
+        }
+
+    ordered = sorted(sells, key=lambda t: getattr(t, "timestamp", datetime.min))
+    recent = ordered[-max(1, max_items // 2):]
+    by_pnl = sorted(sells, key=lambda t: float(getattr(t, "profit_loss", 0.0) or 0.0))
+    extremes: List[Any] = []
+    if by_pnl:
+        extremes.append(by_pnl[0])
+        if len(by_pnl) > 1:
+            extremes.append(by_pnl[-1])
+
+    seen_ts = set()
+    digest: List[Dict[str, Any]] = []
+    for t in list(recent) + extremes:
+        key = (getattr(t, "ticker", ""), getattr(t, "timestamp", ""))
+        if key in seen_ts:
+            continue
+        seen_ts.add(key)
+        digest.append(_row(t))
+        if len(digest) >= max_items:
+            break
+    return digest
+
+
+def summarize_portfolio_period(snapshots: List[Any]) -> Dict[str, Any]:
+    """기간 내 포트폴리오 스냅샷 요약."""
+    if not snapshots:
+        return {"snapshot_count": 0}
+    ordered = sorted(snapshots, key=lambda s: getattr(s, "timestamp", datetime.min))
+    first, last = ordered[0], ordered[-1]
+    v0 = float(getattr(first, "total_value", 0) or 0)
+    v1 = float(getattr(last, "total_value", 0) or 0)
+    period_return = ((v1 - v0) / v0) if v0 > 0 else 0.0
+    peak = v0
+    max_dd = 0.0
+    for s in ordered:
+        v = float(getattr(s, "total_value", 0) or 0)
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (peak - v) / peak
+            max_dd = max(max_dd, dd)
+    return {
+        "snapshot_count": len(ordered),
+        "start_value": round(v0, 0),
+        "end_value": round(v1, 0),
+        "period_return_pct": round(period_return * 100, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "start_date": getattr(first, "timestamp", datetime.min).strftime("%Y-%m-%d")
+        if hasattr(getattr(first, "timestamp", None), "strftime")
+        else "",
+        "end_date": getattr(last, "timestamp", datetime.min).strftime("%Y-%m-%d")
+        if hasattr(getattr(last, "timestamp", None), "strftime")
+        else "",
+    }
+
+
+def load_gpt_trade_hints(lookback_days: int) -> Dict[str, Dict[str, Any]]:
+    """기간 내 gpt_trades JSON에서 종목별 최신 매수 판단."""
+    try:
+        from utils import find_latest_file, OUTPUT_DIR
+    except ImportError:
+        return {}
+
+    hints: Dict[str, Dict[str, Any]] = {}
+    cutoff = datetime.now() - timedelta(days=lookback_days)
+    try:
+        paths = sorted(OUTPUT_DIR.glob("gpt_trades_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        paths = []
+    for path in paths[:12]:
+        try:
+            stem = path.stem
+            parts = stem.split("_")
+            if len(parts) >= 3 and len(parts[2]) == 8:
+                file_dt = datetime.strptime(parts[2], "%Y%m%d")
+                if file_dt < cutoff:
+                    continue
+        except Exception:
+            pass
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            continue
+        plans = raw.get("plans", raw) if isinstance(raw, dict) else raw
+        if not isinstance(plans, list):
+            continue
+        for item in plans:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker") or item.get("Ticker") or "").zfill(6)
+            if not ticker or ticker in hints:
+                continue
+            hints[ticker] = {
+                "decision": item.get("decision") or item.get("action"),
+                "confidence": item.get("confidence"),
+                "summary": (item.get("summary") or item.get("reason") or "")[:120],
+                "source_file": path.name,
+            }
+    return hints
+
+
+def join_gpt_outcomes(sells: List[Any], gpt_hints: Dict[str, Dict[str, Any]], *, max_items: int = 8) -> List[Dict[str, Any]]:
+    """매도 결과 ↔ 당시 GPT 매수 판단 대조."""
+    out: List[Dict[str, Any]] = []
+    for t in sorted(sells, key=lambda x: getattr(x, "timestamp", datetime.min), reverse=True):
+        ticker = str(getattr(t, "ticker", "")).zfill(6)
+        hint = gpt_hints.get(ticker)
+        if not hint:
+            continue
+        ts = getattr(t, "timestamp", None)
+        out.append({
+            "ticker": ticker,
+            "sell_date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else "",
+            "pnl": round(float(getattr(t, "profit_loss", 0.0) or 0.0), 2),
+            "sell_type": _sell_type(t),
+            "gpt_decision": hint.get("decision"),
+            "gpt_summary": hint.get("summary"),
+            "gpt_source": hint.get("source_file"),
+        })
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def refresh_sell_pnl_batch(recorder: Any, sells: List[Any]) -> int:
+    """profit_loss=0 인 체결 매도에 FIFO PnL 재계산."""
+    n = 0
+    for t in sells:
+        if float(getattr(t, "profit_loss", 0.0) or 0.0) != 0.0:
+            continue
+        oid = str(getattr(t, "order_id", "") or "").strip()
+        if oid and hasattr(recorder, "recompute_profit_loss_for_order_id"):
+            if recorder.recompute_profit_loss_for_order_id(oid):
+                n += 1
+    return n
+
+
+def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
+    """체결 완료 매도 기록으로부터 승패 통계를 계산한다."""
+    sells = filter_completed_sells(trade_records)
+    if not sells:
+        sells = [t for t in trade_records if str(getattr(t, "action", "")).lower() == "sell"]
     n = len(sells)
     wins = [t for t in sells if (getattr(t, "profit_loss", 0.0) or 0.0) > 0]
     losses = [t for t in sells if (getattr(t, "profit_loss", 0.0) or 0.0) < 0]
@@ -406,8 +648,9 @@ def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
         else:
             cur = 0
 
-    return {
+    base = {
         "sell_trades": n,
+        "completed_sell_trades": n,
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": round(win_rate, 4),
@@ -417,6 +660,9 @@ def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
         "net_pnl": round(total_profit - total_loss, 2),
         "max_consecutive_losses": max_consec_losses,
     }
+    if sells:
+        base.update(analyze_by_reason_code(sells))
+    return base
 
 
 def decide_autosell_adjustments(stats: Dict[str, Any], auto_sell: Dict[str, Any]) -> Tuple[Dict[str, float], List[str]]:
@@ -449,6 +695,17 @@ def decide_autosell_adjustments(stats: Dict[str, Any], auto_sell: Dict[str, Any]
     if profit_factor < 1.0:
         new_target = _clamp(new_target - ADJUST_STEP, AUTOSELL_TARGET_MIN, AUTOSELL_TARGET_MAX)
         reasons.append(f"손익비 부진(PF={profit_factor:.2f}<1.0) → 익절 목표 하향 {cur_target:.3f}→{new_target:.3f}")
+
+    # R4) 긴급 낙폭 손절 유형이 잦고 성과가 나쁘면 손절 폭 소폭 축소
+    by_type = stats.get("by_sell_type") or {}
+    em = by_type.get("EmergencyDrop") if isinstance(by_type, dict) else None
+    if isinstance(em, dict) and int(em.get("count", 0)) >= 3:
+        em_wr = float(em.get("win_rate", 0.0))
+        if em_wr < 0.35:
+            new_stop = _clamp(cur_stop - ADJUST_STEP, AUTOSELL_STOP_LOSS_MIN, AUTOSELL_STOP_LOSS_MAX)
+            reasons.append(
+                f"EmergencyDrop 다발({em.get('count')}건,승률{em_wr:.0%}) → 손절 타이트화"
+            )
 
     changes: Dict[str, float] = {}
     if abs(new_stop - cur_stop) > 1e-9:
@@ -536,13 +793,19 @@ def _extract_tunable(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {sec: cfg.get(sec, {}) for sec in TUNABLE_SECTIONS}
 
 
-def gpt_propose_config_changes(stats: Dict[str, Any], news: List[Dict[str, str]],
-                               cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """GPT 에 승패 통계 + 코스피 뉴스 + 현재 설정을 주고 변경안을 받는다.
-
-    반환 형식(검증 전): {"screener_params": {...}, "risk_params": {...},
-                       "strategy_params": {...}, "reasons": [...]} 또는 None
-    """
+def gpt_propose_config_changes(
+    stats: Dict[str, Any],
+    news: List[Dict[str, str]],
+    cfg: Dict[str, Any],
+    *,
+    sell_summary: Optional[Dict[str, Any]] = None,
+    trade_digest: Optional[List[Dict[str, Any]]] = None,
+    portfolio_summary: Optional[Dict[str, Any]] = None,
+    gpt_comparisons: Optional[List[Dict[str, Any]]] = None,
+    sample_insufficient: bool = False,
+    min_sell_trades: int = DEFAULT_MIN_SELL_TRADES,
+) -> Optional[Dict[str, Any]]:
+    """GPT 에 승패·사유·포트폴리오·뉴스·설정을 주고 변경안을 받는다."""
     try:
         from gpt_analyzer import _call_openai_json
     except Exception as e:
@@ -554,17 +817,40 @@ def gpt_propose_config_changes(stats: Dict[str, Any], news: List[Dict[str, str]]
         f"- [{n.get('date','')}] {n.get('title','')} :: {n.get('desc','')}" for n in news
     ) or "(수집된 뉴스 없음)"
 
+    sample_note = ""
+    if sample_insufficient:
+        sample_note = (
+            f"\n## 주의\n"
+            f"- 체결 완료 매도가 {stats.get('completed_sell_trades', stats.get('sell_trades', 0))}건으로 "
+            f"권장 최소 {min_sell_trades}건 미만입니다. 큰 변경은 하지 말고, reasons에 '표본 부족'을 명시하세요.\n"
+        )
+
     system_prompt = (
         "당신은 한국 주식 자동매매 시스템의 리스크/전략 파라미터를 검토하는 퀀트 전문가입니다. "
-        "최근 한 달 실제 매매 승패 통계와 코스피 시장 뉴스를 근거로, 주어진 설정값을 점진적으로 개선하세요. "
+        "실제 매매 승패·매도 사유·포트폴리오·시장 뉴스를 근거로 설정을 점진적으로 개선하세요. "
+        "EmergencyDrop 등 손절 유형이 반복되면 auto_sell 관련 값을 보수적으로 조정할 수 있습니다. "
         "반드시 보수적으로 조정하고(한 번에 큰 변화 금지), 근거가 약하면 변경하지 마세요. "
         "응답은 반드시 단일 JSON 객체여야 합니다."
     )
+    digest_json = json.dumps(trade_digest or [], ensure_ascii=False)
+    sell_sum_json = json.dumps(sell_summary or {}, ensure_ascii=False)
+    port_json = json.dumps(portfolio_summary or {}, ensure_ascii=False)
+    gpt_cmp_json = json.dumps(gpt_comparisons or [], ensure_ascii=False)
+
     user_prompt = (
-        "## 최근 매매 승패 통계 (최근 한 달)\n"
+        "## 최근 매매 승패 통계 (체결 매도 기준)\n"
         f"{json.dumps(stats, ensure_ascii=False)}\n\n"
+        "## 매도 사유 분포\n"
+        f"{sell_sum_json}\n\n"
+        "## 대표 매도 거래\n"
+        f"{digest_json}\n\n"
+        "## 포트폴리오 기간 요약\n"
+        f"{port_json}\n\n"
+        "## GPT 매수 판단 vs 실제 매도 결과 (있는 경우만)\n"
+        f"{gpt_cmp_json}\n\n"
         "## 코스피 한 달 주요 뉴스\n"
-        f"{news_lines}\n\n"
+        f"{news_lines}\n"
+        f"{sample_note}\n"
         "## 현재 설정값 (이 키들만 조정 가능)\n"
         f"{json.dumps(current, ensure_ascii=False, indent=2)}\n\n"
         "## 지시\n"
@@ -670,8 +956,20 @@ def _apply_changes_to_cfg(cfg: Dict[str, Any], changes: Dict[str, Any]) -> None:
                 target[key] = val
 
 
-def _notify_summary(stats: Dict[str, Any], changes: Dict[str, Any], reasons: List[str],
-                    lookback_days: int, applied: bool, news_count: int, source: str) -> None:
+def _notify_summary(
+    stats: Dict[str, Any],
+    changes: Dict[str, Any],
+    reasons: List[str],
+    lookback_days: int,
+    applied: bool,
+    news_count: int,
+    source: str,
+    *,
+    sell_summary: Optional[Dict[str, Any]] = None,
+    portfolio_summary: Optional[Dict[str, Any]] = None,
+    skipped: bool = False,
+    skip_reason: str = "",
+) -> None:
     """Discord 로 분석/튜닝 요약 전송(실패는 조용히 무시)."""
     try:
         from notifier import send_discord_message, WEBHOOK_URL, is_valid_webhook
@@ -681,12 +979,40 @@ def _notify_summary(stats: Dict[str, Any], changes: Dict[str, Any], reasons: Lis
         pf = stats.get("profit_factor", 0.0)
         fields = [
             {"name": "📅 분석 기간", "value": f"최근 {lookback_days}일", "inline": True},
-            {"name": "📊 매도 거래", "value": f"{stats.get('sell_trades', 0)}건 (승 {stats.get('wins', 0)}/패 {stats.get('losses', 0)})", "inline": True},
+            {
+                "name": "📊 체결 매도",
+                "value": f"{stats.get('completed_sell_trades', stats.get('sell_trades', 0))}건 "
+                f"(승 {stats.get('wins', 0)}/패 {stats.get('losses', 0)})",
+                "inline": True,
+            },
             {"name": "🎯 승률", "value": f"{float(stats.get('win_rate', 0.0)):.1%}", "inline": True},
             {"name": "💹 손익비(PF)", "value": f"{pf}", "inline": True},
             {"name": "💰 순손익", "value": f"{stats.get('net_pnl', 0):,}", "inline": True},
             {"name": "📰 뉴스/판단", "value": f"{news_count}건 / {source}", "inline": True},
         ]
+        if portfolio_summary and portfolio_summary.get("snapshot_count", 0) > 0:
+            fields.append({
+                "name": "📈 포트폴리오",
+                "value": (
+                    f"수익 {portfolio_summary.get('period_return_pct', 0)}% / "
+                    f"MDD {portfolio_summary.get('max_drawdown_pct', 0)}%"
+                ),
+                "inline": True,
+            })
+        if sell_summary:
+            tops = sell_summary.get("top_sell_types") or sell_summary.get("top_reason_codes") or []
+            if tops:
+                lines = []
+                for item in tops[:3]:
+                    label = item.get("type") or item.get("code") or "?"
+                    lines.append(f"• {label}: {item.get('count', 0)}건")
+                fields.append({
+                    "name": "🏷️ 매도 사유 Top",
+                    "value": "\n".join(lines)[:500],
+                    "inline": False,
+                })
+        if skipped and skip_reason:
+            fields.append({"name": "⏭️ 스킵", "value": skip_reason[:500], "inline": False})
         if reasons:
             change_lines = "\n".join(f"• {r}" for r in reasons)
             status = "✅ 적용됨" if applied else "🧪 미적용(드라이런)"
@@ -713,17 +1039,24 @@ def run_review() -> Dict[str, Any]:
     setup_logging()
 
     lookback_days = int(os.getenv("REVIEWER_LOOKBACK_DAYS", "30"))
-    min_trades = int(os.getenv("REVIEWER_MIN_TRADES", "10"))
+    min_trades = int(
+        os.getenv("REVIEWER_MIN_SELL_TRADES", os.getenv("REVIEWER_MIN_TRADES", str(DEFAULT_MIN_SELL_TRADES)))
+    )
+    allow_partial = os.getenv("REVIEWER_ALLOW_PARTIAL", "0") == "1"
+    max_digest = int(os.getenv("REVIEWER_MAX_DIGEST", str(DEFAULT_MAX_DIGEST)))
     dry_run = os.getenv("REVIEWER_DRY_RUN", "0") == "1"
     max_rel_change = float(os.getenv("REVIEWER_MAX_REL_CHANGE", str(DEFAULT_MAX_REL_CHANGE)))
 
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    logger.info(f"=== reviewer start (lookback={lookback_days}d, min_trades={min_trades}, "
-                f"dry_run={dry_run}, max_rel_change={max_rel_change}) ===")
+    logger.info(
+        f"=== reviewer start (lookback={lookback_days}d, min_sell_trades={min_trades}, "
+        f"allow_partial={allow_partial}, dry_run={dry_run}, max_rel_change={max_rel_change}) ==="
+    )
 
     # 1) DB 에서 기간 내 거래 조회
+    recorder = None
     try:
         from recorder import get_recorder
         recorder = get_recorder()
@@ -732,11 +1065,37 @@ def run_review() -> Dict[str, Any]:
         logger.error(f"거래 기록 조회 실패: {e}")
         trades = []
 
-    # 2) 승패 분석
-    stats = analyze_win_loss(trades)
-    logger.info(f"[stats] {stats}")
+    completed_sells = filter_completed_sells(trades)
+    if recorder and completed_sells:
+        refreshed = refresh_sell_pnl_batch(recorder, completed_sells)
+        if refreshed:
+            logger.info(f"[pnl] FIFO 재계산 {refreshed}건")
+            trades = recorder.get_trade_records(start_date=start_dt, end_date=end_dt)
+            completed_sells = filter_completed_sells(trades)
 
-    # 3) 코스피 한 달 주요 뉴스 수집
+    # 2) 승패·사유 분석
+    stats = analyze_win_loss(trades)
+    sell_summary = summarize_sell_context(completed_sells)
+    trade_digest = build_trade_digest(completed_sells, max_items=max_digest)
+    logger.info(f"[stats] {stats}")
+    logger.info(f"[sell_summary] completed={sell_summary.get('completed_sell_count', 0)}")
+
+    # 3) 포트폴리오·GPT 대조 (Phase B)
+    portfolio_summary: Dict[str, Any] = {}
+    gpt_comparisons: List[Dict[str, Any]] = []
+    if recorder:
+        try:
+            snaps = recorder.get_portfolio_snapshots(start_date=start_dt, end_date=end_dt)
+            portfolio_summary = summarize_portfolio_period(snaps)
+            logger.info(f"[portfolio] {portfolio_summary}")
+        except Exception as e:
+            logger.debug(f"스냅샷 요약 실패: {e}")
+    gpt_hints = load_gpt_trade_hints(lookback_days)
+    gpt_comparisons = join_gpt_outcomes(completed_sells, gpt_hints)
+    if gpt_comparisons:
+        logger.info(f"[gpt_compare] {len(gpt_comparisons)}건")
+
+    # 4) 코스피 한 달 주요 뉴스 수집
     news = collect_kospi_news(lookback_days)
     logger.info(f"[news] 수집 {len(news)}건")
 
@@ -749,10 +1108,18 @@ def run_review() -> Dict[str, Any]:
         logger.error(f"config 로드 실패({config_path}): {e}")
         cfg = None
 
+    n_completed = int(stats.get("completed_sell_trades", stats.get("sell_trades", 0)))
+    sample_insufficient = n_completed < min_trades
+
     result: Dict[str, Any] = {
         "timestamp": end_dt.isoformat(),
         "lookback_days": lookback_days,
         "stats": stats,
+        "sell_summary": sell_summary,
+        "trade_digest": trade_digest,
+        "digest_count": len(trade_digest),
+        "portfolio_summary": portfolio_summary,
+        "gpt_comparisons": gpt_comparisons,
         "news_count": len(news),
         "changes": {},
         "reasons": [],
@@ -760,12 +1127,14 @@ def run_review() -> Dict[str, Any]:
         "applied": False,
         "skipped": False,
         "config_path": str(config_path),
+        "min_sell_trades": min_trades,
+        "allow_partial": allow_partial,
     }
 
     # 5) 표본 부족/설정 로드 실패 시 스킵
-    if stats["sell_trades"] < min_trades:
+    if sample_insufficient and not allow_partial:
         result["skipped"] = True
-        result["skip_reason"] = f"매도 거래 {stats['sell_trades']}건 < 최소 {min_trades}건"
+        result["skip_reason"] = f"체결 매도 {n_completed}건 < 최소 {min_trades}건"
         logger.info(f"[skip] {result['skip_reason']} → config 변경 없음")
     elif cfg is None:
         result["skipped"] = True
@@ -775,8 +1144,21 @@ def run_review() -> Dict[str, Any]:
         reasons: List[str] = []
         source = "none"
 
+        if sample_insufficient:
+            reasons.append(f"표본 부족: 체결 매도 {n_completed}건 < 권장 {min_trades}건 (보수 모드)")
+
         # 6) GPT 리뷰 → 변경 제안
-        proposal = gpt_propose_config_changes(stats, news, cfg)
+        proposal = gpt_propose_config_changes(
+            stats,
+            news,
+            cfg,
+            sell_summary=sell_summary,
+            trade_digest=trade_digest,
+            portfolio_summary=portfolio_summary,
+            gpt_comparisons=gpt_comparisons,
+            sample_insufficient=sample_insufficient,
+            min_sell_trades=min_trades,
+        )
         if proposal:
             result["gpt_raw_proposal"] = proposal
             changes, notes = _sanitize_proposal(proposal, cfg, max_rel_change)
@@ -824,9 +1206,19 @@ def run_review() -> Dict[str, Any]:
         logger.error(f"review_log 저장 실패: {e}")
 
     # 9) Discord 요약
-    _notify_summary(stats, result.get("changes", {}), result.get("reasons", []),
-                    lookback_days, result.get("applied", False),
-                    len(news), result.get("source", "none"))
+    _notify_summary(
+        stats,
+        result.get("changes", {}),
+        result.get("reasons", []),
+        lookback_days,
+        result.get("applied", False),
+        len(news),
+        result.get("source", "none"),
+        sell_summary=result.get("sell_summary"),
+        portfolio_summary=result.get("portfolio_summary"),
+        skipped=result.get("skipped", False),
+        skip_reason=result.get("skip_reason", ""),
+    )
 
     logger.info("=== reviewer done ===")
     return result

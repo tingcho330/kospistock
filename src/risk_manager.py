@@ -492,12 +492,20 @@ class RiskManager:
                             "(order_reconciler 연동 불가)"
                         )
                     else:
+                        reason_text = str(
+                            reason_meta.get("reason") or reason_meta.get("type") or ""
+                        ).strip()
+                        reason_code = str(
+                            reason_meta.get("type") or reason_meta.get("reason_code") or ""
+                        ).strip()
                         _direct_sell_payload = {
                             "side": "sell", "ticker": ticker, "name": name,
                             "qty": qty, "price": current_price, "trade_status": "pending",
                             "order_id": odno,
                             "requested_qty": qty,
                             "executed_qty": 0,
+                            "sell_reason": reason_text,
+                            "reason_code": reason_code,
                             "_debug_context": "risk_manager.direct_execute",
                             "strategy_details": {"mode": "direct_execute", **reason_meta}
                         }
