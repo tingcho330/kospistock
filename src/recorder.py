@@ -585,7 +585,107 @@ class DataRecorder:
             self.logger.error(f"open 주문 조회 실패: {e}")
             _db_dbg_log("recorder.get_open_orders.FAIL", error=str(e))
             return []
-    
+
+    def get_orphan_trade_records(
+        self,
+        *,
+        since_ts: str,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """order_id가 비어 있는 거래 기록 (backfill 대상)."""
+        try:
+            q = """
+                SELECT id, timestamp, ticker, action, quantity, price, requested_qty, executed_qty, order_status, order_id
+                FROM trade_records
+                WHERE (order_id IS NULL OR order_id = '')
+                  AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(q, (since_ts, int(limit)))
+                rows = cursor.fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "timestamp": r[1],
+                        "ticker": r[2],
+                        "action": r[3],
+                        "quantity": r[4],
+                        "price": r[5],
+                        "requested_qty": r[6],
+                        "executed_qty": r[7],
+                        "order_status": r[8],
+                        "order_id": r[9],
+                    }
+                )
+            _db_dbg_log(
+                "recorder.get_orphan_trade_records.OK",
+                since_ts=since_ts,
+                count=len(out),
+                sample_ids=[x.get("id") for x in out[:5]],
+            )
+            return out
+        except Exception as e:
+            self.logger.error(f"orphan 거래 조회 실패: {e}")
+            _db_dbg_log("recorder.get_orphan_trade_records.FAIL", error=str(e))
+            return []
+
+    def backfill_order_id(
+        self,
+        *,
+        row_id: int,
+        order_id: str,
+        executed_qty: Optional[int] = None,
+        order_status: Optional[str] = None,
+    ) -> int:
+        """빈 order_id 행에 KIS 주문번호·체결 메타 backfill (기존 order_id 있으면 스킵)."""
+        try:
+            order_id = (order_id or "").strip()
+            if not order_id:
+                _db_dbg_skip("recorder.backfill_order_id.SKIP", reason="empty order_id", row_id=row_id)
+                return 0
+
+            sets = ["order_id = ?", "last_status_update_ts = ?"]
+            params: List[Any] = [order_id, datetime.now().isoformat()]
+
+            if executed_qty is not None:
+                sets.append("executed_qty = ?")
+                params.append(int(executed_qty))
+            if order_status is not None:
+                sets.append("order_status = ?")
+                params.append(str(order_status).lower())
+
+            params.extend([int(row_id)])
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    UPDATE trade_records
+                    SET {', '.join(sets)}
+                    WHERE id = ? AND (order_id IS NULL OR order_id = '')
+                    """,
+                    params,
+                )
+                n = cursor.rowcount
+                conn.commit()
+            _db_dbg_log(
+                "recorder.backfill_order_id.OK" if n else "recorder.backfill_order_id.NO_MATCH",
+                row_id=row_id,
+                order_id=order_id,
+                rows_affected=n,
+                executed_qty=executed_qty,
+                order_status=order_status,
+            )
+            return n
+        except Exception as e:
+            self.logger.error(f"order_id backfill 실패: {e}")
+            _db_dbg_log("recorder.backfill_order_id.FAIL", error=str(e), row_id=row_id)
+            return 0
+
     def mark_pending_buy_cancelled(self, ticker: str, target_date: Optional[datetime] = None) -> int:
         """
         해당 종목·해당 일자의 pending 매수 기록을 cancelled로 표시 (15시 20분 미체결 취소 시 호출).
@@ -1205,8 +1305,11 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             order_status = "executed"
         if order_status in ("submitted",):
             order_status = "pending"
-        if order_status in ("completed", "market_executed"):
+        if order_status in ("completed", "market_executed", "limit_executed", "split_executed"):
             order_status = "executed"
+
+        if executed_qty <= 0 and order_status == "executed" and quantity > 0:
+            executed_qty = quantity
 
         # pending without order_id → reconciler가 추적 불가한 orphan INSERT 방지
         if order_status == "pending" and not order_id:

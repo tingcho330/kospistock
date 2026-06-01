@@ -1319,6 +1319,59 @@ class Trader:
         )
         return odno
 
+    def _build_trade_record(
+        self,
+        *,
+        ticker: str,
+        name: str,
+        side: str,
+        qty: int,
+        price: int,
+        trade_status: str,
+        res: Optional[Dict[str, Any]] = None,
+        order_id: Optional[str] = None,
+        executed_qty: Optional[int] = None,
+        requested_qty: Optional[int] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        """record_trade용 payload — order_id·체결수량 메타를 일관되게 채운다."""
+        explicit_oid = order_id is not None
+        if explicit_oid:
+            odno = str(order_id).strip()
+        elif res is not None:
+            odno = self._extract_order_id(res)
+        else:
+            odno = ""
+        if not odno and not explicit_oid:
+            odno = str(getattr(self, "_last_order_odno", "") or "").strip()
+
+        _filled_statuses = frozenset({
+            "executed", "completed", "limit_executed", "split_executed",
+            "market_executed", "partial",
+        })
+        status_lower = str(trade_status).lower()
+        req = requested_qty if requested_qty is not None else qty
+        if executed_qty is not None:
+            exe = executed_qty
+        elif status_lower in _filled_statuses:
+            exe = qty
+        else:
+            exe = 0
+
+        payload: Dict[str, Any] = {
+            "side": side,
+            "ticker": ticker,
+            "name": name,
+            "qty": qty,
+            "price": price,
+            "trade_status": trade_status,
+            "order_id": odno,
+            "requested_qty": req,
+            "executed_qty": exe,
+        }
+        payload.update(extra)
+        return payload
+
     def _finalize_buy_result(self, *,
                              context: str,
                              name: str,
@@ -1636,17 +1689,17 @@ class Trader:
                 if filled_qty > 0:
                     # 즉시 체결된 경우
                     trade_status = "completed"
-                    record_trade({
-                        "side": "sell", "ticker": ticker, "name": name,
-                        "qty": filled_qty, "price": current_price,
-                        "trade_status": trade_status,
-                        "strategy_details": {
+                    record_trade(self._build_trade_record(
+                        res=result, ticker=ticker, name=name, side="sell",
+                        qty=filled_qty, price=current_price, trade_status=trade_status,
+                        executed_qty=filled_qty, requested_qty=quantity,
+                        strategy_details={
                             "reason": reason_text,
                             "reason_code": reason_code,
-                            "broker_msg": result.get('msg1')
+                            "broker_msg": result.get('msg1'),
                         },
-                        "sell_reason": reason_text
-                    })
+                        sell_reason=reason_text,
+                    ))
                     _notify_embed(create_trade_embed({
                         "side": "SELL", "name": name, "ticker": ticker,
                         "qty": filled_qty, "price": current_price, "trade_status": trade_status,
@@ -1664,19 +1717,19 @@ class Trader:
                     return {"status": "submitted", "filled_qty": 0, "rt_cd": result.get('rt_cd'), "msg1": result.get('msg1')}
             else:
                 err = result.get('msg1', 'Unknown error')
-                record_trade({
-                    "side": "sell", "ticker": ticker, "name": name,
-                    "qty": quantity, "price": current_price,
-                    "trade_status": "failed",
-                    "strategy_details": {
+                record_trade(self._build_trade_record(
+                    res=result, ticker=ticker, name=name, side="sell",
+                    qty=quantity, price=current_price, trade_status="failed",
+                    executed_qty=0, requested_qty=quantity,
+                    strategy_details={
                         "error": err,
                         "rt_cd": result.get('rt_cd'),
                         "msg_cd": result.get('msg_cd'),
                         "reason": reason_text,
-                        "reason_code": reason_code
+                        "reason_code": reason_code,
                     },
-                    "sell_reason": reason_text
-                })
+                    sell_reason=reason_text,
+                ))
                 _notify_embed(create_trade_embed({
                     "side": "SELL", "name": name, "ticker": ticker,
                     "qty": quantity, "price": current_price, "trade_status": "failed",
@@ -3140,9 +3193,13 @@ class Trader:
             odno = order_result.get('odno')
             exec_info = self._check_delayed_execution(ticker, expected_qty, odno)
             if exec_info:
-                return {'status': 'executed', 'executed': True, 'executed_qty': exec_info.get('executed_qty', 0), 'wait_time': 1}
+                return {
+                    'status': 'executed', 'executed': True,
+                    'executed_qty': exec_info.get('executed_qty', 0),
+                    'wait_time': 1, 'order_id': odno,
+                }
             # 주문 접수 성공, 미체결
-            return {'status': 'submitted', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
+            return {'status': 'submitted', 'executed': False, 'executed_qty': 0, 'wait_time': 0, 'order_id': odno}
         
         # ok=False인 경우에만 실패로 간주
         return {'status': 'failed', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
@@ -4142,18 +4199,17 @@ class Trader:
                             
                             # 매수 통계 반영
                             self.stats["buy"] += 1
-                            record_trade({
-                                "side": "buy", "ticker": ticker, "name": name,
-                                "qty": executed_qty,
-                                "price": order_price,
-                                "trade_status": "completed",
-                                "gpt_analysis": plan,
-                                "strategy_details": {
-                                    "broker_msg": result.get('msg1'), 
+                            record_trade(self._build_trade_record(
+                                res=result, ticker=ticker, name=name, side="buy",
+                                qty=executed_qty, price=order_price, trade_status="completed",
+                                executed_qty=executed_qty, requested_qty=quantity,
+                                gpt_analysis=plan,
+                                strategy_details={
+                                    "broker_msg": result.get('msg1'),
                                     "batch": batch_name,
-                                    "execution_time": wait_time
-                                }
-                            })
+                                    "execution_time": wait_time,
+                                },
+                            ))
                             
                             remaining_cash = new_cash
                             any_order_placed = True
@@ -4186,18 +4242,17 @@ class Trader:
                         new_cash, holdings_after, _ = self._load_snapshot()
                         
                         # 부분 체결 기록
-                        record_trade({
-                            "side": "buy", "ticker": ticker, "name": name,
-                            "qty": executed_qty,
-                            "price": order_price,
-                            "trade_status": "partial",
-                            "gpt_analysis": plan,
-                            "strategy_details": {
-                                "broker_msg": result.get('msg1'), 
+                        record_trade(self._build_trade_record(
+                            res=result, ticker=ticker, name=name, side="buy",
+                            qty=executed_qty, price=order_price, trade_status="partial",
+                            executed_qty=executed_qty, requested_qty=quantity,
+                            gpt_analysis=plan,
+                            strategy_details={
+                                "broker_msg": result.get('msg1'),
                                 "batch": batch_name,
-                                "execution_time": execution_result.get('wait_time', 0)
-                            }
-                        })
+                                "execution_time": execution_result.get('wait_time', 0),
+                            },
+                        ))
                         
                         remaining_cash = new_cash
                         any_order_placed = True
@@ -4237,18 +4292,18 @@ class Trader:
                             
                             if qty_delta > 0:
                                 self.stats["buy"] += 1
-                                record_trade({
-                                    "side": "buy", "ticker": ticker, "name": name,
-                                    "qty": qty_delta,
-                                    "price": 0,  # 시장가는 가격 0
-                                    "trade_status": "completed",
-                                    "gpt_analysis": plan,
-                                    "strategy_details": {
-                                        "broker_msg": market_result.get('msg1'), 
+                                record_trade(self._build_trade_record(
+                                    res=market_result if isinstance(market_result, dict) else None,
+                                    ticker=ticker, name=name, side="buy",
+                                    qty=qty_delta, price=0, trade_status="completed",
+                                    executed_qty=qty_delta, requested_qty=remaining_qty,
+                                    gpt_analysis=plan,
+                                    strategy_details={
+                                        "broker_msg": market_result.get('msg1') if isinstance(market_result, dict) else None,
                                         "batch": batch_name,
-                                        "order_type": "market"
-                                    }
-                                })
+                                        "order_type": "market",
+                                    },
+                                ))
                                 
                                 remaining_cash = new_cash
                                 any_order_placed = True
@@ -4311,18 +4366,18 @@ class Trader:
                             
                             if qty_delta > 0:
                                 self.stats["buy"] += 1
-                                record_trade({
-                                    "side": "buy", "ticker": ticker, "name": name,
-                                    "qty": qty_delta,
-                                    "price": 0,
-                                    "trade_status": "completed",
-                                    "gpt_analysis": plan,
-                                    "strategy_details": {
-                                        "broker_msg": market_result.get('msg1'), 
+                                record_trade(self._build_trade_record(
+                                    res=market_result if isinstance(market_result, dict) else None,
+                                    ticker=ticker, name=name, side="buy",
+                                    qty=qty_delta, price=0, trade_status="completed",
+                                    executed_qty=qty_delta, requested_qty=remaining_qty2,
+                                    gpt_analysis=plan,
+                                    strategy_details={
+                                        "broker_msg": market_result.get('msg1') if isinstance(market_result, dict) else None,
                                         "batch": batch_name,
-                                        "order_type": "market"
-                                    }
-                                })
+                                        "order_type": "market",
+                                    },
+                                ))
                                 
                                 remaining_cash = new_cash
                                 any_order_placed = True
@@ -4355,12 +4410,12 @@ class Trader:
                     any_order_placed = True
                     # ✅ 매수 통계 반영(모의)
                     self.stats["buy"] += 1
-                    record_trade({
-                        "side": "buy", "ticker": ticker, "name": name,
-                        "qty": quantity, "price": order_price, "trade_status": "completed",
-                        "gpt_analysis": plan,
-                        "strategy_details": {"batch": batch_name}
-                    })
+                    record_trade(self._build_trade_record(
+                        order_id="", ticker=ticker, name=name, side="buy",
+                        qty=quantity, price=order_price, trade_status="completed",
+                        gpt_analysis=plan,
+                        strategy_details={"batch": batch_name},
+                    ))
                     logger.info(f"  -> [모의] {name}({ticker}) {quantity}주 @{order_price:,.0f}원 지정가 매수 실행. [{batch_name}]")
                     _notify_text(
                         f" [모의] BUY {name}({ticker}) x{quantity} @ {order_price:,.0f} [{batch_name}]",
@@ -4708,11 +4763,13 @@ class Trader:
                         logger.info(f"  -> ✅ 분할 지정가 주문 실제 체결 확인: {name}({ticker}) {executed_qty}주 (지연 확인)")
                         
                         # 정확한 거래 기록
-                        record_trade({
-                            "side": "buy", "ticker": ticker, "name": name,
-                            "qty": executed_qty, "price": order_price, "trade_status": "split_executed",
-                            "strategy_details": {"batch": "NEW", "order_type": "split", "delayed_confirmation": True}
-                        })
+                        record_trade(self._build_trade_record(
+                            order_id=str(last_odno) if last_odno else None,
+                            ticker=ticker, name=name, side="buy",
+                            qty=executed_qty, price=order_price, trade_status="split_executed",
+                            executed_qty=executed_qty, requested_qty=quantity,
+                            strategy_details={"batch": "NEW", "order_type": "split", "delayed_confirmation": True},
+                        ))
                         
                         # 통계 업데이트
                         self.stats["buy"] += 1
@@ -4739,11 +4796,12 @@ class Trader:
                     if execution_result.get('executed'):
                         executed_qty = execution_result.get('executed_qty', quantity)
                         logger.info(f"  -> ✅ 단일 지정가 주문 성공: {name}({ticker}) {executed_qty}주 (확인방식: {execution_result.get('status', 'unknown')})")
-                        record_trade({
-                            "side": "buy", "ticker": ticker, "name": name,
-                            "qty": executed_qty, "price": order_price, "trade_status": "limit_executed",
-                            "strategy_details": {"broker_msg": res.get('msg1'), "batch": "NEW", "order_type": "limit"}
-                        })
+                        record_trade(self._build_trade_record(
+                            res=res, ticker=ticker, name=name, side="buy",
+                            qty=executed_qty, price=order_price, trade_status="limit_executed",
+                            executed_qty=executed_qty, requested_qty=quantity,
+                            strategy_details={"broker_msg": res.get('msg1'), "batch": "NEW", "order_type": "limit"},
+                        ))
                         
                         # 통계 업데이트
                         self.stats["buy"] += 1
@@ -4776,11 +4834,13 @@ class Trader:
                         logger.info(f"  -> ✅ 단일 지정가 주문 실제 체결 확인: {name}({ticker}) {executed_qty}주 (지연 확인)")
                         
                         # 정확한 거래 기록
-                        record_trade({
-                            "side": "buy", "ticker": ticker, "name": name,
-                            "qty": executed_qty, "price": order_price, "trade_status": "limit_executed",
-                            "strategy_details": {"batch": "NEW", "order_type": "limit", "delayed_confirmation": True}
-                        })
+                        record_trade(self._build_trade_record(
+                            res=res,
+                            ticker=ticker, name=name, side="buy",
+                            qty=executed_qty, price=order_price, trade_status="limit_executed",
+                            executed_qty=executed_qty, requested_qty=quantity,
+                            strategy_details={"batch": "NEW", "order_type": "limit", "delayed_confirmation": True},
+                        ))
                         
                         # 통계 업데이트
                         self.stats["buy"] += 1
@@ -4796,22 +4856,23 @@ class Trader:
                         # 간단히: 현재 보유 수량이 목표 수량 이상이면 이미 체결된 것으로 간주
                         if current_qty >= quantity:
                             logger.info(f"  -> ✅ 이전 주문 체결 확인: {name}({ticker}) {current_qty}주 (시장가 폴백 불필요)")
-                            record_trade({
-                                "side": "buy", "ticker": ticker, "name": name,
-                                "qty": quantity, "price": order_price, "trade_status": "limit_executed",
-                                "strategy_details": {"batch": "NEW", "order_type": "limit", "delayed_confirmation": True}
-                            })
+                            record_trade(self._build_trade_record(
+                                ticker=ticker, name=name, side="buy",
+                                qty=quantity, price=order_price, trade_status="limit_executed",
+                                executed_qty=quantity, requested_qty=quantity,
+                                strategy_details={"batch": "NEW", "order_type": "limit", "delayed_confirmation": True},
+                            ))
                             self.stats["buy"] += 1
                             return True
                         
                         logger.warning(f"  -> 대체 주문 절차 진행: {name}({ticker})")
             else:
                 logger.info(f"  -> [모의] 단일 지정가 주문 성공: {name}({ticker})")
-                record_trade({
-                    "side": "buy", "ticker": ticker, "name": name,
-                    "qty": quantity, "price": order_price, "trade_status": "completed",
-                    "strategy_details": {"batch": "NEW"}
-                })
+                record_trade(self._build_trade_record(
+                    order_id="", ticker=ticker, name=name, side="buy",
+                    qty=quantity, price=order_price, trade_status="completed",
+                    strategy_details={"batch": "NEW"},
+                ))
                 
                 # 통계 업데이트
                 self.stats["buy"] += 1
@@ -4852,11 +4913,12 @@ class Trader:
                         if exec_res.get('executed'):
                             executed_qty = exec_res.get('executed_qty', quantity)
                             logger.info(f"  -> ✅ 시장성 지정가 주문 성공: {name}({ticker}) {executed_qty}주")
-                            record_trade({
-                                "side": "buy", "ticker": ticker, "name": name,
-                                "qty": executed_qty, "price": px, "trade_status": "limit_executed",
-                                "strategy_details": {"batch": "NEW", "order_type": "marketable_limit"}
-                            })
+                            record_trade(self._build_trade_record(
+                                res=alt_res, ticker=ticker, name=name, side="buy",
+                                qty=executed_qty, price=px, trade_status="limit_executed",
+                                executed_qty=executed_qty, requested_qty=quantity,
+                                strategy_details={"batch": "NEW", "order_type": "marketable_limit"},
+                            ))
                             self.stats["buy"] += 1
                             return True
                         else:

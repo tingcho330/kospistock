@@ -54,7 +54,7 @@
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — `OPENAI_API_KEY` 없으면 점수 기반으로 자동 폴백
 - **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·전략 믹서 기반 매도
-- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화
+- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
@@ -76,7 +76,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  config/config.json + config/.env (Git 제외)                             │
-│  output/  ← screener_*.json, gpt_trades_*.json, trading_log.db, cache/  │
+│  output/  ← screener_*.json, gpt_trades_*.json, trading_data.db, cache/  │
 └─────────────────────────────────────────────────────────────────────────┘
          ▲                              ▲
          │                              │
@@ -114,7 +114,7 @@
 screener.py                              health_check.py
   → screener_candidates_*.json             → news_collector.py
   → screener_scores_*.json                   → gpt_analyzer.py
-  → market_state_*.json                      → trader.py → recorder → trading_log.db
+  → market_state_*.json                      → trader.py → recorder → trading_data.db
          └──────────────────────────────────────────┘
                               (장중, 별도 컨테이너) risk_manager.py
 ```
@@ -145,11 +145,24 @@ screener.py                              health_check.py
 | `collected_news_*` | `news_collector.py` |
 | `gpt_trades_*` | `gpt_analyzer.py` |
 | `balance_*`, `daily_balances/`, `summary_*` | `account.py` / 통합 매니저 |
-| `trading_log.db` | `recorder.py` |
+| `trading_data.db` | `recorder.py` (SQLite `trade_records`) |
+| `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
 | `cache/` (토큰, `.mst`, `.pkl` 등) | KIS·스크리너 |
 
 Git에는 `output/.gitkeep`만 추적합니다.
+
+### 3.7 거래 DB·주문번호(`order_id`)
+
+| 항목 | 내용 |
+|------|------|
+| 저장 | `output/trading_data.db` — 주문·체결 메타(`order_id`, `executed_qty`, `order_status`) |
+| 매매 기록 | `trader.py`의 `_build_trade_record()` → `record_trade()` — 즉시 체결 시에도 KIS `ODNO` 저장 |
+| 리컨실 (15:22) | `order_reconciler.py` — `pending`/`partial` + `order_id` 있는 행을 KIS와 상태 동기화 |
+| orphan backfill | 리컨실 마지막에 자동 실행 — `order_id` 빈 행을 KIS 일별 주문과 **유일 매칭** 시 backfill |
+| 수동 backfill | `python src/order_reconciler.py --since-hours 36 --backfill-only` |
+
+> 컨테이너 이미지에 `sqlite3` CLI가 없습니다. DB 확인은 아래 [7.3](#73-수동--단발-실행) Python 예시를 사용하세요.
 
 ### 3.6 KIS API 계층
 
@@ -179,14 +192,14 @@ Git에는 `output/.gitkeep`만 추적합니다.
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT 또는 휴리스틱 매매 계획 JSON 생성 |
-| `trader.py` | 매수/매도·체결·분할매수·`--batch-check-only` |
+| `trader.py` | 매수/매도·체결·분할매수·`_build_trade_record()`·`--batch-check-only` |
 
 ### 기록·정합성·분석
 
 | 파일 | 역할 |
 |------|------|
-| `recorder.py` | SQLite `trading_log.db` |
-| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 |
+| `recorder.py` | SQLite `trading_data.db`, upsert/backfill API |
+| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
 | `reviewer.py` | FIFO 손익·승률·`config.json` 자동 튜닝 (월간) |
 | `rotation_manager.py` | 회전 매매 (`rotation.enabled`) |
 | `account.py` | 잔고·요약 JSON |
@@ -218,7 +231,7 @@ Git에는 `output/.gitkeep`만 추적합니다.
 | AI | `openai` (선택) |
 | 스크래핑 | `beautifulsoup4` |
 | 설정 | `python-dotenv`, `PyYAML` |
-| DB | SQLite (`output/trading_log.db`) |
+| DB | SQLite (`output/trading_data.db`) |
 | 배포 | Docker, Docker Compose |
 
 **외부 API:** KIS Open API, Naver Search API, OpenAI API(선택), Discord Webhook(선택)
@@ -353,9 +366,21 @@ docker compose exec integrated_manager python -u /app/src/news_collector.py
 docker compose exec integrated_manager python -u /app/src/gpt_analyzer.py --market KOSPI --slots 3
 docker compose exec integrated_manager python -u /app/src/trader.py
 
-# 체결 확인·리컨실
+# 체결 확인·리컨실 (pending/partial 갱신 + orphan order_id backfill)
 docker compose exec integrated_manager python -u /app/src/trader.py --batch-check-only
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --limit 800
+
+# order_id 누락 행만 KIS 일별 주문으로 backfill
+docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --backfill-only
+
+# DB 확인 (컨테이너에 sqlite3 CLI 없음 → Python 사용)
+docker compose exec integrated_manager python -c "
+import sqlite3
+for r in sqlite3.connect('/app/output/trading_data.db').execute(
+    'SELECT id, ticker, order_id, executed_qty, order_status FROM trade_records ORDER BY id'
+):
+    print('|'.join(str(x) for x in r))
+"
 ```
 
 호스트에서 직접 실행 시 (`config/.env`·`output/` 경로 유지):
@@ -375,7 +400,8 @@ python run_integrated_manager.py --once
 | 변수 | 용도 |
 |------|------|
 | `LOG_LEVEL` | `DEBUG` / `INFO` (기본 `INFO`) |
-| `DB_RECORD_DEBUG` | `1` 시 DB 디버그 로그 |
+| `DB_RECORD_DEBUG` | `1` 시 DB 기록 추적 로그 (`[DB_DEBUG]`) |
+| `DB_DEBUG_LOG_FILE` | DB 디버그 로그 경로 (기본 `output/debug/db_record_debug.log`) |
 | `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃(초) |
 | `SCRIPT_TIMEOUT_SEC` | 기타 스크립트 타임아웃 |
 
