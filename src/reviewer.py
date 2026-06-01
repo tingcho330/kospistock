@@ -617,12 +617,17 @@ def refresh_sell_pnl_batch(recorder: Any, sells: List[Any]) -> int:
     return n
 
 
-def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
+def analyze_win_loss(trade_records: List[Any], *, include_pending_for_stats: bool = False) -> Dict[str, Any]:
     """체결 완료 매도 기록으로부터 승패 통계를 계산한다."""
-    sells = filter_completed_sells(trade_records)
-    if not sells:
-        sells = [t for t in trade_records if str(getattr(t, "action", "")).lower() == "sell"]
+    completed = filter_completed_sells(trade_records)
+    all_sells = [t for t in trade_records if str(getattr(t, "action", "")).upper() == "SELL"]
+    sells = completed
+    used_pending_fallback = False
+    if not sells and include_pending_for_stats and all_sells:
+        sells = all_sells
+        used_pending_fallback = True
     n = len(sells)
+    n_completed = len(completed)
     wins = [t for t in sells if (getattr(t, "profit_loss", 0.0) or 0.0) > 0]
     losses = [t for t in sells if (getattr(t, "profit_loss", 0.0) or 0.0) < 0]
 
@@ -649,8 +654,9 @@ def analyze_win_loss(trade_records: List[Any]) -> Dict[str, Any]:
             cur = 0
 
     base = {
-        "sell_trades": n,
-        "completed_sell_trades": n,
+        "sell_trades": len(all_sells),
+        "completed_sell_trades": n_completed,
+        "stats_include_pending": used_pending_fallback,
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": round(win_rate, 4),
@@ -1073,10 +1079,13 @@ def run_review() -> Dict[str, Any]:
             trades = recorder.get_trade_records(start_date=start_dt, end_date=end_dt)
             completed_sells = filter_completed_sells(trades)
 
-    # 2) 승패·사유 분석
-    stats = analyze_win_loss(trades)
-    sell_summary = summarize_sell_context(completed_sells)
-    trade_digest = build_trade_digest(completed_sells, max_items=max_digest)
+    # 2) 승패·사유 분석 (보수 모드: 체결 매도 없으면 pending 포함해 사유만 GPT에 전달)
+    review_sells = completed_sells
+    if not review_sells and allow_partial:
+        review_sells = [t for t in trades if str(getattr(t, "action", "")).upper() == "SELL"]
+    stats = analyze_win_loss(trades, include_pending_for_stats=allow_partial)
+    sell_summary = summarize_sell_context(review_sells)
+    trade_digest = build_trade_digest(review_sells, max_items=max_digest)
     logger.info(f"[stats] {stats}")
     logger.info(f"[sell_summary] completed={sell_summary.get('completed_sell_count', 0)}")
 
@@ -1091,7 +1100,7 @@ def run_review() -> Dict[str, Any]:
         except Exception as e:
             logger.debug(f"스냅샷 요약 실패: {e}")
     gpt_hints = load_gpt_trade_hints(lookback_days)
-    gpt_comparisons = join_gpt_outcomes(completed_sells, gpt_hints)
+    gpt_comparisons = join_gpt_outcomes(review_sells, gpt_hints)
     if gpt_comparisons:
         logger.info(f"[gpt_compare] {len(gpt_comparisons)}건")
 
@@ -1108,7 +1117,8 @@ def run_review() -> Dict[str, Any]:
         logger.error(f"config 로드 실패({config_path}): {e}")
         cfg = None
 
-    n_completed = int(stats.get("completed_sell_trades", stats.get("sell_trades", 0)))
+    n_completed = int(stats.get("completed_sell_trades", 0))
+    n_all_sells = int(stats.get("sell_trades", 0))
     sample_insufficient = n_completed < min_trades
 
     result: Dict[str, Any] = {
