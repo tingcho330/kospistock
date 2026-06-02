@@ -583,23 +583,25 @@ class RiskManager:
         return df
 
     # ── screener_core 호출로 실시간 지표/레벨 ───────────────────────────
-    def compute_realtime_levels(self, ticker: str, entry_price: float) -> Dict:
+    def compute_realtime_levels(self, ticker: str, current_price: float, base_price: Optional[float] = None) -> Dict:
         """
         손절가/목표가/RSI 계산(파일 참조 없이 함수 호출).
-        - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
+        - current_price: 현재가(지표/판단용)
+        - base_price: 손절/목표가 산정 기준가(기본: current_price, 권장: 진입가/평단)
         인터페이스 보장: 항상 {'손절가','목표가','RSI','Price','source'} 포함.
         """
         t = str(ticker).zfill(6)
-        ep = float(entry_price)
+        cp = float(current_price)
+        bp = float(base_price) if base_price is not None else cp
         risk_params = self.config.get("risk_params", {}) or {}
         strategy_params = self.config.get("strategy_params", {}) or {}  # Phase 1: strategy_params 추가
 
         # 기본 페이로드 + 퍼센트 백업(선적용, 이후 코어 계산 성공 시 덮어씀)
         out: Dict = {
             "Ticker": t,
-            "Price": int(round(ep)),
+            "Price": int(round(cp)) if cp > 0 else int(round(bp)),
             "RSI": 50.0,
-            **_percent_backup_levels(ep, risk_params),
+            **_percent_backup_levels(bp, risk_params),
         }
 
         # 1) 손절/목표가 (성공 시만 덮어쓰기)
@@ -607,13 +609,13 @@ class RiskManager:
             date_str = datetime.now(KST).strftime("%Y%m%d")
             
             # 현재 가격을 안전하게 변환
-            safe_ep = _to_float(ep, 0)
-            if safe_ep <= 0:
-                logger.warning(f"[{t}] 잘못된 현재가: {ep}, 백업 사용")
-                raise ValueError(f"Invalid current price: {ep}")
+            safe_bp = _to_float(bp, 0)
+            if safe_bp <= 0:
+                logger.warning(f"[{t}] 잘못된 기준가: base_price={bp}, 백업 사용")
+                raise ValueError(f"Invalid base price: {bp}")
             
             # Phase 1: strategy_params 전달
-            levels = _compute_levels(t, safe_ep, date_str, risk_params, strategy_params)
+            levels = _compute_levels(t, safe_bp, date_str, risk_params, strategy_params)
             if isinstance(levels, dict):
                 if "손절가" in levels and "목표가" in levels:
                     stop_loss = _to_float(levels["손절가"], out["손절가"])
@@ -1939,7 +1941,9 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     continue
 
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 실시간 레벨 계산 시작")
-                stock_info = rm.compute_realtime_levels(ticker, cur_price)
+                avg_price = _to_float(h.get("pchs_avg_pric"), 0.0)
+                base_price = avg_price if avg_price > 0 else cur_price
+                stock_info = rm.compute_realtime_levels(ticker, cur_price, base_price=base_price)
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 조건 판단 시작")
                 decision, reason, structured_context = rm.check_sell_condition(h, stock_info)
                 if decision == "SELL":

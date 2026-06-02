@@ -145,6 +145,23 @@ class DataRecorder:
                         structured_context TEXT DEFAULT ''
                     )
                 ''')
+
+                # 포지션 테이블 (A안): 티커 단위로 entry/stop/target을 영속 저장
+                # - 기존 보유 종목이 trade_records에 BUY 기록이 없어도 동작하게 하기 위함
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS positions (
+                        ticker TEXT PRIMARY KEY,
+                        entry_price REAL NOT NULL,
+                        stop_price REAL NOT NULL,
+                        target_price REAL NOT NULL,
+                        levels_source TEXT NOT NULL,
+                        levels_updated_at TEXT NOT NULL,
+                        entry_updated_at TEXT NOT NULL,
+                        qty INTEGER DEFAULT 0,
+                        avg_price REAL DEFAULT 0.0,
+                        last_seen_at TEXT DEFAULT ''
+                    )
+                ''')
                 
                 # 포트폴리오 스냅샷 테이블
                 cursor.execute('''
@@ -216,6 +233,13 @@ class DataRecorder:
                     CREATE INDEX IF NOT EXISTS idx_rsi_history_ticker_timestamp 
                     ON rsi_history(ticker, timestamp DESC)
                 ''')
+
+                # positions 인덱스 (운영 편의)
+                try:
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_last_seen_at ON positions(last_seen_at)")
+                    conn.commit()
+                except Exception:
+                    pass
                 
                 # order_status 컬럼 추가 (기존 DB 마이그레이션, 당일 매도 방지용)
                 try:
@@ -1323,6 +1347,113 @@ class DataRecorder:
             self.logger.error(f"RSI 이력 조회 실패 ({ticker}): {e}")
             return []
 
+    # ───────────────── 포지션 레벨(진입가 기준) ─────────────────
+    def get_position(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """positions 테이블에서 티커 포지션(레벨) 조회."""
+        try:
+            ticker_str = str(ticker).zfill(6)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT
+                        ticker, entry_price, stop_price, target_price,
+                        levels_source, levels_updated_at, entry_updated_at,
+                        qty, avg_price, last_seen_at
+                    FROM positions
+                    WHERE ticker = ?
+                    """,
+                    (ticker_str,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    "ticker": row[0],
+                    "entry_price": float(row[1]),
+                    "stop_price": float(row[2]),
+                    "target_price": float(row[3]),
+                    "levels_source": row[4],
+                    "levels_updated_at": row[5],
+                    "entry_updated_at": row[6],
+                    "qty": int(row[7] or 0),
+                    "avg_price": float(row[8] or 0.0),
+                    "last_seen_at": row[9] or "",
+                }
+        except Exception as e:
+            self.logger.error(f"포지션 조회 실패 ({ticker}): {e}")
+            return None
+
+    def upsert_position_levels(
+        self,
+        *,
+        ticker: str,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        levels_source: str,
+        levels_updated_at: str,
+        entry_updated_at: str,
+        qty: int = 0,
+        avg_price: float = 0.0,
+        last_seen_at: str = "",
+    ) -> bool:
+        """positions 테이블에 포지션(레벨) upsert."""
+        try:
+            ticker_str = str(ticker).zfill(6)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO positions (
+                        ticker, entry_price, stop_price, target_price,
+                        levels_source, levels_updated_at, entry_updated_at,
+                        qty, avg_price, last_seen_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        entry_price = excluded.entry_price,
+                        stop_price = excluded.stop_price,
+                        target_price = excluded.target_price,
+                        levels_source = excluded.levels_source,
+                        levels_updated_at = excluded.levels_updated_at,
+                        entry_updated_at = excluded.entry_updated_at,
+                        qty = excluded.qty,
+                        avg_price = excluded.avg_price,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        ticker_str,
+                        float(entry_price),
+                        float(stop_price),
+                        float(target_price),
+                        str(levels_source or ""),
+                        str(levels_updated_at or ""),
+                        str(entry_updated_at or ""),
+                        int(qty or 0),
+                        float(avg_price or 0.0),
+                        str(last_seen_at or ""),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"포지션 upsert 실패 ({ticker}): {e}")
+            return False
+
+    def delete_position(self, ticker: str) -> bool:
+        """전량매도 등으로 오픈 포지션 정리(삭제)."""
+        try:
+            ticker_str = str(ticker).zfill(6)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM positions WHERE ticker = ?", (ticker_str,))
+                conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"포지션 삭제 실패 ({ticker}): {e}")
+            return False
+
 # 전역 DataRecorder 인스턴스
 _recorder_instance = None
 
@@ -1499,6 +1630,44 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
         logging.getLogger(__name__).error(f"거래 기록 저장 실패: {e}", exc_info=True)
         _db_dbg_log("record_trade.EXCEPTION", error=str(e), caller=_db_dbg_caller(2))
         return False
+
+
+def get_position(ticker: str) -> Optional[Dict[str, Any]]:
+    """positions 조회 (하위 호환성 헬퍼)."""
+    return get_recorder().get_position(ticker)
+
+
+def upsert_position_levels(
+    *,
+    ticker: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    levels_source: str,
+    levels_updated_at: str,
+    entry_updated_at: str,
+    qty: int = 0,
+    avg_price: float = 0.0,
+    last_seen_at: str = "",
+) -> bool:
+    """positions upsert (하위 호환성 헬퍼)."""
+    return get_recorder().upsert_position_levels(
+        ticker=ticker,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        levels_source=levels_source,
+        levels_updated_at=levels_updated_at,
+        entry_updated_at=entry_updated_at,
+        qty=qty,
+        avg_price=avg_price,
+        last_seen_at=last_seen_at,
+    )
+
+
+def delete_position(ticker: str) -> bool:
+    """positions 삭제 (하위 호환성 헬퍼)."""
+    return get_recorder().delete_position(ticker)
 
 def _normalize_ticker_6(ticker: str) -> str:
     """종목코드 6자리 표준 형식 (recorder 전용, utils 의존 없음)."""

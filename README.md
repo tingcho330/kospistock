@@ -54,7 +54,9 @@
 - **다단계 스크리닝** — 1차 유동성 필터 → 종합 점수 → 모멘텀·변동성·섹터 다양화 (`--debug` 시 퍼널 로그)
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — `OPENAI_API_KEY` 없으면 점수 기반으로 자동 폴백
-- **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·전략 믹서 기반 매도
+- **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·전략 믹서 기반 매도  
+  - **진입가(평단) 기준 목표가/손절가**를 사용하며, 레벨은 SQLite `positions` 테이블에 저장됩니다.  
+  - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
@@ -147,7 +149,7 @@ screener.py                              health_check.py
 | `collected_news_*` | `news_collector.py` |
 | `gpt_trades_*` | `gpt_analyzer.py` |
 | `balance_*`, `daily_balances/`, `summary_*` | `account.py` / 통합 매니저 |
-| `trading_data.db` | `recorder.py` (SQLite `trade_records`) |
+| `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
 | `cache/` (토큰, `.mst`, `.pkl` 등) | KIS·스크리너 |
@@ -159,6 +161,7 @@ Git에는 `output/.gitkeep`만 추적합니다.
 | 항목 | 내용 |
 |------|------|
 | 저장 | `output/trading_data.db` — 주문·체결 메타(`order_id`, `executed_qty`, `order_status`) |
+| 포지션 레벨 | `output/trading_data.db` — `positions` 테이블에 티커별 `entry_price/stop_price/target_price` 저장 (진입가 기준) |
 | 매매 기록 | `trader.py`의 `_build_trade_record()` → `record_trade()` — 즉시 체결 시에도 KIS `ODNO` 저장 |
 | 리컨실 (15:22) | `order_reconciler.py` — `pending`/`partial` + `order_id` 있는 행을 KIS와 상태 동기화 |
 | orphan backfill | 리컨실 마지막에 자동 실행 — `order_id` 빈 행을 KIS 일별 주문과 **유일 매칭** 시 backfill |
@@ -214,7 +217,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 
 | 파일 | 역할 |
 |------|------|
-| `recorder.py` | SQLite `trading_data.db`, upsert/backfill API |
+| `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill API |
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |

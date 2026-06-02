@@ -61,6 +61,9 @@ from recorder import (
     fetch_trades_by_tickers,
     mark_pending_buy_cancelled,
     mark_pending_order_cancelled,
+    get_position,
+    upsert_position_levels,
+    delete_position,
 )
 
 try:
@@ -83,6 +86,8 @@ from gpt_analyzer import (
     get_gpt_enhanced_rebalance_candidates,
     fallback_rebalance_logic
 )
+
+from screener_core import _compute_levels
 
 # ── 디스코드 노티파이어 ───────────────────────────────────────────────
 from notifier import (
@@ -339,6 +344,10 @@ class Trader:
             key=f"phase:init:{self.run_id}", cooldown=60
         )
 
+        # positions(진입가 기준 레벨) 운용 파라미터
+        self._entry_price_update_abs_won = 1.0
+        self._entry_price_update_rel = 0.001  # 0.1%
+
     def _load_latest_market_state(self) -> Optional[Dict[str, Any]]:
         """
         screener가 output/market_state_YYYYMMDD_MARKET.json 로 저장한 시장 상태를 로드한다.
@@ -359,6 +368,106 @@ class Trader:
         except Exception as e:
             logger.debug("screener market_state 로드 실패: %s", e)
             return None
+
+    def _compute_levels_from_entry(self, ticker: str, entry_price: float) -> Dict[str, Any]:
+        """진입가(평단) 기준으로 손절/목표가를 계산한다."""
+        date_str = datetime.now(KST).strftime("%Y%m%d")
+        strategy_params = self.settings.get("strategy_params", {}) or {}
+        return _compute_levels(str(ticker).zfill(6), float(entry_price), date_str, self.risk_params, strategy_params)
+
+    def _should_update_entry_price(self, old_entry: float, new_entry: float) -> bool:
+        try:
+            if old_entry <= 0 or new_entry <= 0:
+                return False
+            abs_diff = abs(new_entry - old_entry)
+            if abs_diff > float(self._entry_price_update_abs_won):
+                return True
+            rel_diff = abs_diff / old_entry if old_entry > 0 else 0.0
+            return rel_diff >= float(self._entry_price_update_rel)
+        except Exception:
+            return False
+
+    def _ensure_position_levels(self, *, ticker: str, entry_price: float, qty: int, avg_price: float) -> Dict[str, Any]:
+        """
+        positions 테이블에 티커 레벨이 없으면 생성하고, 있으면 유리한 방향으로만 갱신한다.
+        반환: positions row dict (entry/stop/target 등)
+        """
+        now_iso = datetime.now(KST).isoformat()
+        ticker6 = str(ticker).zfill(6)
+        entry_price = float(entry_price or 0.0)
+        qty = int(qty or 0)
+        avg_price = float(avg_price or 0.0)
+
+        pos = get_position(ticker6)
+        if pos is None:
+            lv = self._compute_levels_from_entry(ticker6, entry_price)
+            stop_px = float(lv.get("손절가") or 0.0)
+            tgt_px = float(lv.get("목표가") or 0.0)
+            src = str(lv.get("source") or "percent_backup")
+            upsert_position_levels(
+                ticker=ticker6,
+                entry_price=entry_price,
+                stop_price=stop_px,
+                target_price=tgt_px,
+                levels_source=src,
+                levels_updated_at=now_iso,
+                entry_updated_at=now_iso,
+                qty=qty,
+                avg_price=avg_price,
+                last_seen_at=now_iso,
+            )
+            logger.info(
+                f"[positions] INIT {ticker6} entry={entry_price:,.2f} stop={stop_px:,.2f} target={tgt_px:,.2f} "
+                f"src={src} qty={qty}"
+            )
+            return get_position(ticker6) or {
+                "ticker": ticker6,
+                "entry_price": entry_price,
+                "stop_price": stop_px,
+                "target_price": tgt_px,
+                "levels_source": src,
+                "levels_updated_at": now_iso,
+                "entry_updated_at": now_iso,
+                "qty": qty,
+                "avg_price": avg_price,
+                "last_seen_at": now_iso,
+            }
+
+        cur_entry = float(pos.get("entry_price") or 0.0)
+        entry_updated = False
+        if self._should_update_entry_price(cur_entry, entry_price):
+            cur_entry = entry_price
+            entry_updated = True
+
+        lv = self._compute_levels_from_entry(ticker6, cur_entry)
+        new_stop = float(lv.get("손절가") or 0.0)
+        new_tgt = float(lv.get("목표가") or 0.0)
+        src = str(lv.get("source") or pos.get("levels_source") or "percent_backup")
+
+        prev_stop = float(pos.get("stop_price") or 0.0)
+        prev_tgt = float(pos.get("target_price") or 0.0)
+        stop_px = max(prev_stop, new_stop) if (prev_stop > 0 and new_stop > 0) else (new_stop or prev_stop)
+        tgt_px = min(prev_tgt, new_tgt) if (prev_tgt > 0 and new_tgt > 0) else (new_tgt or prev_tgt)
+
+        upsert_position_levels(
+            ticker=ticker6,
+            entry_price=cur_entry,
+            stop_price=stop_px,
+            target_price=tgt_px,
+            levels_source=src,
+            levels_updated_at=now_iso,
+            entry_updated_at=(now_iso if entry_updated else str(pos.get("entry_updated_at") or now_iso)),
+            qty=qty,
+            avg_price=avg_price,
+            last_seen_at=now_iso,
+        )
+        if entry_updated or stop_px != prev_stop or tgt_px != prev_tgt:
+            logger.info(
+                f"[positions] UPDATE {ticker6} entry={cur_entry:,.2f}"
+                f"{' (entry_changed)' if entry_updated else ''} "
+                f"stop={prev_stop:,.2f}->{stop_px:,.2f} target={prev_tgt:,.2f}->{tgt_px:,.2f} src={src} qty={qty}"
+            )
+        return get_position(ticker6) or pos
 
     # ── 공통 버퍼 통일: cash_buffer_ratio vs affordability_buffer ───────
     def _eff_buffer(self) -> float:
@@ -1414,6 +1523,16 @@ class Trader:
                 }
                 _db_dbg_trade_in("trader.finalize_buy.EXECUTED_DB", _executed_payload, res=res)
                 record_trade(_executed_payload)
+                # positions: 진입가 기준 레벨 초기화/갱신 (체결 시점)
+                try:
+                    self._ensure_position_levels(
+                        ticker=ticker,
+                        entry_price=float(price),
+                        qty=int(executed_qty),
+                        avg_price=float(price),
+                    )
+                except Exception as e:
+                    logger.debug(f"[positions] BUY executed 레벨 초기화 실패: {ticker} err={e}")
                 self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
                 return ("executed", executed_qty)
         # 접수만 된 경우 또는 제출됨 → pending 기록으로 당일 매도 방지가 즉시 적용되도록 DB에 남김
@@ -1433,6 +1552,16 @@ class Trader:
                     }
                     _db_dbg_trade_in("trader.finalize_buy.PENDING_DB", _pending_payload, res=res)
                     record_trade(_pending_payload)
+                    # positions: pending 단계에서도 entry 기준 레벨을 미리 만들어둔다(당일 매도방지/일관성)
+                    try:
+                        self._ensure_position_levels(
+                            ticker=ticker,
+                            entry_price=float(price),
+                            qty=int(requested_qty),
+                            avg_price=float(price),
+                        )
+                    except Exception as e:
+                        logger.debug(f"[positions] BUY pending 레벨 초기화 실패: {ticker} err={e}")
                     logger.info(f"[{context}] 주문 제출 완료: {name}({ticker}) {requested_qty}주 @ {price:,.0f}원 (15시 20분 체결 확인, 당일 매도 방지 적용)")
                 else:
                     logger.warning(
@@ -2254,17 +2383,28 @@ class Trader:
                 if current_price > 0:
                     stock_info["Price"] = current_price
 
-                rt_levels = self.risk_manager.compute_realtime_levels(ticker, current_price) or {}
+                # positions(진입가 기준) 레벨 오버레이 + 트레일링 갱신
+                avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
+                entry_base = avg_price if avg_price > 0 else float(current_price)
+                pos = self._ensure_position_levels(
+                    ticker=ticker,
+                    entry_price=entry_base,
+                    qty=quantity,
+                    avg_price=avg_price if avg_price > 0 else entry_base,
+                )
+                if pos:
+                    stock_info["손절가"] = _to_int(pos.get("stop_price", 0))
+                    stock_info["목표가"] = _to_int(pos.get("target_price", 0))
+                    stock_info["source"] = str(pos.get("levels_source") or stock_info.get("source") or "positions")
+
+                # RSI 등 지표는 risk_manager로 계산 (목표/손절은 positions를 우선)
+                try:
+                    rt_levels = self.risk_manager.compute_realtime_levels(ticker, current_price, base_price=entry_base) or {}
+                except TypeError:
+                    # 구버전 호환(시그니처 변경 전) - RSI만 필요하므로 기존 호출 폴백
+                    rt_levels = self.risk_manager.compute_realtime_levels(ticker, current_price) or {}
                 if "RSI" in rt_levels and rt_levels["RSI"] is not None:
                     stock_info["RSI"] = float(rt_levels["RSI"])
-                if "손절가" in rt_levels and rt_levels["손절가"] is not None:
-                    stock_info["손절가"] = _to_int(rt_levels["손절가"])
-                if "목표가" in rt_levels and rt_levels["목표가"] is not None:
-                    stock_info["목표가"] = _to_int(rt_levels["목표가"])
-                if "Price" in rt_levels and rt_levels["Price"] is not None:
-                    stock_info["Price"] = _to_int(rt_levels["Price"])
-                if "source" in rt_levels and rt_levels["source"]:
-                    stock_info["source"] = rt_levels["source"]
             except Exception as e:
                 logger.debug(f"[{ticker}] 실시간 레벨 오버레이 실패: {e}")
 
@@ -2490,6 +2630,14 @@ class Trader:
                     except Exception as e:
                         logger.debug(f"[{ticker}] 전량매도 후 쿨다운 갱신 실패: {e}")
 
+                    # positions 정리: 전량매도 시 포지션 레벨 삭제
+                    try:
+                        if filled_qty > 0 and filled_qty >= pre_qty:
+                            logger.info(f"[positions] DELETE {str(ticker).zfill(6)} (full_exit)")
+                            delete_position(ticker)
+                    except Exception as e:
+                        logger.debug(f"[positions] 전량매도 포지션 삭제 실패: {ticker} err={e}")
+
                     if filled_qty == 0:
                         logger.info("  -> 응답은 성공이나 즉시 체결 없음(미체결 가능). submitted로 기록.")
                 else:
@@ -2539,6 +2687,12 @@ class Trader:
                 # ✅ 매도 통계 반영(모의)
                 self.stats["sell"] += 1
                 self._add_to_cooldown(ticker, "모의 매도 완료")
+                # positions 정리(모의): 전량매도로 간주
+                try:
+                    logger.info(f"[positions] DELETE {str(ticker).zfill(6)} (paper_full_exit)")
+                    delete_position(ticker)
+                except Exception as e:
+                    logger.debug(f"[positions] 모의 전량매도 포지션 삭제 실패: {ticker} err={e}")
                 # 모의환경: 부분익절 이력이 있었다면 전량매도 후에도 동일하게 재진입 차단 갱신
                 try:
                     if self._had_partial_sell(ticker):
