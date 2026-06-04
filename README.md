@@ -60,6 +60,7 @@
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
+- **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 비교 후 Discord 전송. 실현 손익은 `trading_data.db` 체결 매도 `profit_loss` 합, 미실현은 계속 보유 종목 평가 변화
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
 ---
@@ -98,16 +99,33 @@
 
 | 시각 | 작업 | 실행 |
 |------|------|------|
-| 09:00 | 장시작 잔액 | `account.py` |
+| 09:00 | 장시작 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("open")` → `output/daily_balances/` |
 | 09:10 | 스크리너 | `screener.py` |
 | 10:15 | 매매 파이프라인 | `health_check` → `news_collector` → `gpt_analyzer` → `trader` |
 | 15:20 | 일괄 체결 확인 | `trader.py --batch-check-only` |
 | 15:22 | 주문 정합성 | `order_reconciler.py` |
-| 15:30 | 장종료 잔액 | `account.py` |
-| 15:35 | 일일 요약 | Discord (`send_daily_trading_summary`) |
+| 15:30 | 장종료 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("close")` |
+| 15:35 | 일일 요약 | Discord (`send_daily_trading_summary`) — `daily_summary.summary_send_time`으로 변경 가능 |
 
 - 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day`)
 - **월간 유지보수:** 매일 점검 후 `monthly_maintenance.day`(기본 1일)에 1회 — `reviewer.py` → `cleanup_output.py` (기본 16:00)
+
+### 3.2.1 일일 매매 요약 (Discord)
+
+`compare_balances()` + `send_daily_trading_summary()`가 `balance_open_YYYYMMDD.json` / `balance_close_YYYYMMDD.json`을 비교합니다.
+
+| 표시 항목 | 계산 방식 |
+|-----------|-----------|
+| 잔액 변화 · 일일 수익률 | 장시작/종료 `total_balance` 차이 |
+| 현금 변화 · 보유평가 변화 | 각 스냅샷 `cash` / `holdings_value` 차이 (합 = 잔액 변화) |
+| 실현 손익 | 당일 체결 매도 `trade_records.profit_loss` 합 (`recorder`) |
+| 미실현 손익 | **장중 계속 보유** 종목만: 종료 평가액 − 시작 평가액 |
+| 수수료·세금 | 당일 체결 거래 `commission + tax` 합 |
+| 매매 내역 | 스냅샷 기준 매도/매수 종목 수 (티커 집합 차이) |
+| 보유종목 | **장마감** 스냅샷 `holdings_count` |
+
+> 실현 손익이 0으로 나오면 당일 매도가 DB에 없거나 `profit_loss` 미계산일 수 있습니다. `order_reconciler` 실행 후 `recorder.recompute_profit_loss_for_order_id()`로 보정하세요.  
+> `account.py`는 수동 잔고 조회·`balance_*.json` 저장용이며, 스케줄 스냅샷 경로(`daily_balances/`)와는 별도입니다.
 
 ### 3.3 스크리너 vs 매매 파이프라인
 
@@ -148,7 +166,8 @@ screener.py                              health_check.py
 | `screener_*`, `market_state_*` | `screener.py` |
 | `collected_news_*` | `news_collector.py` |
 | `gpt_trades_*` | `gpt_analyzer.py` |
-| `balance_*`, `daily_balances/`, `summary_*` | `account.py` / 통합 매니저 |
+| `balance_*`, `summary_*` | `account.py` (수동 조회) |
+| `daily_balances/balance_{open,close}_*.json` | `integrated_manager.capture_balance_snapshot` |
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
@@ -196,7 +215,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 
 | 파일 | 역할 |
 |------|------|
-| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, 잔액·요약·리컨실, 파이프라인 상태 복구 |
+| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, `daily_balances` 스냅샷·일일 Discord 요약·리컨실, 파이프라인 상태 복구 |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 (`--once`, `--capture-open` 등) |
 | `risk_manager.py` | 장중 리스크 사이클, 매도·파이프라인 재기동 |
 | `run_background_risk_manager.py` | 리스크 전용 컨테이너 진입점 (`BackgroundRiskManager`) |
@@ -321,13 +340,6 @@ trader.run_buy_logic
                                                       └→ 매도(REBALANCE_SWAP / ROTATION_SWAP) → 매수
 ```
 
-#### 단위 테스트
-
-```bash
-pip install -r requirements.txt
-PYTHONPATH=src python3 -m unittest tests.test_rotation_policy -v
-```
-
 ---
 
 ## 5. 기술 스택
@@ -404,7 +416,7 @@ PYTHONPATH=src python3 -m unittest tests.test_rotation_policy -v
 
 | 시각·구분 | 스크립트 | API |
 |-----------|----------|-----|
-| 09:00 | `account.py` | KIS |
+| 09:00 | 잔액 스냅샷 (`integrated_manager`) | KIS |
 | 09:10 | `screener.py` | KIS |
 | 10:15~ | `health_check` → `news` → `gpt` → `trader` | KIS, Naver, OpenAI(선택) |
 | 장중 | `risk_manager` | KIS |
@@ -533,9 +545,8 @@ kospistock/
 │   ├── .env                     # 로컬 비밀값 (Git 제외)
 │   └── kis_devlp.yaml           # 로컬 KIS 기본값 (Git 제외, 선택)
 ├── output/
-│   └── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
-├── tests/
-│   └── test_rotation_policy.py  # 회전 정책 단위 테스트
+│   ├── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
+│   └── daily_balances/          # balance_open_*.json, balance_close_*.json (런타임)
 ├── src/
 │   ├── api/
 │   │   ├── kis_auth.py

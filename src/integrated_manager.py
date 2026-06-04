@@ -439,6 +439,51 @@ def load_balance_snapshot(date: str, snapshot_type: str) -> Optional[Dict]:
         logger.debug("잔액 스냅샷 로드 상세 오류:", exc_info=True)
     return None
 
+def _kst_day_bounds(date_yyyymmdd: str) -> Tuple[datetime, datetime]:
+    """YYYYMMDD(KST) 하루 구간."""
+    day = datetime.strptime(date_yyyymmdd, "%Y%m%d").replace(tzinfo=KST)
+    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return start, end
+
+
+def _get_daily_trade_stats(date_yyyymmdd: str) -> Dict:
+    """당일 체결 거래 DB 집계 — 실현손익·수수료·세금."""
+    out = {
+        "realized_pnl": None,
+        "fees_taxes": None,
+        "trade_count": 0,
+    }
+    try:
+        from recorder import DataRecorder, is_completed_sell
+
+        db_path = str(OUTPUT_DIR / "trading_data.db")
+        if not Path(db_path).exists():
+            return out
+
+        start, end = _kst_day_bounds(date_yyyymmdd)
+        rec = DataRecorder(db_path)
+        trades = rec.get_trade_records(start_date=start, end_date=end)
+
+        completed = [
+            t
+            for t in trades
+            if str(getattr(t, "order_status", "executed") or "").lower()
+            not in ("pending", "cancelled", "failed", "submitted")
+            and (int(getattr(t, "executed_qty", 0) or 0) > 0 or int(getattr(t, "quantity", 0) or 0) > 0)
+        ]
+        sells = [t for t in completed if is_completed_sell(t)]
+
+        out["realized_pnl"] = int(round(sum(float(t.profit_loss or 0) for t in sells)))
+        out["fees_taxes"] = int(
+            round(sum(float(t.commission or 0) + float(t.tax or 0) for t in completed))
+        )
+        out["trade_count"] = len(completed)
+    except Exception as e:
+        logger.warning(f"당일 거래 DB 집계 실패: {type(e).__name__}: {e}")
+    return out
+
+
 def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
     """장시작/종료 잔액 비교 분석"""
     try:
@@ -463,24 +508,22 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
         # 계속 보유된 종목
         held_tickers = open_tickers & close_tickers
         
-        # 실현 손익 추정 (매도된 종목의 가치 변화)
-        realized_pnl = 0
-        for ticker in sold_tickers:
-            open_holding = next((h for h in open_balance["holdings_detail"] if h["ticker"] == ticker), None)
-            if open_holding:
-                realized_pnl += open_holding["value"]
-        
-        # 미실현 손익 (계속 보유된 종목의 가치 변화)
+        # 미실현 손익: 장중 계속 보유한 종목의 평가액 변화
         unrealized_pnl = 0
         for ticker in held_tickers:
             open_holding = next((h for h in open_balance["holdings_detail"] if h["ticker"] == ticker), None)
             close_holding = next((h for h in close_balance["holdings_detail"] if h["ticker"] == ticker), None)
             if open_holding and close_holding:
                 unrealized_pnl += close_holding["value"] - open_holding["value"]
-        
-        # 수수료 추정 (총 변화량에서 실현/미실현 손익 차감)
-        estimated_fees = total_change - realized_pnl - unrealized_pnl
-        
+
+        # 실현 손익: DB 체결 매도 profit_loss 합 (장초 평가액 합산은 사용하지 않음)
+        trade_stats = _get_daily_trade_stats(close_balance["date"])
+        realized_pnl = trade_stats["realized_pnl"]
+        if realized_pnl is None:
+            realized_pnl = 0
+
+        fees_taxes = trade_stats["fees_taxes"]
+
         return {
             "date": close_balance["date"],
             "total_change": total_change,
@@ -489,13 +532,14 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "daily_return_pct": round(daily_return_pct, 2),
             "realized_pnl": realized_pnl,
             "unrealized_pnl": unrealized_pnl,
-            "estimated_fees": estimated_fees,
+            "fees_taxes": fees_taxes,
             "net_pnl": total_change,
             "sold_tickers": list(sold_tickers),
             "bought_tickers": list(bought_tickers),
             "held_tickers": list(held_tickers),
             "open_balance": open_balance["total_balance"],
-            "close_balance": close_balance["total_balance"]
+            "close_balance": close_balance["total_balance"],
+            "close_holdings_count": close_balance.get("holdings_count", len(close_tickers)),
         }
         
     except Exception as e:
@@ -524,7 +568,9 @@ def send_daily_trading_summary():
         daily_return = comparison["daily_return_pct"]
         realized_pnl = comparison["realized_pnl"]
         unrealized_pnl = comparison["unrealized_pnl"]
-        estimated_fees = comparison["estimated_fees"]
+        cash_change = comparison["cash_change"]
+        holdings_change = comparison["holdings_change"]
+        fees_taxes = comparison.get("fees_taxes")
         
         # 변화량 이모지
         change_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
@@ -547,6 +593,16 @@ def send_daily_trading_summary():
                     "inline": True
                 },
                 {
+                    "name": "💵 현금 변화",
+                    "value": f"{cash_change:+,}원",
+                    "inline": True
+                },
+                {
+                    "name": "📦 보유평가 변화",
+                    "value": f"{holdings_change:+,}원",
+                    "inline": True
+                },
+                {
                     "name": "💰 실현 손익",
                     "value": f"{realized_pnl:+,}원",
                     "inline": True
@@ -558,10 +614,10 @@ def send_daily_trading_summary():
                 }
             ])
             
-            if abs(estimated_fees) > 0:
+            if fees_taxes is not None and abs(fees_taxes) > 0:
                 fields.append({
-                    "name": "💸 추정 수수료",
-                    "value": f"{estimated_fees:+,}원",
+                    "name": "💸 수수료·세금",
+                    "value": f"{fees_taxes:+,}원",
                     "inline": True
                 })
         
@@ -587,7 +643,7 @@ def send_daily_trading_summary():
             "fields": fields,
             "color": 0x00ff00 if total_change > 0 else 0xff0000 if total_change < 0 else 0x808080,
             "footer": {
-                "text": f"보유종목: {open_balance['holdings_count']}개"
+                "text": f"보유종목: {comparison.get('close_holdings_count', close_balance.get('holdings_count', 0))}개"
             }
         }
         
