@@ -420,7 +420,10 @@ trader.run_buy_logic
 | 09:10 | `screener.py` | KIS |
 | 10:15~ | `health_check` → `news` → `gpt` → `trader` | KIS, Naver, OpenAI(선택) |
 | 장중 | `risk_manager` | KIS |
+| 15:20 | `trader.py --batch-check-only` | KIS |
 | 15:22 | `order_reconciler` | KIS |
+| 15:30 | 잔액 스냅샷 (`integrated_manager`) | KIS |
+| 15:35 | `send_daily_trading_summary` | Discord (선택) |
 | 월 1회 | `reviewer`, `cleanup_output` | DB·로컬 파일 |
 
 ### 6.4 체크리스트
