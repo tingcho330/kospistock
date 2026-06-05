@@ -54,9 +54,11 @@
 - **다단계 스크리닝** — 1차 유동성 필터 → 종합 점수 → 모멘텀·변동성·섹터 다양화 (`--debug` 시 퍼널 로그)
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — `OPENAI_API_KEY` 없으면 점수 기반으로 자동 폴백
-- **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·전략 믹서 기반 매도  
+- **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·긴급 낙폭·전략 믹서 기반 매도  
   - **진입가(평단) 기준 목표가/손절가**를 사용하며, 레벨은 SQLite `positions` 테이블에 저장됩니다.  
-  - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).
+  - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).  
+  - `direct_execute` 실패 시 같은 사이클에서 `trader.py --sell-only`로 **매도 fallback** (쿨다운 적용).
+- **KIS 토큰 공유** — 두 컨테이너가 `output/cache/kis_token.json`을 공유. 파일락·EGW00133 backoff·재인증 쿨다운으로 **1분 1회 발급 제한** 대응.
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
@@ -155,9 +157,45 @@ screener.py                              health_check.py
 | 항목 | 내용 |
 |------|------|
 | 주기 | 장중 ~5분 / 장외 ~30분 |
-| 로직 | `risk_manager.RiskManager` + `strategies.StrategyMixer` |
-| 매도 | `risk_params.auto_sell.direct_execute` 시 KIS 직접, 아니면 `trader.py` subprocess |
+| 진입 | `run_background_risk_manager.py` → `BackgroundRiskManager` → `risk_manager._run_cycle()` |
+| 로직 | `risk_manager.RiskManager` + `strategies.StrategyMixer` (hybrid/advanced) |
+| 매도 판단 | 기본 규칙(긴급 낙폭·손절·목표·RSI·전일종가) → 고급 전략 순 |
+| 매도 실행 | `auto_sell.direct_execute: true` 시 KIS 시장가 직접 주문 |
+| fallback | `direct_execute` 실패 종목 수집 후 사이클 종료 시 `trader.py --sell-only` 1회 기동 |
+| 보유 0 | 조건 충족 시 `trader.py` 전체 파이프라인 자동 기동 (별도 경로) |
 | 알림 | `DISCORD_WEBHOOK_URL_RISK` (없으면 `DISCORD_WEBHOOK_URL`) |
+
+**`_run_cycle()` 흐름:**
+
+```
+계좌 스냅샷 → (보유 0이면 trader.py) → 각 종목:
+  compute_realtime_levels → check_sell_condition
+    → SELL + direct_execute → KIS order_cash
+    → 실패 시 목록에 추가
+→ 실패 종목 있으면 trader.py --sell-only
+```
+
+**기본 규칙 우선순위** (`_check_basic_rules`): 긴급 낙폭(`emergency_drop_pct`) → 손절가 → 부분 익절 → 목표가 → RSI → 전일 종가 이탈 → 최대 보유일.
+
+> `EmergencyDrop`은 `rotation.min_holding_days`를 적용하지 않습니다. 손절·RSI 익절에는 최소 보유일이 적용됩니다.
+
+### 3.4.1 KIS 토큰 (`output/cache/`)
+
+두 Docker 서비스가 **동일 앱키·동일 토큰 파일**을 사용합니다. KIS OAuth는 **1분당 1회** 발급 제한(`EGW00133`)이 있습니다.
+
+| 파일 | 역할 |
+|------|------|
+| `kis_token.json` | 접근 토큰 캐시 (24h, 만료 5분 전 갱신) |
+| `kis_token.lock` | 컨테이너 간 발급 경합 방지 (fcntl) |
+
+`api/kis_auth.py` 동작:
+
+- 발급 전 파일락 → 다른 프로세스가 갱신한 토큰 재사용
+- `EGW00133` 시 65초 backoff 후 최대 3회 재시도
+- 재인증 쿨다운(60초) 내 API 재발급 대신 파일 토큰 재로드
+- 재인증 실패 시 기존 토큰 파일을 **선삭제하지 않음** (성공 시에만 덮어쓰기)
+
+환경 변수: `KIS_TOKEN_BACKOFF_SEC`, `KIS_REAUTH_COOLDOWN_SEC`, `KIS_TOKEN_LOCK_TIMEOUT_SEC`, `KIS_TOKEN_FILE`
 
 ### 3.5 주요 산출물 (`output/`)
 
@@ -171,7 +209,8 @@ screener.py                              health_check.py
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
-| `cache/` (토큰, `.mst`, `.pkl` 등) | KIS·스크리너 |
+| `cache/kis_token.json`, `cache/kis_token.lock` | KIS OAuth 토큰·발급 락 |
+| `cache/` (`.mst`, `.pkl` 등) | KIS·스크리너 |
 
 Git에는 `output/.gitkeep`만 추적합니다.
 
@@ -207,6 +246,10 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 `api/kis_auth.KIS` → `api/domestic_stock/domestic_stock_functions.DomesticStock`  
 시세·잔고·`order_cash()` 주문·업종지수 시세(TR `FHKUP03500100`)를 한 경로에서 처리합니다.
 
+- **인증:** `auth()` / `reauthenticate()` — 토큰 파일 캐시 + `request_get`/`request_post` 만료 시 1회 재시도
+- **설정:** `config/.env` + `config/kis_devlp.yaml` (`load_kis_config()`)
+- **주의:** `integrated_manager`(스크리너·account)와 `background_risk_manager`(장중 매도)가 동시에 KIS를 호출하므로 토큰 파일 공유·락이 필요합니다.
+
 ---
 
 ## 4. 모듈 설명
@@ -230,7 +273,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT 또는 휴리스틱 매매 계획 JSON 생성 |
-| `trader.py` | 매수/매도·체결·분할매수·`_build_trade_record()`·`--batch-check-only` |
+| `trader.py` | 매수/매도·체결·분할매수·`_build_trade_record()`·`--batch-check-only`·`--sell-only` |
 
 ### 기록·정합성·분석
 
@@ -255,7 +298,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `notifier.py` | Discord 웹훅 |
 | `strategies.py` | 매도 전략 클래스 |
 | `db_debug.py` | DB 디버그 로그 (`DB_RECORD_DEBUG=1`) |
-| `api/kis_auth.py` | KIS 인증·토큰 캐시 |
+| `api/kis_auth.py` | KIS 인증·토큰 캐시·파일락·EGW00133 backoff |
 | `api/domestic_stock/domestic_stock_functions.py` | 시세·주문 REST 래퍼 |
 
 ### 4.1 회전 매매 (Rotation)
@@ -493,6 +536,17 @@ docker compose exec integrated_manager python -u /app/src/trader.py
 
 # 체결 확인·리컨실 (pending/partial 갱신 + orphan order_id backfill)
 docker compose exec integrated_manager python -u /app/src/trader.py --batch-check-only
+
+# 매도만 (risk_manager direct_execute fallback과 동일)
+docker compose exec background_risk_manager python -u /app/src/trader.py --sell-only
+
+# KIS 토큰 상태 확인
+docker compose exec background_risk_manager python -c "
+from api.kis_auth import KIS
+k = KIS(env='prod')
+print('token ok:', bool(k.auth_token))
+"
+
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --limit 800
 
 # order_id 누락 행만 KIS 일별 주문으로 backfill
@@ -534,6 +588,11 @@ python run_integrated_manager.py --once
 | `REVIEWER_DRY_RUN` | `1`이면 config 미적용 |
 | `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃(초) |
 | `SCRIPT_TIMEOUT_SEC` | 기타 스크립트 타임아웃 |
+| `KIS_TOKEN_FILE` | 토큰 캐시 경로 (기본 `output/cache/kis_token.json`) |
+| `KIS_TOKEN_BACKOFF_SEC` | EGW00133 재시도 대기(초, 기본 65) |
+| `KIS_REAUTH_COOLDOWN_SEC` | 재인증 API 호출 쿨다운(초, 기본 60) |
+| `KIS_TOKEN_LOCK_TIMEOUT_SEC` | 토큰 파일락 대기(초, 기본 120) |
+| `DISCORD_WEBHOOK_URL_RISK` | 리스크 매니저 전용 Discord 웹훅 |
 
 ---
 

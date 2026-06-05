@@ -928,6 +928,53 @@ class RiskManager:
             _notify(f"❗ trader.py 기동 중 예외: {e}", key="auto_trigger_trader_fail", cooldown_sec=300)
         return False
 
+    def _trigger_trader_sell_fallback(self, failed_tickers: List[str]) -> bool:
+        """
+        direct_execute 실패 시 trader.py --sell-only 를 1회 기동.
+        """
+        if not failed_tickers:
+            return False
+        if not _can_trigger("trigger_trader_sell_fallback", self.auto_trigger_cooldown_sec):
+            logger.info(
+                f"[FALLBACK] trader.py sell-only 쿨다운 중 (실패 종목: {', '.join(failed_tickers)})"
+            )
+            return False
+        try:
+            tickers_str = ", ".join(failed_tickers)
+            logger.warning(f"[FALLBACK] direct_execute 실패 → trader.py --sell-only 기동 ({tickers_str})")
+            res = subprocess.run(
+                ["python", str(TRADER_SCRIPT_PATH), "--sell-only"],
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding="utf-8",
+                timeout=600,
+            )
+            head = (res.stdout or "")[-600:]
+            logger.info("[FALLBACK] trader.py --sell-only 완료. tail:\n%s", head)
+            _notify(
+                f"🔄 direct_execute 실패 → trader.py 매도 fallback 완료 ({tickers_str})",
+                key="trader_sell_fallback_ok",
+                cooldown_sec=300,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "[FALLBACK] trader.py --sell-only 실패: exit=%s\nstdout:\n%s\nstderr:\n%s",
+                e.returncode, (e.stdout or "")[-600:], (e.stderr or "")[-600:],
+            )
+            _notify(
+                f"❌ direct_execute fallback 실패 ({', '.join(failed_tickers)})",
+                key="trader_sell_fallback_fail",
+                cooldown_sec=300,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("[FALLBACK] trader.py --sell-only 타임아웃")
+            _notify("⏱️ trader.py 매도 fallback 타임아웃", key="trader_sell_fallback_fail", cooldown_sec=300)
+        except Exception as e:
+            logger.error("[FALLBACK] trader.py --sell-only 예외: %s", e, exc_info=True)
+        return False
+
     # ── 매도 판단 로직 ────────────────────────────────────────────────
     def check_sell_condition(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
         """
@@ -1926,6 +1973,8 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                             f"계좌 동기화 지연 가능성 (다음 사이클에서 재확인)"
                         )
         
+        direct_sell_failed_tickers: List[str] = []
+
         if valid_holdings:
             logger.info(f"[리스크체크] 보유 종목 {len(valid_holdings)}개 모니터링 시작")
             for idx, h in enumerate(valid_holdings, 1):
@@ -1970,7 +2019,11 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                         if ok:
                             logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ✅ 즉시 매도 주문 제출 성공")
                         else:
-                            logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ❌ 주문 제출 실패 (다음 사이클에서 trader.py 처리)")
+                            direct_sell_failed_tickers.append(ticker)
+                            logger.warning(
+                                f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                                f"[DIRECT_SELL] ❌ 주문 제출 실패 → 사이클 종료 후 trader.py fallback 예정"
+                            )
                     else:
                         # direct_sell이 비활성화된 경우에도 로그 출력
                         logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 판단되었으나 direct_sell 비활성화 또는 조건 불충족. trader.py에서 처리 필요.")
@@ -1991,6 +2044,9 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) ✅ 유지 판단: {reason}")
             
             logger.info(f"[리스크체크] 보유 종목 {len(valid_holdings)}개 모니터링 완료")
+
+            if direct_sell_failed_tickers:
+                rm._trigger_trader_sell_fallback(direct_sell_failed_tickers)
 
 # ── 메인 (레거시 지원) ─────────────────────────────────────────────
 if __name__ == "__main__":

@@ -5499,6 +5499,7 @@ if __name__ == "__main__":
     # 명령행 인수 파싱
     parser = argparse.ArgumentParser(description="자동매매 트레이더")
     parser.add_argument("--batch-check-only", action="store_true", help="15시 20분 일괄 체결 확인만 실행")
+    parser.add_argument("--sell-only", action="store_true", help="매도 로직만 실행 (risk_manager fallback용)")
     args = parser.parse_args()
     
     start_ts = time.time()
@@ -5513,6 +5514,18 @@ if __name__ == "__main__":
                 logger.info("15시 20분 일괄 체결 확인 완료")
             else:
                 logger.info("15시 20분이 아니므로 일괄 체결 확인을 건너뜁니다.")
+            sys.exit(0)
+
+        # risk_manager direct_execute 실패 fallback: 매도만 실행
+        if args.sell_only:
+            logger.info("매도 전용 모드(--sell-only)로 실행")
+            trader._clear_processed_orders()
+            trader._update_account_info(force=True)
+            _, holdings0, _ = trader.get_account_info_from_files()
+            executed_sells = trader.run_sell_logic(holdings0) if holdings0 else False
+            if executed_sells:
+                trader._update_account_info(force=True)
+            trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
             sys.exit(0)
 
         # 새로운 실행 시작 시 처리된 주문 목록 초기화
