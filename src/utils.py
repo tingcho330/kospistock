@@ -311,6 +311,11 @@ def _score_file(p: Path, prefer_date: bool = True) -> Tuple[int, int, float]:
     # 날짜 우선 정렬: (date, hms, mtime)
     return (date_int if prefer_date else 0, hms_int if prefer_date else 0, mtime)
 
+def _is_degraded_snapshot_file(path: Path) -> bool:
+    """account.py 실패 시 생성되는 *_degraded.json (본 스냅샷 선택에서 제외)."""
+    return "_degraded" in path.stem
+
+
 def _iter_globs(patterns: Union[str, Iterable[str]]) -> List[Path]:
     pats: List[str] = []
     if isinstance(patterns, str):
@@ -339,7 +344,7 @@ def find_latest_file(
     - prefer_date_over_mtime: 파일명 날짜 우선, 동일/부재시 mtime 기준.
     """
     logger = logging.getLogger(__name__)
-    candidates = _iter_globs(patterns)
+    candidates = [p for p in _iter_globs(patterns) if not _is_degraded_snapshot_file(p)]
     if not candidates:
         return None
 
@@ -493,13 +498,24 @@ def load_account_files_with_retry(
         ok = True
         if summary_path and summary_path.exists():
             js = _read_json(summary_path)
-            parsed_summary = _parse_summary_payload(js)
+            if isinstance(js, dict) and str(js.get("status", "")).lower() == "degraded":
+                logger.warning("요약 스냅샷 degraded 무시: %s", summary_path.name)
+                summary_path = None
+                parsed_summary = {}
+                ok = False
+            else:
+                parsed_summary = _parse_summary_payload(js)
         else:
             ok = False
 
         if balance_path and balance_path.exists():
             jb = _read_json(balance_path)
-            parsed_balance = _parse_balance_payload(jb)
+            if isinstance(jb, dict) and str(jb.get("status", "")).lower() == "degraded":
+                logger.warning("잔고 스냅샷 degraded 무시: %s", balance_path.name)
+                balance_path = None
+                parsed_balance = []
+            else:
+                parsed_balance = _parse_balance_payload(jb)
 
         if ok:
             return parsed_summary, parsed_balance, summary_path, balance_path
