@@ -575,9 +575,6 @@ export CONFIG_PATH="$(pwd)/config/config.json"
 export OUTPUT_DIR="$(pwd)/output"
 pip install -r requirements.txt
 python run_integrated_manager.py --once
-
-# 단위 테스트 (연속 손실 집계·중복 SELL 방지)
-python3 -m unittest tests.test_consecutive_loss_count -v
 ```
 
 > `./src` 볼륨 마운트 시 코드 수정은 **컨테이너 재시작 없이** 반영됩니다. 반영이 안 되면:  
@@ -633,8 +630,6 @@ kospistock/
 │   ├── settings.py / env_loader.py / utils.py / notifier.py
 │   ├── cleanup_output.py / db_debug.py
 │   └── ...
-├── tests/
-│   └── test_consecutive_loss_count.py   # 연속 손실·중복 SELL 검증
 ├── .devcontainer/
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
