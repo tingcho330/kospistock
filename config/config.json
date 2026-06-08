@@ -35,7 +35,7 @@
     "reward_risk": 3.0,
     "max_daily_loss_pct": 0.02,
     "max_daily_loss_amount": 500000,
-    "stop_trading_on_consecutive_losses": 2,
+    "stop_trading_on_consecutive_losses": 3,
     "stop_pct": 0.03,
     "cooldown_fail_threshold": 2,
     "strategy_mode": "hybrid",
