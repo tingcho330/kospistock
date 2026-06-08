@@ -64,6 +64,9 @@ from recorder import (
     get_position,
     upsert_position_levels,
     delete_position,
+    get_recorder,
+    is_countable_loss_sell,
+    count_consecutive_losses,
 )
 
 try:
@@ -2358,6 +2361,22 @@ class Trader:
         holding_tickers = [str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0]
         last_buy_trades = fetch_trades_by_tickers(holding_tickers)
 
+        # risk_manager direct_execute 등으로 이미 제출된 pending/partial SELL은 중복 매도 방지
+        open_sell_tickers: set = set()
+        try:
+            open_orders = get_recorder().get_open_orders(statuses=("pending", "partial"))
+            open_sell_tickers = {
+                str(o.get("ticker", "")).zfill(6)
+                for o in open_orders
+                if str(o.get("action", "")).upper() == "SELL"
+            }
+            if open_sell_tickers:
+                logger.info(
+                    f"[SELL_SKIP] pending/partial 매도 주문 존재 → 중복 매도 방지: {sorted(open_sell_tickers)}"
+                )
+        except Exception as e:
+            logger.debug(f"[SELL_SKIP] open sell 조회 실패: {e}")
+
         for holding in holdings:
             ticker = str(holding.get("pdno", "")).zfill(6)
             name = holding.get("prdt_name", "N/A")
@@ -2476,6 +2495,14 @@ class Trader:
             
             if decision != "SELL":
                 logger.info(f"유지 판단: {reason}")
+                self.stats["hold"] += 1
+                continue
+
+            if ticker in open_sell_tickers:
+                logger.info(
+                    f"[{ticker}] pending/partial 매도 주문 존재 → run_sell_logic skip "
+                    "(risk_manager direct_execute 중복 방지)"
+                )
                 self.stats["hold"] += 1
                 continue
 
@@ -4023,8 +4050,11 @@ class Trader:
             recorder = DataRecorder()
             today_trades = recorder.get_trade_records(start_date=today_start, end_date=today_end, action="SELL")
             
-            # 오늘 총 손실 계산
-            total_loss = sum(t.profit_loss for t in today_trades if t.profit_loss < 0)
+            # 오늘 총 손실 계산 (체결 확정·order_id 있는 매도만)
+            total_loss = sum(
+                t.profit_loss for t in today_trades
+                if is_countable_loss_sell(t) and t.profit_loss < 0
+            )
             
             # 계좌 총액 조회 (퍼센트 계산용)
             summary, balance, _, _ = get_account_snapshot_cached()
@@ -4065,13 +4095,8 @@ class Trader:
             # 최근 거래를 시간순으로 정렬
             recent_trades.sort(key=lambda x: x.timestamp if isinstance(x.timestamp, datetime) else datetime.fromisoformat(str(x.timestamp)), reverse=True)
             
-            # 연속 손실 횟수 계산 (오늘 거래만)
-            consecutive_losses = 0
-            for trade in recent_trades:
-                if trade.profit_loss < 0:
-                    consecutive_losses += 1
-                else:
-                    break  # 손익이 나면 중단
+            # 연속 손실 횟수 (체결 확정·order_id 있는 손실만; pending/failed/중복 제외)
+            consecutive_losses = count_consecutive_losses(recent_trades)
             
             if consecutive_losses >= stop_on_losses:
                 return False, f"연속 손실 {consecutive_losses}회 >= {stop_on_losses}회로 거래 중단 (오늘 기준)"

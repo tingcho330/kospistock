@@ -19,8 +19,9 @@ output/*
 *.log
 *.csv
 
-# Tests (local only)
-tests/
+# Test artifacts (sources under tests/ are tracked)
+tests/**/__pycache__/
+tests/**/*.db
 
 # Python
 __pycache__/

@@ -60,6 +60,8 @@
   - `direct_execute` 실패 시 같은 사이클에서 `trader.py --sell-only`로 **매도 fallback** (쿨다운 적용).
 - **KIS 토큰 공유** — 두 컨테이너가 `output/cache/kis_token.json`을 공유. 파일락·EGW00133 backoff·재인증 쿨다운으로 **1분 1회 발급 제한** 대응.
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
+- **연속 손실 집계** — `is_countable_loss_sell()` / `count_consecutive_losses()`로 **체결 확정·order_id 있는 손실만** 카운트 (`stop_trading_on_consecutive_losses`, 기본 3회). pending/failed·중복 SELL row 제외
+- **중복 SELL 방지** — `risk_manager` direct_execute 후 `trader.run_sell_logic`이 동일 종목을 재매도·재기록하지 않도록 pending 주문 skip + `order_id` 없는 SELL 중복 INSERT 차단
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
 - **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 비교 후 Discord 전송. 실현 손익은 `trading_data.db` 체결 매도 `profit_loss` 합, 미실현은 계속 보유 종목 평가 변화
@@ -162,6 +164,7 @@ screener.py                              health_check.py
 | 매도 판단 | 기본 규칙(긴급 낙폭·손절·목표·RSI·전일종가) → 고급 전략 순 |
 | 매도 실행 | `auto_sell.direct_execute: true` 시 KIS 시장가 직접 주문 |
 | fallback | `direct_execute` 실패 종목 수집 후 사이클 종료 시 `trader.py --sell-only` 1회 기동 |
+| 중복 방지 | `trader.run_sell_logic`은 `get_open_orders(pending/partial)` SELL ticker skip. `recorder`는 `order_id` 없는 SELL이 10분·동일 qty·가격 1% 이내 기존 행과 겹치면 skip 또는 UPDATE |
 | 보유 0 | 조건 충족 시 `trader.py` 전체 파이프라인 자동 기동 (별도 경로) |
 | 알림 | `DISCORD_WEBHOOK_URL_RISK` (없으면 `DISCORD_WEBHOOK_URL`) |
 
@@ -220,11 +223,14 @@ Git에는 `output/.gitkeep`만 추적합니다.
 |------|------|
 | 저장 | `output/trading_data.db` — 주문·체결 메타(`order_id`, `executed_qty`, `order_status`) |
 | 포지션 레벨 | `output/trading_data.db` — `positions` 테이블에 티커별 `entry_price/stop_price/target_price` 저장 (진입가 기준) |
-| 매매 기록 | `trader.py`의 `_build_trade_record()` → `record_trade()` — 즉시 체결 시에도 KIS `ODNO` 저장 |
+| 매매 기록 | `record_trade()` → `upsert_trade_record_by_order_id()` — `order_id` 있으면 UPSERT, 없으면 SELL 중복 검사 후 INSERT/skip |
+| 손실 집계 | `is_countable_loss_sell()` — `executed` + `order_id` + `profit_loss < 0` 만 연속·일일 손실에 반영. `pending`/`failed`/중복 row 제외 |
+| 중복 SELL | `find_recent_sell_duplicate()` — 동일 ticker·qty, 10분 이내, 가격 1% 이내. 기존 `order_id` 행 있으면 `duplicate_sell_without_order_id_skipped` 로그 후 skip |
 | 리컨실 (15:22) | `order_reconciler.py` — `pending`/`partial` + `order_id` 있는 행을 KIS와 상태 동기화 |
 | orphan backfill | 리컨실 마지막에 자동 실행 — `order_id` 빈 행을 KIS 일별 주문과 **유일 매칭** 시 backfill |
 | 수동 backfill | `python src/order_reconciler.py --since-hours 36 --backfill-only` |
 
+> `risk_manager` direct_execute → `pending` SELL 기록 후 `trader` fallback이 같은 종목을 `order_id` 없이 재기록하면 손실이 이중 집계될 수 있었습니다. 현재는 저장 단계·집계 단계 모두에서 차단합니다.  
 > 컨테이너 이미지에 `sqlite3` CLI가 없습니다. DB 확인은 아래 [7.3](#73-수동--단발-실행) Python 예시를 사용하세요.
 
 ### 3.8 GPT 월간 회고 (`reviewer.py`)
@@ -273,13 +279,13 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT 또는 휴리스틱 매매 계획 JSON 생성 |
-| `trader.py` | 매수/매도·체결·분할매수·`_build_trade_record()`·`--batch-check-only`·`--sell-only` |
+| `trader.py` | 매수/매도·체결·분할매수·연속 손실 체크·pending SELL skip·`--batch-check-only`·`--sell-only` |
 
 ### 기록·정합성·분석
 
 | 파일 | 역할 |
 |------|------|
-| `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill API |
+| `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill, `is_countable_loss_sell`, 중복 SELL 방지 |
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
@@ -569,6 +575,9 @@ export CONFIG_PATH="$(pwd)/config/config.json"
 export OUTPUT_DIR="$(pwd)/output"
 pip install -r requirements.txt
 python run_integrated_manager.py --once
+
+# 단위 테스트 (연속 손실 집계·중복 SELL 방지)
+python3 -m unittest tests.test_consecutive_loss_count -v
 ```
 
 > `./src` 볼륨 마운트 시 코드 수정은 **컨테이너 재시작 없이** 반영됩니다. 반영이 안 되면:  
@@ -624,6 +633,8 @@ kospistock/
 │   ├── settings.py / env_loader.py / utils.py / notifier.py
 │   ├── cleanup_output.py / db_debug.py
 │   └── ...
+├── tests/
+│   └── test_consecutive_loss_count.py   # 연속 손실·중복 SELL 검증
 ├── .devcontainer/
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py

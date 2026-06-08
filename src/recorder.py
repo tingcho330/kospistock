@@ -50,6 +50,43 @@ def is_completed_sell(trade: Any) -> bool:
     return status == "executed" and qty > 0 and price > 0
 
 
+def is_countable_loss_sell(trade: Any) -> bool:
+    """
+    연속 손실·일일 손실 집계에 포함할 매도 거래인지 판별.
+    - 체결 확정(completed sell)이고 손실인 경우만 True
+    - pending/failed/order_id 없는 중복 fallback INSERT는 제외
+    """
+    if not is_completed_sell(trade):
+        return False
+    action = str(getattr(trade, "action", "")).upper()
+    if action != "SELL":
+        return False
+    order_id = str(getattr(trade, "order_id", "") or "").strip()
+    if not order_id:
+        return False
+    return True
+
+
+def count_consecutive_losses(trades: List[Any]) -> int:
+    """거래 목록(최신순)에서 체결 확정 손실만 연속 카운트. 비집계 거래는 건너뜀."""
+    count = 0
+    for trade in trades:
+        if not is_countable_loss_sell(trade):
+            continue
+        pnl = float(getattr(trade, "profit_loss", 0.0) or 0.0)
+        if pnl < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _price_within_tolerance(a: float, b: float, tolerance_pct: float = 0.01) -> bool:
+    if a <= 0 or b <= 0:
+        return a == b
+    return abs(a - b) / max(a, b) <= tolerance_pct
+
+
 @dataclass
 class TradeRecord:
     """거래 기록"""
@@ -358,6 +395,122 @@ class DataRecorder:
             _db_dbg_log("recorder.save_trade_record.FAIL", error=str(e), ticker=getattr(trade_record, "ticker", ""))
             return False
 
+    def find_recent_sell_duplicate(
+        self,
+        *,
+        ticker: str,
+        quantity: int,
+        price: float,
+        within_minutes: int = 10,
+        price_tolerance_pct: float = 0.01,
+        reference_time: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        동일 종목·유사 수량/가격의 최근 SELL 기록 조회 (중복 INSERT 방지용).
+        order_id가 있는 기존 행을 우선 반환한다.
+        """
+        ticker = str(ticker).zfill(6)
+        quantity = int(quantity)
+        price = float(price)
+        ref = reference_time or datetime.now()
+        cutoff = (ref - timedelta(minutes=within_minutes)).isoformat()
+        upper = (ref + timedelta(minutes=1)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, ticker, action, quantity, price, order_status, order_id,
+                           executed_qty, profit_loss
+                    FROM trade_records
+                    WHERE ticker = ? AND UPPER(action) = 'SELL'
+                      AND timestamp >= ? AND timestamp <= ?
+                    ORDER BY timestamp DESC
+                    """,
+                    (ticker, cutoff, upper),
+                )
+                rows = cursor.fetchall()
+            matches: List[Dict[str, Any]] = []
+            for r in rows:
+                row_qty = int(r[4] or 0)
+                row_price = float(r[5] or 0)
+                if row_qty != quantity:
+                    continue
+                if not _price_within_tolerance(price, row_price, price_tolerance_pct):
+                    continue
+                matches.append(
+                    {
+                        "id": r[0],
+                        "timestamp": r[1],
+                        "ticker": r[2],
+                        "action": r[3],
+                        "quantity": row_qty,
+                        "price": row_price,
+                        "order_status": r[6],
+                        "order_id": r[7] or "",
+                        "executed_qty": int(r[8] or 0),
+                        "profit_loss": float(r[9] or 0.0),
+                    }
+                )
+            if not matches:
+                return None
+            with_oid = [m for m in matches if str(m.get("order_id") or "").strip()]
+            return with_oid[0] if with_oid else matches[0]
+        except Exception as e:
+            self.logger.debug(f"find_recent_sell_duplicate 실패: {e}")
+            return None
+
+    def _handle_sell_without_order_id(self, trade_record: TradeRecord) -> Optional[bool]:
+        """
+        order_id 없는 SELL 저장 시 중복 여부 처리.
+        - 기존 order_id 행이 있으면 UPDATE 또는 skip
+        - 반환 None: 중복 아님 → caller가 일반 INSERT 진행
+        - 반환 True/False: 처리 완료
+        """
+        dup = self.find_recent_sell_duplicate(
+            ticker=trade_record.ticker,
+            quantity=int(trade_record.quantity),
+            price=float(trade_record.price),
+            reference_time=trade_record.timestamp,
+        )
+        if not dup:
+            return None
+
+        existing_oid = str(dup.get("order_id") or "").strip()
+        incoming_status = str(getattr(trade_record, "order_status", "executed") or "").lower()
+        executed_qty = int(getattr(trade_record, "executed_qty", 0) or 0)
+
+        if existing_oid and incoming_status == "executed" and executed_qty > 0:
+            self.update_order_status(
+                order_id=existing_oid,
+                order_status="executed",
+                executed_qty=executed_qty,
+                price=float(trade_record.price),
+                profit_loss=float(trade_record.profit_loss),
+                sell_reason=getattr(trade_record, "sell_reason", "") or None,
+                reason_code=getattr(trade_record, "reason_code", "") or None,
+                structured_context=getattr(trade_record, "structured_context", "") or None,
+            )
+            _db_dbg_log(
+                "recorder.upsert.UPDATE_DUPLICATE_SELL",
+                existing_order_id=existing_oid,
+                ticker=trade_record.ticker,
+                executed_qty=executed_qty,
+            )
+            return True
+
+        _db_dbg_skip(
+            "duplicate_sell_without_order_id_skipped",
+            "matching SELL with order_id exists; skip no-order_id INSERT",
+            ticker=trade_record.ticker,
+            qty=int(trade_record.quantity),
+            price=float(trade_record.price),
+            existing_order_id=existing_oid or "(empty)",
+            existing_row_id=dup.get("id"),
+            incoming_status=incoming_status,
+        )
+        return True
+
     def upsert_trade_record_by_order_id(self, trade_record: TradeRecord) -> bool:
         """
         order_id가 있으면 해당 주문 기준으로 UPDATE/INSERT 수행.
@@ -374,6 +527,11 @@ class DataRecorder:
                 order_status=getattr(trade_record, "order_status", "executed"),
             )
             if not order_id:
+                action_upper = str(trade_record.action).upper()
+                if action_upper == "SELL":
+                    handled = self._handle_sell_without_order_id(trade_record)
+                    if handled is not None:
+                        return handled
                 _db_dbg_skip(
                     "recorder.upsert.NO_ORDER_ID",
                     reason="order_id empty -> fallback save_trade_record (new INSERT)",
