@@ -5,30 +5,33 @@
     "max_concurrency": 2
   },
   "screener_params": {
-    "min_market_cap": 50000000000,
-    "min_trading_value_5d_avg": 200000000000,
-    "top_n": 8,
-    "fin_weight": 0.25,
-    "tech_weight": 0.35,
-    "mkt_weight": 0.1,
-    "sector_weight": 0.1,
-    "sector_cap": 0.35,
-    "sector_source_priority": ["kis", "pykrx"],
-    "max_market_cap": 50000000000000,
-    "vol_kki_weight": 0.05,
-    "pos_52w_weight": 0.05,
+    "min_market_cap": 300000000000,
+    "min_trading_value_5d_avg": 50000000000,
+    "top_n": 15,
+    "fin_weight": 0.12,
+    "tech_weight": 0.42,
+    "mkt_weight": 0.12,
+    "sector_weight": 0.14,
+    "sector_cap": 0.3,
+    "sector_source_priority": [
+      "kis",
+      "pykrx"
+    ],
+    "max_market_cap": 100000000000000,
+    "vol_kki_weight": 0.1,
+    "pos_52w_weight": 0.1,
     "exclude_newly_listed_days": 20,
-    "exclude_consecutive_up_days": 4,
-    "min_score_threshold": 0.52,
+    "exclude_consecutive_up_days": 7,
+    "min_score_threshold": 0.6,
     "require_positive_momentum": true,
     "exclude_high_volatility": true,
-    "volatility_threshold": 0.75,
-    "min_history_bars": 50,
+    "volatility_threshold": 0.95,
+    "min_history_bars": 60,
     "affordability_filter": true,
     "affordability_buffer": 0.05
   },
   "risk_params": {
-    "max_positions": 8,
+    "max_positions": 6,
     "cooldown_period_days": 20,
     "atr_period": 14,
     "atr_k_stop": 2.0,
@@ -42,11 +45,11 @@
     "enable_advanced_strategies": true,
     "auto_sell": {
       "enabled": true,
-      "stop_loss_pct": 0.045,
-      "target_pct": 0.07,
-      "partial_profit_pct": 0.025,
+      "stop_loss_pct": 0.04,
+      "target_pct": 0.09,
+      "partial_profit_pct": 0.035,
       "partial_profit_ratio": 0.5,
-      "emergency_drop_pct": 0.03,
+      "emergency_drop_pct": 0.035,
       "direct_execute": true,
       "cooldown_sec_per_ticker": 20
     },
@@ -73,8 +76,8 @@
     "max_entry_price_ratio": 0.2,
     "analysis_expansion": {
       "enabled": true,
-      "max_primary_candidates": 10,
-      "max_total_analysis": 15
+      "max_primary_candidates": 15,
+      "max_total_analysis": 20
     }
   },
   "strategy_params": {
@@ -83,11 +86,11 @@
     "atr_k_stop": 2.5,
     "atr_k_profit": 4.0,
     "strategy_weights": {
-      "RsiReversalStrategy": 0.6,
-      "TrendFollowingStrategy": 0.8,
-      "AdvancedTechnicalStrategy": 0.6,
-      "DynamicAtrStrategy": 0.7,
-      "BaseStrategy": 0.5
+      "RsiReversalStrategy": 0.5,
+      "TrendFollowingStrategy": 1.0,
+      "AdvancedTechnicalStrategy": 0.7,
+      "DynamicAtrStrategy": 0.8,
+      "BaseStrategy": 0.4
     },
     "sell_threshold": 1.0
   },
@@ -95,14 +98,14 @@
     "buy_enabled": true,
     "allow_rebuy": false,
     "max_legs_per_ticker": 1,
-    "post_partial_sell_buy_cooldown_days": 5,
-    "partial_sell_flag_ttl_days": 7,
-    "per_ticker_max_weight": 0.12,
-    "min_holding_hours": 72,
+    "post_partial_sell_buy_cooldown_days": 3,
+    "partial_sell_flag_ttl_days": 5,
+    "per_ticker_max_weight": 0.1,
+    "min_holding_hours": 48,
     "min_order_cash": 50000,
     "rebuy_atr_k": 0.5,
     "rebuy_rsi_ceiling": 72.0,
-    "cash_buffer_ratio": 0.02,
+    "cash_buffer_ratio": 0.05,
     "min_cash_reserve": 0,
     "dynamic_cash_management": {
       "enabled": true,
@@ -115,13 +118,29 @@
       "volatility_threshold": 0.25,
       "rebalance_frequency_hours": 6
     },
-    "buy_time_windows": ["09:10-13:00"],
-    "sell_time_windows": ["09:05-15:10"],
+    "buy_time_windows": [
+      "09:10-14:20"
+    ],
+    "sell_time_windows": [
+      "09:05-15:10"
+    ],
     "split_buy": {
       "enabled": false,
       "slices": 5,
-      "weights": [0.4, 0.3, 0.15, 0.1, 0.05],
-      "ladder_ticks": [0, 1, 2, 3, 4],
+      "weights": [
+        0.4,
+        0.3,
+        0.15,
+        0.1,
+        0.05
+      ],
+      "ladder_ticks": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
       "interval_sec": 0.3,
       "jitter_sec": 0.1,
       "min_qty": 200,
@@ -171,7 +190,7 @@
   },
   "rotation": {
     "enabled": true,
-    "min_holding_days": 10,
+    "min_holding_days": 5,
     "delta_score_min": 0.12,
     "max_pairs_per_run": 1,
     "use_dynamic_threshold": true,
@@ -206,7 +225,7 @@
   },
   "rebalance_params": {
     "use_gpt_analysis": true,
-    "screener_top_n": 10,
+    "screener_top_n": 15,
     "min_score_threshold": 0.7
   },
   "batch_execution_check": {
