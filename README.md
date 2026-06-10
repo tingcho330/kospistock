@@ -53,7 +53,7 @@
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **다단계 스크리닝** — 1차 유동성 필터 → 종합 점수 → 모멘텀·변동성·섹터 다양화 (`--debug` 시 퍼널 로그)
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
-- **GPT / 휴리스틱 분석** — `OPENAI_API_KEY` 없으면 점수 기반으로 자동 폴백
+- **GPT / 휴리스틱 분석** — 1차 필터(뉴스·점수) → 전술 계획(차트·패턴·예산 가드) 2단계. `OPENAI_API_KEY` 없으면 휴리스틱 폴백. 1차 필터 탈락 시 `gpt_trades_*.json`에 **`결정: "미진입"`** 기록(탈락 사유·`initial_filter` 메타 포함). `trader.py`는 **`결정 == "매수"`** 만 실행
 - **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·긴급 낙폭·전략 믹서 기반 매도  
   - **진입가(평단) 기준 목표가/손절가**를 사용하며, 레벨은 SQLite `positions` 테이블에 저장됩니다.  
   - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).  
@@ -150,9 +150,48 @@ screener.py                              health_check.py
 1. `health_check.py`
 2. `news_collector.py` ← 스크리너 JSON
 3. `gpt_analyzer.py`
-4. `trader.py` ← `gpt_trades_*.json`
+4. `trader.py` ← `gpt_trades_*.json` (`plans` 중 `결정 == "매수"`만 매수)
 
 실패 시 `output/pipeline_state.json`에 저장 후 `STEP_DEPENDENCIES` 기준 **실패 단계부터 재시도** (`MAX_ATTEMPTS`).
+
+#### `gpt_trades_*.json` 스키마 (`gpt_analyzer.py`)
+
+```json
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-06-10T10:15:28+09:00",
+  "market": "KOSPI",
+  "date": "20260610",
+  "plans": [ ... ]
+}
+```
+
+| `plans[].결정` | 의미 | `trader` 매수 |
+|----------------|------|---------------|
+| `매수` | 전술 계획까지 통과·매수 추천 | ✅ 실행 |
+| `보류` | 전술 분석 후 관망 | ❌ (`integrated_analysis.respect_gpt_hold` 시 후보 제외) |
+| `미진입` | **1차 필터 탈락** — 전술 GPT/휴리스틱 미실행 | ❌ (감사·디버그용 로그) |
+
+`미진입` 항목 예시 필드: `단계: "initial_filter"`, `분석`(탈락 사유), `initial_filter`(GPT 1차 `decision`/`reason`), `stock_info`(스크리너 스냅샷).
+
+**1차 필터 탈락 조건 (요약):**
+
+| 조건 | 설명 |
+|------|------|
+| `NO_NEWS` + Score &lt; 0.65 | 뉴스 없고 점수 낮음 |
+| GPT 1차 `보류` | 뉴스·점수 기반 빠른 스크리닝 (`INITIAL_FILTER_PROMPT`) |
+| 휴리스틱 | Score &lt; 0.6 이고 뉴스 200자 미만 (OpenAI 미사용·GPT 실패 시) |
+
+**`config.json` → `gpt_params` (주요):**
+
+| 키 | 기본·예시 | 설명 |
+|----|-----------|------|
+| `openai_model` | `gpt-4o-mini` | OpenAI 모델 |
+| `budget_guard` | `true` | 전술 프롬프트에 가용 현금·최대 진입가 주입 |
+| `max_entry_price_ratio` | `0.2` | `max_allowed = usable_cash × ratio` — 초과 종목 매수 비권장 |
+| `analysis_expansion.enabled` | `true` | 통합 분석 모드(더 많은 후보·결과 허용) |
+| `analysis_expansion.max_total_analysis` | `15` | 1차 필터·전술 분석 대상 상한 |
+| `analysis_expansion.max_primary_candidates` | `10` | 전술 계획(`매수`/`보류`) 결과 상한 (`미진입`은 별도 카운트) |
 
 ### 3.4 장중 리스크
 
@@ -206,7 +245,7 @@ screener.py                              health_check.py
 |------|------|
 | `screener_*`, `market_state_*` | `screener.py` |
 | `collected_news_*` | `news_collector.py` |
-| `gpt_trades_*` | `gpt_analyzer.py` |
+| `gpt_trades_*`, `gpt_rotations_*` | `gpt_analyzer.py` (매매 계획·회전 샌드박스 제안) |
 | `balance_*`, `summary_*` | `account.py` (수동 조회) |
 | `daily_balances/balance_{open,close}_*.json` | `integrated_manager.capture_balance_snapshot` |
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
@@ -278,7 +317,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `kis_master.py` | KIS `.mst` 마스터 다운로드·캐시 |
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
-| `gpt_analyzer.py` | GPT 또는 휴리스틱 매매 계획 JSON 생성 |
+| `gpt_analyzer.py` | GPT/휴리스틱 2단계 분석 → `gpt_trades_*.json` (`매수`/`보류`/`미진입`), 리밸런싱 GPT 헬퍼, 예산 가드 |
 | `trader.py` | 매수/매도·체결·분할매수·연속 손실 체크·pending SELL skip·`--batch-check-only`·`--sell-only` |
 
 ### 기록·정합성·분석

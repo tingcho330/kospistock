@@ -434,11 +434,67 @@ def _call_openai_json(system_prompt: str, user_prompt: str, max_retries: int = 3
     _notify(f"⚠️ OpenAI 호출 최종 실패({_gpt_backend.name}): {str(last_err)[:400]}", key="gpt_analyzer_call_fail", cooldown_sec=300)
     return None
 
+def _minimal_stock_info(c: Dict) -> Dict:
+    return {
+        "Ticker": c.get("Ticker"),
+        "Name": c.get("Name"),
+        "Price": c.get("Price"),
+        "ATR": c.get("ATR"),
+        "RSI": c.get("RSI"),
+        "MA50": c.get("MA50"),
+        "MA200": c.get("MA200"),
+        "Score": c.get("Score"),
+        "FinScore": c.get("FinScore"),
+        "TechScore": c.get("TechScore"),
+        "MktScore": c.get("MktScore"),
+        "SectorScore": c.get("SectorScore"),
+        "PatternScore": c.get("PatternScore"),
+        "MA20Up": c.get("MA20Up"),
+        "AccumVol": c.get("AccumVol"),
+        "HigherLows": c.get("HigherLows"),
+        "Consolidation": c.get("Consolidation"),
+        "YEY": c.get("YEY"),
+        "PER": c.get("PER"),
+        "PBR": c.get("PBR"),
+        "Sector": c.get("Sector"),
+        "SectorSource": c.get("SectorSource"),
+        "stop_price": c.get("stop_price"),
+        "target_price": c.get("target_price"),
+        "levels_source": c.get("levels_source"),
+        "daily_chart": c.get("daily_chart"),
+        "investor_flow": c.get("investor_flow"),
+    }
+
+
+def _build_initial_filter_skip_plan(
+    c: Dict,
+    rank: int,
+    skip_reason: str,
+    news_status: Optional[str],
+    initial_filter: Optional[Dict[str, Any]] = None,
+) -> Dict:
+    news_tag = "(NO_NEWS)" if news_status == "NO_NEWS" else "(NEWS_OK)"
+    analysis = f"전술 계획 단계 미진입: {skip_reason}{_compose_reason_suffix(c)} [{news_tag}]"
+    entry: Dict[str, Any] = {
+        "rank": rank,
+        "stock_info": _minimal_stock_info(c),
+        "결정": "미진입",
+        "단계": "initial_filter",
+        "분석": analysis,
+        "parameters": {"installments": []},
+    }
+    if initial_filter:
+        entry["initial_filter"] = initial_filter
+    return entry
+
+
 def _pretty_print_plans(plans: List[Dict]) -> None:
     if not plans:
         print("\n--- 매수 계획 없음 ---")
         return
-    print("\n=== ✨ 생성된 매수 계획 ===")
+    buy_plans = [p for p in plans if p.get("결정") == "매수"]
+    skip_plans = [p for p in plans if p.get("결정") == "미진입"]
+    print(f"\n=== ✨ GPT 분석 결과 (매수 {len(buy_plans)}건 / 미진입 {len(skip_plans)}건) ===")
     for i, plan in enumerate(plans, 1):
         stock = plan.get("stock_info", {})
         name = stock.get("Name", "N/A"); ticker = stock.get("Ticker", "N/A")
@@ -446,6 +502,10 @@ def _pretty_print_plans(plans: List[Dict]) -> None:
         decision = plan.get("결정", "N/A"); reason = (plan.get("분석", "") or "")[:300]
         stop_px = stock.get("stop_price"); tgt_px = stock.get("target_price"); source = stock.get("levels_source")
         print(f"\n[{i}] {name} ({ticker}) - {decision}")
+        if decision == "미진입":
+            print(f" - 단계: {plan.get('단계', 'initial_filter')}")
+            print(f" - 사유: {reason}")
+            continue
         print(f" - 전략: {strategy}")
         print(f" - 전술: {tactic}")
         if stop_px and tgt_px and decision == "매수":
@@ -814,8 +874,9 @@ def analyze_candidates_and_create_plans(
         # 기본 모드: 슬롯 수만큼만
         max_results = max(1, int(available_slots))
     
+    tactical_count = 0
     for i, c in enumerate(candidates_to_process):
-        if len(results) >= max_results:
+        if tactical_count >= max_results:
             break
 
         name = c.get("Name", "N/A")
@@ -834,9 +895,13 @@ def analyze_candidates_and_create_plans(
 
         # 1차 필터링: 기본 조건 체크
         passed = True
+        skip_reason: Optional[str] = None
+        initial_filter_meta: Optional[Dict[str, Any]] = None
+
         if news_status == "NO_NEWS":
             if score < 0.65:
                 passed = False
+                skip_reason = f"NO_NEWS + Score={score:.3f}<0.65"
             logger.debug(f"[Initial] {name}({ticker}) → NO_NEWS 플래그 감지(Score={score:.3f})")
 
         # GPT 초기 필터링 (가능한 경우)
@@ -845,18 +910,43 @@ def analyze_candidates_and_create_plans(
                 js = _initial_filter_gpt(name=name, score=score, news_text=news_text)
                 if js and isinstance(js, dict) and js.get("decision") and "보류" in js["decision"]:
                     passed = False
+                    initial_filter_meta = {
+                        "decision": js.get("decision"),
+                        "reason": js.get("reason", ""),
+                    }
+                    gpt_reason = (js.get("reason") or "").strip()
+                    skip_reason = f"GPT 1차필터 보류: {js.get('decision')}"
+                    if gpt_reason:
+                        skip_reason += f" — {gpt_reason}"
                 logger.debug(f"[Initial] {name}({ticker}) → {js.get('decision') if js else '실패'} (passed={passed})")
             except Exception as e:
                 logger.warning(f"GPT 초기 필터링 실패 {name}({ticker}): {e}")
                 # GPT 실패 시 휴리스틱으로 폴백
                 if score < 0.6 and len(news_text) < 200:
                     passed = False
-        else:
+                    skip_reason = (
+                        f"GPT 1차필터 실패 + 휴리스틱 탈락 "
+                        f"(Score={score:.3f}<0.6, 뉴스={len(news_text)}자)"
+                    )
+        elif passed and score < 0.6 and len(news_text) < 200:
             # 휴리스틱 필터링
-            if score < 0.6 and len(news_text) < 200:
-                passed = False
+            passed = False
+            skip_reason = f"휴리스틱 1차필터 탈락 (Score={score:.3f}<0.6, 뉴스={len(news_text)}자)"
 
         if not passed:
+            reason = skip_reason or "1차 필터 탈락"
+            skip_plan = _build_initial_filter_skip_plan(
+                c=c,
+                rank=len(results) + 1,
+                skip_reason=reason,
+                news_status=news_status,
+                initial_filter=initial_filter_meta,
+            )
+            results.append(skip_plan)
+            logger.info(
+                f"[{i+1}/{len(candidates_to_process)}] {name}({ticker}) → 미진입 "
+                f"(전술 계획 단계 미진입: {reason})"
+            )
             continue
 
         # 전술적 계획 생성
@@ -900,44 +990,20 @@ def analyze_candidates_and_create_plans(
             plan_js["분석"] = extra
         plan_js["분석"] += _compose_reason_suffix(c)
 
-        # 최종 결과 구성
-        stock_info_min = {
-            "Ticker": c.get("Ticker"),
-            "Name": c.get("Name"),
-            "Price": c.get("Price"),
-            "ATR": c.get("ATR"),
-            "RSI": c.get("RSI"),
-            "MA50": c.get("MA50"),
-            "MA200": c.get("MA200"),
-            "Score": c.get("Score"),
-            "FinScore": c.get("FinScore"),
-            "TechScore": c.get("TechScore"),
-            "MktScore": c.get("MktScore"),
-            "SectorScore": c.get("SectorScore"),
-            "PatternScore": c.get("PatternScore"),
-            "MA20Up": c.get("MA20Up"),
-            "AccumVol": c.get("AccumVol"),
-            "HigherLows": c.get("HigherLows"),
-            "Consolidation": c.get("Consolidation"),
-            "YEY": c.get("YEY"),
-            "PER": c.get("PER"),
-            "PBR": c.get("PBR"),
-            "Sector": c.get("Sector"),
-            "SectorSource": c.get("SectorSource"),
-            "stop_price": c.get("stop_price"),
-            "target_price": c.get("target_price"),
-            "levels_source": c.get("levels_source"),
-            "daily_chart": c.get("daily_chart"),
-            "investor_flow": c.get("investor_flow"),
-        }
-
-        merged = {"rank": len(results) + 1, "stock_info": stock_info_min, **plan_js}
+        merged = {"rank": len(results) + 1, "stock_info": _minimal_stock_info(c), **plan_js}
         results.append(merged)
-        
+        tactical_count += 1
+
         logger.info(f"[{i+1}/{len(candidates_to_process)}] {name}({ticker}) → {plan_js.get('결정', 'N/A')}")
 
-    logger.info(f"분석 완료: {len(results)}개 계획 생성")
-    
+    buy_count = sum(1 for r in results if r.get("결정") == "매수")
+    skip_count = sum(1 for r in results if r.get("결정") == "미진입")
+    hold_count = sum(1 for r in results if r.get("결정") == "보류")
+    logger.info(
+        f"분석 완료: plans {len(results)}건 "
+        f"(매수 {buy_count}, 보류 {hold_count}, 미진입 {skip_count})"
+    )
+
     # 통합 분석 모드에서 상세 로깅
     if gpt_config.get("enabled", True):
         logger.info("=== GPT 분석 결과 요약 ===")
@@ -947,7 +1013,10 @@ def analyze_candidates_and_create_plans(
             name = stock_info.get("Name", "N/A")
             ticker = str(stock_info.get("Ticker", "")).zfill(6)
             score = stock_info.get("Score", 0.0)
-            logger.info(f"  [{i+1}] {name}({ticker}): {decision} (점수: {score:.3f})")
+            if decision == "미진입":
+                logger.info(f"  [{i+1}] {name}({ticker}): 미진입 (점수: {score:.3f}) — {result.get('분석', '')[:120]}")
+            else:
+                logger.info(f"  [{i+1}] {name}({ticker}): {decision} (점수: {score:.3f})")
         logger.info("=== GPT 분석 결과 요약 완료 ===")
     
     return results
