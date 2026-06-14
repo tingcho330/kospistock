@@ -7,9 +7,13 @@ Reviewer Module - 성과 분석 및 리뷰 시스템
 import logging
 import os
 import json
+import re
 import shutil
+import subprocess
 import numpy as np
+import requests
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -369,6 +373,24 @@ DEFAULT_MAX_REL_CHANGE = 0.30
 NEWS_MAX_ITEMS = 40
 DEFAULT_MIN_SELL_TRADES = 10
 DEFAULT_MAX_DIGEST = 15
+DEFAULT_GIT_REPO = "tingcho330/kospistock"
+DEFAULT_GIT_BRANCH = "main"
+DEFAULT_DEPLOY_GRACE_DAYS = 3
+DEFAULT_GIT_MAX_COMMITS = 50
+
+# 매매·리스크·기록 로직 변경으로 거래 패턴이 바뀔 수 있는 경로
+TRADING_RELEVANT_FILE_HINTS = (
+    "config/config.json",
+    "src/trader.py",
+    "src/risk_manager.py",
+    "src/strategies.py",
+    "src/rotation_",
+    "src/gpt_analyzer.py",
+    "src/screener",
+    "src/recorder.py",
+    "src/order_reconciler.py",
+    "src/integrated_manager.py",
+)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -737,6 +759,349 @@ def _write_config_atomic(config_path, cfg: Dict[str, Any]) -> str:
     return backup_path
 
 
+# ── Git 커밋 이력 (로컬 git → GitHub API 폴백) ───────────────────────
+def _parse_repo_slug(repo: str) -> Tuple[str, str]:
+    """'owner/repo' 또는 GitHub URL → (owner, repo)."""
+    repo = (repo or DEFAULT_GIT_REPO).strip().rstrip("/")
+    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", repo)
+    if m:
+        return m.group(1), m.group(2).removesuffix(".git")
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        return owner, name.removesuffix(".git")
+    raise ValueError(f"invalid git repo slug: {repo}")
+
+
+def _find_git_root() -> Optional[Path]:
+    """로컬 .git 디렉터리 탐색 (REVIEWER_GIT_ROOT 우선)."""
+    explicit = os.getenv("REVIEWER_GIT_ROOT", "").strip()
+    if explicit:
+        root = Path(explicit)
+        return root if (root / ".git").exists() else None
+    for base in (
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent.parent,
+        Path.cwd(),
+        Path("/app"),
+    ):
+        for candidate in (base, *base.parents):
+            if (candidate / ".git").exists():
+                return candidate
+            if candidate.parent == candidate:
+                break
+    return None
+
+
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def _file_affects_trading(filename: str) -> bool:
+    fn = _normalize_path(filename)
+    return any(h in fn for h in TRADING_RELEVANT_FILE_HINTS)
+
+
+def _parse_commit_datetime(date_str: str) -> Optional[datetime]:
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            return dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _commit_in_range(commit_dt: Optional[datetime], start_dt: datetime, end_dt: datetime) -> bool:
+    if commit_dt is None:
+        return False
+    return start_dt <= commit_dt <= end_dt
+
+
+def _github_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "kospistock-reviewer/1.0",
+    })
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        session.headers["Authorization"] = f"Bearer {token}"
+    return session
+
+
+def _fetch_commits_local(
+    repo_root: Path,
+    start_dt: datetime,
+    end_dt: datetime,
+    max_commits: int,
+) -> List[Dict[str, Any]]:
+    """git log 로 기간 내 커밋·변경 파일 수집."""
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "log",
+                f"--since={start_dt.isoformat()}",
+                f"--until={end_dt.isoformat()}",
+                f"-n{max_commits}",
+                "--pretty=format:@@@%n%H%n%ai%n%s",
+                "--name-only",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except Exception as e:
+        logger.debug(f"local git log 실패: {e}")
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+
+    commits: List[Dict[str, Any]] = []
+    for block in proc.stdout.split("@@@")[1:]:
+        lines = [ln.strip() for ln in block.strip().splitlines() if ln.strip()]
+        if len(lines) < 3:
+            continue
+        full_sha, date_str, message = lines[0], lines[1], lines[2]
+        files = [_normalize_path(f) for f in lines[3:] if f and not f.startswith("@@@")]
+        commit_dt = _parse_commit_datetime(date_str)
+        if not _commit_in_range(commit_dt, start_dt, end_dt):
+            continue
+        commits.append({
+            "sha": full_sha[:7],
+            "full_sha": full_sha,
+            "date": date_str,
+            "message": message[:200],
+            "files": files,
+            "source": "local_git",
+        })
+    return commits
+
+
+def _fetch_commits_github(
+    owner: str,
+    repo: str,
+    branch: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    max_commits: int,
+) -> List[Dict[str, Any]]:
+    """GitHub REST API 로 공개 저장소 커밋·변경 파일 수집."""
+    session = _github_session()
+    since_iso = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+    try:
+        resp = session.get(
+            url,
+            params={"sha": branch, "since": since_iso, "per_page": min(100, max_commits)},
+            timeout=30,
+        )
+    except Exception as e:
+        logger.warning(f"GitHub commits 요청 실패: {e}")
+        return []
+    if resp.status_code != 200:
+        logger.warning(f"GitHub commits 조회 실패: HTTP {resp.status_code}")
+        return []
+
+    commits: List[Dict[str, Any]] = []
+    for item in resp.json()[:max_commits]:
+        commit_meta = item.get("commit") or {}
+        author = commit_meta.get("author") or {}
+        date_str = author.get("date", "")
+        commit_dt = _parse_commit_datetime(date_str)
+        if not _commit_in_range(commit_dt, start_dt, end_dt):
+            continue
+
+        full_sha = item.get("sha", "")
+        message = (commit_meta.get("message") or "").split("\n")[0][:200]
+        files: List[str] = []
+        try:
+            detail = session.get(
+                f"https://api.github.com/repos/{owner}/{repo}/commits/{full_sha}",
+                timeout=30,
+            )
+            if detail.status_code == 200:
+                files = [
+                    _normalize_path(f.get("filename", ""))
+                    for f in detail.json().get("files", [])
+                    if f.get("filename")
+                ]
+        except Exception as e:
+            logger.debug(f"GitHub commit detail 실패 ({full_sha[:7]}): {e}")
+
+        commits.append({
+            "sha": full_sha[:7],
+            "full_sha": full_sha,
+            "date": date_str,
+            "message": message,
+            "files": files,
+            "source": "github_api",
+        })
+    return commits
+
+
+def _enrich_commit_record(raw: Dict[str, Any]) -> Dict[str, Any]:
+    files = raw.get("files") or []
+    trading_files = [f for f in files if _file_affects_trading(f)]
+    return {
+        **raw,
+        "trading_relevant": bool(trading_files),
+        "trading_files": trading_files,
+    }
+
+
+def summarize_code_changes(commits: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
+    enriched = [_enrich_commit_record(c) for c in commits]
+    deploy_events = [c for c in enriched if c.get("trading_relevant")]
+    timeline_lines = []
+    for c in enriched[:20]:
+        flag = " [매매로직]" if c.get("trading_relevant") else ""
+        files = ", ".join((c.get("files") or [])[:8])
+        timeline_lines.append(
+            f"- {c.get('date', '')[:10]} {c.get('sha', '')} {c.get('message', '')}{flag}"
+            + (f" ({files})" if files else "")
+        )
+    return {
+        "source": source,
+        "commit_count": len(enriched),
+        "trading_relevant_count": len(deploy_events),
+        "commits": enriched,
+        "deploy_events": deploy_events,
+        "timeline_text": "\n".join(timeline_lines) or "(기간 내 커밋 없음)",
+    }
+
+
+def collect_code_changes(start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
+    """분석 기간 내 코드 변경 이력 수집 (로컬 git 우선, 없으면 GitHub API)."""
+    if os.getenv("REVIEWER_GIT_DISABLED", "0") == "1":
+        return summarize_code_changes([], "disabled")
+
+    max_commits = int(os.getenv("REVIEWER_GIT_MAX_COMMITS", str(DEFAULT_GIT_MAX_COMMITS)))
+    repo_slug = os.getenv("REVIEWER_GIT_REPO", DEFAULT_GIT_REPO)
+    branch = os.getenv("REVIEWER_GIT_BRANCH", DEFAULT_GIT_BRANCH)
+
+    commits: List[Dict[str, Any]] = []
+    source = "none"
+
+    repo_root = _find_git_root()
+    if repo_root:
+        commits = _fetch_commits_local(repo_root, start_dt, end_dt, max_commits)
+        if commits:
+            source = "local_git"
+
+    if not commits:
+        try:
+            owner, repo = _parse_repo_slug(repo_slug)
+            commits = _fetch_commits_github(owner, repo, branch, start_dt, end_dt, max_commits)
+            if commits:
+                source = "github_api"
+        except Exception as e:
+            logger.warning(f"GitHub 커밋 수집 실패: {e}")
+
+    summary = summarize_code_changes(commits, source)
+    logger.info(
+        f"[git] source={source} commits={summary['commit_count']} "
+        f"trading_relevant={summary['trading_relevant_count']}"
+    )
+    return summary
+
+
+def _trade_timestamp(trade: Any) -> datetime:
+    ts = getattr(trade, "timestamp", None)
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=None) if ts.tzinfo else ts
+    if isinstance(ts, str):
+        parsed = _parse_commit_datetime(ts)
+        if parsed:
+            return parsed
+    return datetime.min
+
+
+def _trade_in_deploy_grace(trade_dt: datetime, deploy_dt: datetime, grace_days: int) -> bool:
+    if trade_dt is datetime.min or deploy_dt is datetime.min:
+        return False
+    return deploy_dt.date() <= trade_dt.date() <= (deploy_dt.date() + timedelta(days=grace_days))
+
+
+def exclude_post_deploy_sells(
+    sells: List[Any],
+    deploy_events: List[Dict[str, Any]],
+    grace_days: int,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """코드 배포 직후(grace) 매도는 분석에서 제외."""
+    if not deploy_events or grace_days <= 0:
+        return sells, []
+
+    stable: List[Any] = []
+    excluded: List[Dict[str, Any]] = []
+    for t in sells:
+        trade_dt = _trade_timestamp(t)
+        matched = None
+        for ev in deploy_events:
+            deploy_dt = _parse_commit_datetime(ev.get("date", ""))
+            if deploy_dt and _trade_in_deploy_grace(trade_dt, deploy_dt, grace_days):
+                matched = ev
+                break
+        if matched:
+            excluded.append({
+                "date": trade_dt.strftime("%Y-%m-%d") if trade_dt != datetime.min else "",
+                "ticker": str(getattr(t, "ticker", "")).zfill(6),
+                "pnl": round(float(getattr(t, "profit_loss", 0.0) or 0.0), 2),
+                "deploy_sha": matched.get("sha"),
+                "deploy_date": (matched.get("date") or "")[:10],
+                "deploy_message": matched.get("message", "")[:120],
+            })
+        else:
+            stable.append(t)
+    return stable, excluded
+
+
+def build_stabilized_trade_stats(
+    trades: List[Any],
+    completed_sells: List[Any],
+    deploy_events: List[Dict[str, Any]],
+    grace_days: int,
+    *,
+    allow_partial: bool = False,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """코드 배포 grace 구간 매도를 제외한 안정 구간 통계."""
+    stable_sells, excluded = exclude_post_deploy_sells(completed_sells, deploy_events, grace_days)
+    stable_keys = {
+        (str(getattr(t, "ticker", "")), str(getattr(t, "timestamp", "")), str(getattr(t, "order_id", "")))
+        for t in stable_sells
+    }
+    stable_trades = [
+        t for t in trades
+        if str(getattr(t, "action", "")).upper() != "SELL"
+        or (str(getattr(t, "ticker", "")), str(getattr(t, "timestamp", "")), str(getattr(t, "order_id", ""))) in stable_keys
+    ]
+    stats = analyze_win_loss(stable_trades, include_pending_for_stats=allow_partial)
+    stats["excluded_post_deploy_sells"] = len(excluded)
+    stats["stable_completed_sell_trades"] = len(stable_sells)
+    stats["deploy_grace_days"] = grace_days
+    return stats, excluded
+
+
+def select_stats_for_tuning(
+    full_stats: Dict[str, Any],
+    stable_stats: Dict[str, Any],
+    min_trades: int,
+) -> Dict[str, Any]:
+    """튜닝용 통계: 배포 영향 제외 표본이 충분하면 stable 우선."""
+    stable_n = int(stable_stats.get("completed_sell_trades", 0))
+    excluded = int(stable_stats.get("excluded_post_deploy_sells", 0))
+    threshold = max(5, min_trades // 2)
+    if excluded > 0 and stable_n >= threshold:
+        chosen = dict(stable_stats)
+        chosen["stats_basis"] = "stable_excluding_deploy_grace"
+        return chosen
+    chosen = dict(full_stats)
+    chosen["stats_basis"] = "full"
+    return chosen
+
+
 # ── 코스피 한 달 주요 뉴스 수집 ─────────────────────────────────────
 def collect_kospi_news(lookback_days: int, max_items: int = NEWS_MAX_ITEMS) -> List[Dict[str, str]]:
     """최근 lookback_days 일간의 코스피/증시 관련 주요 뉴스를 수집한다.
@@ -808,10 +1173,13 @@ def gpt_propose_config_changes(
     trade_digest: Optional[List[Dict[str, Any]]] = None,
     portfolio_summary: Optional[Dict[str, Any]] = None,
     gpt_comparisons: Optional[List[Dict[str, Any]]] = None,
+    code_changes: Optional[Dict[str, Any]] = None,
+    stabilized_stats: Optional[Dict[str, Any]] = None,
+    excluded_trades: Optional[List[Dict[str, Any]]] = None,
     sample_insufficient: bool = False,
     min_sell_trades: int = DEFAULT_MIN_SELL_TRADES,
 ) -> Optional[Dict[str, Any]]:
-    """GPT 에 승패·사유·포트폴리오·뉴스·설정을 주고 변경안을 받는다."""
+    """GPT 에 승패·사유·포트폴리오·뉴스·코드 변경·설정을 주고 변경안을 받는다."""
     try:
         from gpt_analyzer import _call_openai_json
     except Exception as e:
@@ -833,7 +1201,10 @@ def gpt_propose_config_changes(
 
     system_prompt = (
         "당신은 한국 주식 자동매매 시스템의 리스크/전략 파라미터를 검토하는 퀀트 전문가입니다. "
-        "실제 매매 승패·매도 사유·포트폴리오·시장 뉴스를 근거로 설정을 점진적으로 개선하세요. "
+        "실제 매매 승패·매도 사유·포트폴리오·시장 뉴스·코드 변경 이력을 함께 고려해 설정을 점진적으로 개선하세요. "
+        "분석 기간 중 trader/risk_manager/config 등 매매 로직 커밋 직후 거래는 배포 영향으로 왜곡될 수 있습니다. "
+        "stabilized_stats(배포 grace 제외)가 제공되면 튜닝 판단의 주 근거로 사용하고, "
+        "full_stats와 불일치하는 이상 패턴은 코드 변경으로 설명 가능하면 파라미터 조정 근거에서 제외하세요. "
         "EmergencyDrop 등 손절 유형이 반복되면 auto_sell 관련 값을 보수적으로 조정할 수 있습니다. "
         "반드시 보수적으로 조정하고(한 번에 큰 변화 금지), 근거가 약하면 변경하지 마세요. "
         "응답은 반드시 단일 JSON 객체여야 합니다."
@@ -842,10 +1213,23 @@ def gpt_propose_config_changes(
     sell_sum_json = json.dumps(sell_summary or {}, ensure_ascii=False)
     port_json = json.dumps(portfolio_summary or {}, ensure_ascii=False)
     gpt_cmp_json = json.dumps(gpt_comparisons or [], ensure_ascii=False)
+    code_ctx = code_changes or {}
+    git_timeline = code_ctx.get("timeline_text") or "(커밋 이력 없음)"
+    excluded_json = json.dumps(excluded_trades or [], ensure_ascii=False)
+    stable_json = json.dumps(stabilized_stats or {}, ensure_ascii=False)
 
     user_prompt = (
-        "## 최근 매매 승패 통계 (체결 매도 기준)\n"
+        "## 최근 매매 승패 통계 (체결 매도 기준, 전체)\n"
         f"{json.dumps(stats, ensure_ascii=False)}\n\n"
+        "## 안정 구간 통계 (코드 배포 grace 직후 매도 제외, 튜닝 우선 근거)\n"
+        f"{stable_json}\n\n"
+        "## 배포 grace 로 제외된 매도 (코드 변경 영향 가능)\n"
+        f"{excluded_json}\n\n"
+        "## 분석 기간 Git 커밋 이력\n"
+        f"source={code_ctx.get('source', 'none')}, "
+        f"commits={code_ctx.get('commit_count', 0)}, "
+        f"trading_relevant={code_ctx.get('trading_relevant_count', 0)}\n"
+        f"{git_timeline}\n\n"
         "## 매도 사유 분포\n"
         f"{sell_sum_json}\n\n"
         "## 대표 매도 거래\n"
@@ -864,6 +1248,7 @@ def gpt_propose_config_changes(
         "- 새 키 추가, 키 삭제, 리스트/구조 변경은 금지합니다.\n"
         "- 변경이 필요 없는 키는 응답에 포함하지 마세요. 변경할 키만 새 값으로 포함하세요.\n"
         "- 각 숫자 값은 현재값 대비 과도하게 바꾸지 마세요(작은 폭의 점진적 조정).\n"
+        "- 코드 배포 직후 거래 이상은 로직 변경으로 해석하고, stabilized_stats 기준으로 튜닝하세요.\n"
         "- 승률이 낮고 손실이 크면 리스크를 줄이고(손절 타이트, 포지션/익절 보수화), 성과가 좋고 시장이 우호적이면 소폭 공격적으로.\n\n"
         "## 출력 JSON 형식 (변경할 키만)\n"
         "{\n"
@@ -975,6 +1360,8 @@ def _notify_summary(
     portfolio_summary: Optional[Dict[str, Any]] = None,
     skipped: bool = False,
     skip_reason: str = "",
+    code_changes: Optional[Dict[str, Any]] = None,
+    stabilized_stats: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Discord 로 분석/튜닝 요약 전송(실패는 조용히 무시)."""
     try:
@@ -996,6 +1383,22 @@ def _notify_summary(
             {"name": "💰 순손익", "value": f"{stats.get('net_pnl', 0):,}", "inline": True},
             {"name": "📰 뉴스/판단", "value": f"{news_count}건 / {source}", "inline": True},
         ]
+        if code_changes:
+            git_src = code_changes.get("source", "none")
+            git_n = code_changes.get("commit_count", 0)
+            git_tr = code_changes.get("trading_relevant_count", 0)
+            excluded_n = int((stabilized_stats or {}).get("excluded_post_deploy_sells", 0))
+            git_line = f"{git_src} · 커밋 {git_n} (매매로직 {git_tr})"
+            if excluded_n:
+                git_line += f" · grace 제외 {excluded_n}건"
+            fields.append({"name": "🧩 코드 변경", "value": git_line, "inline": False})
+        if stabilized_stats and stabilized_stats.get("stats_basis") == "stable_excluding_deploy_grace":
+            fields.append({
+                "name": "📊 안정 구간 승률",
+                "value": f"{float(stabilized_stats.get('win_rate', 0.0)):.1%} "
+                f"({stabilized_stats.get('completed_sell_trades', 0)}건)",
+                "inline": True,
+            })
         if portfolio_summary and portfolio_summary.get("snapshot_count", 0) > 0:
             fields.append({
                 "name": "📈 포트폴리오",
@@ -1089,6 +1492,24 @@ def run_review() -> Dict[str, Any]:
     logger.info(f"[stats] {stats}")
     logger.info(f"[sell_summary] completed={sell_summary.get('completed_sell_count', 0)}")
 
+    # 2b) Git 커밋 이력 + 배포 grace 구간 거래 제외 통계
+    deploy_grace_days = int(os.getenv("REVIEWER_DEPLOY_GRACE_DAYS", str(DEFAULT_DEPLOY_GRACE_DAYS)))
+    code_changes = collect_code_changes(start_dt, end_dt)
+    deploy_events = code_changes.get("deploy_events") or []
+    stabilized_stats, excluded_trades = build_stabilized_trade_stats(
+        trades,
+        completed_sells,
+        deploy_events,
+        deploy_grace_days,
+        allow_partial=allow_partial,
+    )
+    tuning_stats = select_stats_for_tuning(stats, stabilized_stats, min_trades)
+    if excluded_trades:
+        logger.info(
+            f"[git] deploy grace 제외 매도 {len(excluded_trades)}건 "
+            f"(grace={deploy_grace_days}d, basis={tuning_stats.get('stats_basis')})"
+        )
+
     # 3) 포트폴리오·GPT 대조 (Phase B)
     portfolio_summary: Dict[str, Any] = {}
     gpt_comparisons: List[Dict[str, Any]] = []
@@ -1118,13 +1539,25 @@ def run_review() -> Dict[str, Any]:
         cfg = None
 
     n_completed = int(stats.get("completed_sell_trades", 0))
-    n_all_sells = int(stats.get("sell_trades", 0))
-    sample_insufficient = n_completed < min_trades
+    n_stable_completed = int(stabilized_stats.get("completed_sell_trades", n_completed))
+    n_effective = n_stable_completed if excluded_trades else n_completed
+    sample_insufficient = n_effective < min_trades
 
     result: Dict[str, Any] = {
         "timestamp": end_dt.isoformat(),
         "lookback_days": lookback_days,
         "stats": stats,
+        "stabilized_stats": stabilized_stats,
+        "tuning_stats_basis": tuning_stats.get("stats_basis"),
+        "code_changes": {
+            "source": code_changes.get("source"),
+            "commit_count": code_changes.get("commit_count"),
+            "trading_relevant_count": code_changes.get("trading_relevant_count"),
+            "deploy_grace_days": deploy_grace_days,
+            "timeline_text": code_changes.get("timeline_text"),
+            "commits": code_changes.get("commits"),
+            "excluded_trades": excluded_trades,
+        },
         "sell_summary": sell_summary,
         "trade_digest": trade_digest,
         "digest_count": len(trade_digest),
@@ -1144,7 +1577,7 @@ def run_review() -> Dict[str, Any]:
     # 5) 표본 부족/설정 로드 실패 시 스킵
     if sample_insufficient and not allow_partial:
         result["skipped"] = True
-        result["skip_reason"] = f"체결 매도 {n_completed}건 < 최소 {min_trades}건"
+        result["skip_reason"] = f"체결 매도 {n_effective}건 < 최소 {min_trades}건"
         logger.info(f"[skip] {result['skip_reason']} → config 변경 없음")
     elif cfg is None:
         result["skipped"] = True
@@ -1155,7 +1588,7 @@ def run_review() -> Dict[str, Any]:
         source = "none"
 
         if sample_insufficient:
-            reasons.append(f"표본 부족: 체결 매도 {n_completed}건 < 권장 {min_trades}건 (보수 모드)")
+            reasons.append(f"표본 부족: 체결 매도 {n_effective}건 < 권장 {min_trades}건 (보수 모드)")
 
         # 6) GPT 리뷰 → 변경 제안
         proposal = gpt_propose_config_changes(
@@ -1166,6 +1599,9 @@ def run_review() -> Dict[str, Any]:
             trade_digest=trade_digest,
             portfolio_summary=portfolio_summary,
             gpt_comparisons=gpt_comparisons,
+            code_changes=code_changes,
+            stabilized_stats=stabilized_stats,
+            excluded_trades=excluded_trades,
             sample_insufficient=sample_insufficient,
             min_sell_trades=min_trades,
         )
@@ -1177,10 +1613,12 @@ def run_review() -> Dict[str, Any]:
             if changes:
                 source = "gpt"
 
-        # 7) GPT 불가/무변경 시 규칙 기반 auto_sell 폴백
+        # 7) GPT 불가/무변경 시 규칙 기반 auto_sell 폴백 (안정 구간 통계 우선)
         if not changes:
             auto_sell = cfg.setdefault("risk_params", {}).setdefault("auto_sell", {})
-            fb_changes, fb_reasons = decide_autosell_adjustments(stats, auto_sell)
+            fb_changes, fb_reasons = decide_autosell_adjustments(tuning_stats, auto_sell)
+            if fb_changes and tuning_stats.get("stats_basis") == "stable_excluding_deploy_grace":
+                fb_reasons = [f"[안정구간] {r}" for r in fb_reasons]
             if fb_changes:
                 changes = {"risk_params": {"auto_sell": fb_changes}}
                 reasons = fb_reasons
@@ -1228,6 +1666,8 @@ def run_review() -> Dict[str, Any]:
         portfolio_summary=result.get("portfolio_summary"),
         skipped=result.get("skipped", False),
         skip_reason=result.get("skip_reason", ""),
+        code_changes=code_changes,
+        stabilized_stats=stabilized_stats,
     )
 
     logger.info("=== reviewer done ===")
