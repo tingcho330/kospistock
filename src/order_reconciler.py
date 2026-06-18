@@ -63,6 +63,12 @@ def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
         order_time = str(row.get("ord_tmd", "") or "")
         # 취소 여부(주식일별주문체결조회 output1.cncl_yn: Y/N)
         cancelled = str(row.get("cncl_yn", "") or "").strip().upper() == "Y"
+        avg_raw = row.get("avg_prvs", row.get("ord_unpr", 0))
+        try:
+            avg_price = int(float(avg_raw or 0))
+        except Exception:
+            avg_price = 0
+        estimated_fees = _safe_int(row.get("prsm_tlex_smtl", 0))
 
         if executed_qty <= 0 and cancelled:
             status = "cancelled"
@@ -84,6 +90,8 @@ def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
             "status": status,
             "cancelled": cancelled,
             "order_time": order_time,
+            "avg_price": avg_price,
+            "estimated_fees": estimated_fees,
         }
     except Exception:
         return None
@@ -242,6 +250,25 @@ def _match_kis_candidates(
 
 
 def backfill_orphan_order_ids(*, since_hours: int = 24, limit: int = 200) -> Dict[str, int]:
+    """
+    order_id가 비어 있는 DB 행을 KIS 일자별 주문과 매칭해 backfill.
+    유일 매칭(1건)일 때만 UPDATE.
+    """
+    setup_logging()
+    try:
+        return _backfill_orphan_order_ids_impl(since_hours=since_hours, limit=limit)
+    except Exception as e:
+        logger.exception("orphan backfill 실패: %s", e)
+        return {
+            "backfill_orphans": 0,
+            "backfill_updated": 0,
+            "backfill_skipped_ambiguous": 0,
+            "backfill_skipped_no_match": 0,
+            "backfill_error": str(e),
+        }
+
+
+def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) -> Dict[str, int]:
     """
     order_id가 비어 있는 DB 행을 KIS 일자별 주문과 매칭해 backfill.
     유일 매칭(1건)일 때만 UPDATE.
@@ -495,6 +522,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             order_id=order_id,
             order_status=new_status,
             executed_qty=kis_exe,
+            price=(kis_o.get("avg_price") or None) if int(kis_o.get("avg_price") or 0) > 0 else None,
         )
         if n:
             updated += n
@@ -543,6 +571,9 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
 
 
 def main():
+    import sys
+    import json
+
     parser = argparse.ArgumentParser(description="DB pending/partial 주문 리컨실")
     parser.add_argument("--since-hours", type=int, default=24, help="리컨실 대상 조회 범위(시간)")
     parser.add_argument("--limit", type=int, default=500, help="최대 조회 건수")
@@ -553,10 +584,17 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.backfill_only:
-        backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))
-    else:
-        reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
+    try:
+        if args.backfill_only:
+            summary = backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))
+        else:
+            summary = reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
+        print(json.dumps({"ok": True, **summary}, ensure_ascii=False))
+        sys.exit(0)
+    except Exception as e:
+        logger.exception("order_reconciler 실패: %s", e)
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

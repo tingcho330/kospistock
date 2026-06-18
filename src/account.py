@@ -63,8 +63,16 @@ def build_summary_comments() -> dict:
         "prvs_rcdl_excc_amt": "D+2 출금 가능 금액",
         "nxdy_excc_amt": "익일(D+1) 출금 가능 금액",
         "tot_evlu_amt": "총 평가 금액 (주식 평가금 + 예수금)",
+        "nass_amt": "순자산금액",
+        "thdt_buy_amt": "금일매수금액",
+        "thdt_sll_amt": "금일매도금액",
+        "thdt_tlex_amt": "금일제비용금액",
+        "bfdy_tot_asst_evlu_amt": "전일총자산평가금액",
+        "asst_icdc_amt": "자산증감액",
         "pchs_amt_smtl_amt": "매입 금액 합계",
         "evlu_pfls_smtl_amt": "평가 손익 합계",
+        "rlzt_pfls": "실현손익 (inquire-balance-rlz-pl)",
+        "rlzt_erng_rt": "실현수익률 (%)",
         "status": "데이터 상태 (ok/degraded)",
     }
 
@@ -160,6 +168,23 @@ def inquire_balance_with_retry(kis: KIS, *, max_tries: int = 3) -> Tuple[pd.Data
     logger.warning("inquire_balance 재시도 종료: %s", last_err)
     return None, None, True, (str(last_err)[:400] if last_err else "unknown")
 
+
+def inquire_balance_rlz_pl_with_retry(kis: KIS, *, max_tries: int = 3):
+    """KIS 실현손익 잔고 조회 (inquire-balance-rlz-pl)."""
+    last_err = None
+    for _ in range(max_tries):
+        try:
+            if not hasattr(kis, "inquire_balance_rlz_pl"):
+                return None, None, True, "inquire_balance_rlz_pl not implemented"
+            df_balance, df_summary = kis.safe_call(kis.inquire_balance_rlz_pl)
+            if df_summary is not None and not df_summary.empty:
+                return df_balance, df_summary, False, ""
+            last_err = RuntimeError("실현손익 요약 데이터 비어있음")
+        except Exception as e:
+            last_err = e
+    logger.warning("inquire_balance_rlz_pl 재시도 종료: %s", last_err)
+    return None, None, True, (str(last_err)[:400] if last_err else "unknown")
+
 def _make_empty_balance_df() -> pd.DataFrame:
     cols = list(build_balance_comments().keys())
     return pd.DataFrame(columns=cols)
@@ -195,6 +220,7 @@ if __name__ == "__main__":
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         balance_file = OUTPUT_DIR / f"balance_{today}.json"
         summary_file = OUTPUT_DIR / f"summary_{today}.json"
+        summary_rlz_file = OUTPUT_DIR / f"summary_rlz_{today}.json"
 
         # ── degraded 보호 로직 ──
         existing_status = _load_status(summary_file)
@@ -240,6 +266,18 @@ if __name__ == "__main__":
         # 저장(덮어쓰기) - 정상
         dump_with_comments(balance_file, build_balance_comments(), df_balance, extra_fields={"status": "ok"})
         dump_with_comments(summary_file, build_summary_comments(), df_summary, extra_fields={"status": "ok"})
+
+        df_rlz_balance, df_rlz_summary, rlz_degraded, rlz_err = inquire_balance_rlz_pl_with_retry(kis)
+        if not rlz_degraded and df_rlz_summary is not None and not df_rlz_summary.empty:
+            dump_with_comments(
+                summary_rlz_file,
+                build_summary_comments(),
+                df_rlz_summary,
+                extra_fields={"status": "ok", "source": "inquire-balance-rlz-pl"},
+            )
+            logger.info("실현손익 요약 저장: %s", summary_rlz_file)
+        else:
+            logger.warning("실현손익 요약 조회 실패(일일 요약은 balance summary로 폴백): %s", rlz_err)
 
         # 저장된 JSON 재파싱
         _, cash_d2, cash_tot, tot_eval, nxdy_excc = _extract_summary_fields_from_saved_json(summary_file)

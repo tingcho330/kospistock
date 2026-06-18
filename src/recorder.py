@@ -1742,6 +1742,21 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
                 f"pending 거래 기록 생략 (order_id 없음): {ticker} {action}"
             )
             return False
+
+        raw_trade_status = str(trade_data.get("trade_status", "executed")).lower()
+        if order_status in ("executed", "partial") and not order_id:
+            if raw_trade_status not in ("completed",) or action not in ("BUY", "SELL"):
+                _db_dbg_skip(
+                    "record_trade.SKIP_EXECUTED_NO_ORDER_ID",
+                    reason="executed/partial requires order_id for reconciler",
+                    ticker=ticker,
+                    side=action,
+                    trade_status=raw_trade_status,
+                )
+                logging.getLogger(__name__).warning(
+                    f"체결 거래 기록 생략 (order_id 없음): {ticker} {action}"
+                )
+                return False
         
         # TradeRecord 객체 생성
         trade_record = TradeRecord(

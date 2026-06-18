@@ -27,6 +27,8 @@ from utils import (
     KST,
     OUTPUT_DIR,
     extract_cash_from_summary,
+    extract_kis_official_summary,
+    load_summary_rlz_dict,
     setup_logging,
     in_time_windows,
     get_account_snapshot_cached,
@@ -380,10 +382,16 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             ttl_sec=5
         )
         
-        # 총평가금액 계산
-        total_balance = int(str(cash_map.get("tot_evlu_amt", 0)).replace(",", ""))
+        # 총평가금액 계산 (KIS 순자산 우선)
+        tot_evlu = int(str(cash_map.get("tot_evlu_amt", 0)).replace(",", ""))
         cash = int(str(cash_map.get("dnca_tot_amt", 0)).replace(",", ""))
-        holdings_value = total_balance - cash
+        date_tag = datetime.now(KST).strftime("%Y%m%d")
+        kis_official = extract_kis_official_summary(
+            cash_map,
+            load_summary_rlz_dict(date_tag),
+        )
+        net_assets = int(kis_official.get("net_assets") or tot_evlu or 0)
+        holdings_value = net_assets - cash if net_assets >= cash else tot_evlu - cash
         
         # 보유종목 상세 정보
         holdings_detail = []
@@ -400,14 +408,16 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
         
         # 스냅샷 데이터 구성
         snapshot = {
-            "date": datetime.now(KST).strftime("%Y%m%d"),
+            "date": date_tag,
             "timestamp": datetime.now(KST).isoformat(),
             "type": snapshot_type,
-            "total_balance": total_balance,
+            "total_balance": net_assets,
+            "tot_evlu_amt": tot_evlu,
             "cash": cash,
             "holdings_value": holdings_value,
             "holdings_count": len(holdings_detail),
             "holdings_detail": holdings_detail,
+            "kis_official": kis_official,
             "summary_file": str(summary_path) if summary_path else None,
             "balance_file": str(balance_path) if balance_path else None
         }
@@ -523,6 +533,29 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             realized_pnl = 0
 
         fees_taxes = trade_stats["fees_taxes"]
+        db_realized_pnl = realized_pnl
+
+        open_kis = open_balance.get("kis_official") or {}
+        close_kis = close_balance.get("kis_official") or {}
+        kis_realized = close_kis.get("realized_pnl")
+        if kis_realized is not None and int(kis_realized) != 0:
+            realized_pnl = int(kis_realized)
+        kis_fees = close_kis.get("thdt_tlex_amt")
+        if kis_fees is not None and int(kis_fees) > 0:
+            fees_taxes = int(kis_fees)
+
+        validation_warnings: List[str] = []
+        if kis_realized is not None and db_realized_pnl is not None:
+            if abs(int(kis_realized) - int(db_realized_pnl)) > 3000:
+                validation_warnings.append(
+                    f"실현손익 DB↔KIS 불일치: DB {int(db_realized_pnl):+,} vs KIS {int(kis_realized):+,}"
+                )
+        kis_asset_change = close_kis.get("asst_icdc_amt")
+        if kis_asset_change is not None and int(kis_asset_change) != 0:
+            if abs(int(total_change) - int(kis_asset_change)) > 2000:
+                validation_warnings.append(
+                    f"자산증감 불일치: 스냅샷 {int(total_change):+,} vs KIS asst_icdc {int(kis_asset_change):+,}"
+                )
 
         return {
             "date": close_balance["date"],
@@ -531,6 +564,8 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "holdings_change": holdings_change,
             "daily_return_pct": round(daily_return_pct, 2),
             "realized_pnl": realized_pnl,
+            "db_realized_pnl": db_realized_pnl,
+            "kis_realized_pnl": kis_realized,
             "unrealized_pnl": unrealized_pnl,
             "fees_taxes": fees_taxes,
             "net_pnl": total_change,
@@ -540,6 +575,8 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "open_balance": open_balance["total_balance"],
             "close_balance": close_balance["total_balance"],
             "close_holdings_count": close_balance.get("holdings_count", len(close_tickers)),
+            "kis_official_close": close_kis,
+            "validation_warnings": validation_warnings,
         }
         
     except Exception as e:
@@ -567,10 +604,12 @@ def send_daily_trading_summary():
         total_change = comparison["total_change"]
         daily_return = comparison["daily_return_pct"]
         realized_pnl = comparison["realized_pnl"]
+        db_realized_pnl = comparison.get("db_realized_pnl")
         unrealized_pnl = comparison["unrealized_pnl"]
-        cash_change = comparison["cash_change"]
         holdings_change = comparison["holdings_change"]
         fees_taxes = comparison.get("fees_taxes")
+        kis_close = comparison.get("kis_official_close") or {}
+        validation_warnings = comparison.get("validation_warnings") or []
         
         # 변화량 이모지
         change_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
@@ -578,7 +617,7 @@ def send_daily_trading_summary():
         # 임베드 필드 구성
         fields = [
             {
-                "name": f"{change_emoji} 잔액 변화",
+                "name": f"{change_emoji} 순자산 변화 (nass_amt)",
                 "value": f"**{open_balance['total_balance']:,}원** → **{close_balance['total_balance']:,}원** ({total_change:+,}원)",
                 "inline": False
             }
@@ -593,8 +632,13 @@ def send_daily_trading_summary():
                     "inline": True
                 },
                 {
-                    "name": "💵 현금 변화",
-                    "value": f"{cash_change:+,}원",
+                    "name": "📥 금일 매수",
+                    "value": f"{int(kis_close.get('thdt_buy_amt') or 0):,}원",
+                    "inline": True
+                },
+                {
+                    "name": "📤 금일 매도",
+                    "value": f"{int(kis_close.get('thdt_sll_amt') or 0):,}원",
                     "inline": True
                 },
                 {
@@ -603,7 +647,7 @@ def send_daily_trading_summary():
                     "inline": True
                 },
                 {
-                    "name": "💰 실현 손익",
+                    "name": "💰 실현 손익 (KIS)",
                     "value": f"{realized_pnl:+,}원",
                     "inline": True
                 },
@@ -613,13 +657,27 @@ def send_daily_trading_summary():
                     "inline": True
                 }
             ])
+
+            if db_realized_pnl is not None and int(db_realized_pnl) != int(realized_pnl):
+                fields.append({
+                    "name": "📊 실현 손익 (DB)",
+                    "value": f"{int(db_realized_pnl):+,}원 ⚠️",
+                    "inline": True
+                })
             
             if fees_taxes is not None and abs(fees_taxes) > 0:
                 fields.append({
-                    "name": "💸 수수료·세금",
-                    "value": f"{fees_taxes:+,}원",
+                    "name": "💸 금일 제비용",
+                    "value": f"{int(fees_taxes):+,}원",
                     "inline": True
                 })
+
+            d1 = int(kis_close.get("nxdy_excc_amt") or 0)
+            d2 = int(kis_close.get("prvs_rcdl_excc_amt") or 0)
+            if d1 > 0:
+                fields.append({"name": "💵 D+1 정산", "value": f"{d1:,}원", "inline": True})
+            if d2 > 0:
+                fields.append({"name": "💵 D+2 정산", "value": f"{d2:,}원", "inline": True})
         
         # 매매 내역 추가 (변화가 있을 때만)
         if comparison["sold_tickers"] or comparison["bought_tickers"]:
@@ -632,6 +690,13 @@ def send_daily_trading_summary():
             fields.append({
                 "name": "📋 매매 내역",
                 "value": " | ".join(trading_summary),
+                "inline": False
+            })
+
+        if validation_warnings:
+            fields.append({
+                "name": "⚠️ 검증",
+                "value": "\n".join(validation_warnings[:3]),
                 "inline": False
             })
         
@@ -791,21 +856,50 @@ def run_order_reconcile_job():
     """DB pending/partial 주문 리컨실 실행"""
     try:
         logger.info("주문 리컨실(order_reconciler.py) 실행 시작")
-        # 별도 스크립트 실행 (DB 상태 정리)
+        script = Path("/app/src/order_reconciler.py")
+        if not script.exists():
+            script = Path(__file__).resolve().parent / "order_reconciler.py"
+        project_root = script.parent.parent
         result = subprocess.run(
-            [sys.executable, "src/order_reconciler.py", "--since-hours", "36", "--limit", "800"],
+            [sys.executable, str(script), "--since-hours", "36", "--limit", "800"],
             capture_output=True,
             text=True,
-            cwd=os.getcwd(),
+            cwd=str(project_root),
+            timeout=180,
         )
         if result.returncode == 0:
-            logger.info("주문 리컨실 실행 완료")
+            stdout_line = (result.stdout or "").strip().splitlines()
+            summary_line = stdout_line[-1] if stdout_line else ""
+            logger.info(f"주문 리컨실 실행 완료: {summary_line[:300]}")
         else:
-            logger.error(f"주문 리컨실 실패: {result.stderr[:300]}")
-            _notify(f"❌ 주문 리컨실 실패: {result.stderr[:180]}", key="order_reconcile_fail", cooldown_sec=120)
+            stderr_tail = _tail(result.stderr, 80)
+            logger.error(f"주문 리컨실 실패 (exit={result.returncode}):\n{stderr_tail}")
+            _notify(
+                f"❌ 주문 리컨실 실패 (exit={result.returncode}): {stderr_tail[:180]}",
+                key="order_reconcile_fail",
+                cooldown_sec=120,
+            )
+    except subprocess.TimeoutExpired:
+        logger.error("주문 리컨실 실행 시간 초과 (180s)")
+        _notify("❌ 주문 리컨실 시간 초과", key="order_reconcile_timeout", cooldown_sec=120)
     except Exception as e:
         logger.error(f"주문 리컨실 실행 중 오류: {e}")
         _notify(f"❌ 주문 리컨실 오류: {str(e)[:180]}", key="order_reconcile_error", cooldown_sec=120)
+
+
+def run_intraday_reconcile_job():
+    """장중 경량 리컨실 (pending 주문 장시간 방치 방지)."""
+    try:
+        if not is_market_open_day():
+            return
+        now = datetime.now(KST)
+        if not in_time_windows(now, ["09:30-15:10"]):
+            return
+        from order_reconciler import reconcile_open_orders
+        summary = reconcile_open_orders(since_hours=12, limit=200)
+        logger.info(f"장중 경량 리컨실 완료: updated={summary.get('updated', 0)}")
+    except Exception as e:
+        logger.warning(f"장중 경량 리컨실 실패: {e}")
 
 def _monthly_already_ran(year_month: str) -> bool:
     """이번 달 유지보수가 이미 실행됐는지 확인(컨테이너 재시작 등 중복 방지)."""
@@ -1077,6 +1171,10 @@ def register_jobs():
         # batch check 직후 리컨실 1회(주문 상태/체결수량 최신화)
         reconcile_time = _add_minutes_hhmm(batch_check_time, 2)
         getattr(schedule.every(), day).at(reconcile_time).do(run_order_reconcile_job)
+
+        # 장중 경량 리컨실
+        getattr(schedule.every(), day).at("11:00").do(run_intraday_reconcile_job)
+        getattr(schedule.every(), day).at("14:00").do(run_intraday_reconcile_job)
         
         # 장종료시 잔액 캡처
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["balance_close"]).do(capture_balance_snapshot, "close")

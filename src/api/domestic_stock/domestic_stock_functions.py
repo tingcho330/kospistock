@@ -71,6 +71,126 @@ class DomesticStock:
             logger.warning(f"잔고 조회 실패 (status={res.status_code}): {res.text[:200]}")
             return pd.DataFrame(), pd.DataFrame()
 
+    def inquire_balance_rlz_pl(
+        self,
+        *,
+        afhr_flpr_yn: str = "N",
+        fund_sttl_icld_yn: str = "N",
+        prcs_dvsn: str = "00",
+        cost_icld_yn: str = "N",
+        ctx_area_fk100: str = "",
+        ctx_area_nk100: str = "",
+    ):
+        """
+        주식 잔고 조회 (실현손익 포함)
+        GET /uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl
+        TR: TTTC8494R (실전) / VTTC8494R (모의)
+        """
+        url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl"
+        is_vps = getattr(self, "env", "prod") == "vps"
+        tr_id = "VTTC8494R" if is_vps else "TTTC8494R"
+
+        params = {
+            "CANO": self.cano,
+            "ACNT_PRDT_CD": self.acnt_prdt_cd,
+            "AFHR_FLPR_YN": afhr_flpr_yn,
+            "OFL_YN": "",
+            "INQR_DVSN": "00",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": fund_sttl_icld_yn,
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": prcs_dvsn,
+            "COST_ICLD_YN": cost_icld_yn,
+            "CTX_AREA_FK100": ctx_area_fk100,
+            "CTX_AREA_NK100": ctx_area_nk100,
+        }
+
+        res = self.request_get(url, headers={"tr_id": tr_id}, params=params)
+        if res.status_code == 200:
+            data = res.json()
+            df_balance = pd.DataFrame(data.get("output1") or [])
+            out2 = data.get("output2") or []
+            df_summary = pd.DataFrame([out2[0]] if out2 else [])
+            return df_balance, df_summary
+        logger.warning(f"실현손익 잔고 조회 실패 (status={res.status_code}): {res.text[:200]}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    def inquire_period_trade_profit(
+        self,
+        *,
+        inqr_strt_dt: str,
+        inqr_end_dt: str,
+        pdno: str = "",
+        sort_dvsn: str = "00",
+        cblc_dvsn: str = "00",
+        ctx_area_fk100: str = "",
+        ctx_area_nk100: str = "",
+        max_pages: int = 10,
+    ):
+        """
+        기간별 매매손익 현황 조회
+        GET /uapi/domestic-stock/v1/trading/inquire-period-trade-profit
+        TR: TTTC8715R (실전) / VTTC8715R (모의)
+        """
+        url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-period-trade-profit"
+        is_vps = getattr(self, "env", "prod") == "vps"
+        tr_id = "VTTC8715R" if is_vps else "TTTC8715R"
+
+        detail_frames = []
+        summary_df = pd.DataFrame()
+        ctx_fk = ctx_area_fk100
+        ctx_nk = ctx_area_nk100
+        tr_cont = ""
+
+        for _ in range(max(1, max_pages)):
+            params = {
+                "CANO": self.cano,
+                "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                "SORT_DVSN": sort_dvsn,
+                "PDNO": pdno,
+                "INQR_STRT_DT": inqr_strt_dt,
+                "INQR_END_DT": inqr_end_dt,
+                "CBLC_DVSN": cblc_dvsn,
+                "CTX_AREA_FK100": ctx_fk,
+                "CTX_AREA_NK100": ctx_nk,
+            }
+            headers = {"tr_id": tr_id}
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+
+            res = self.request_get(url, headers=headers, params=params)
+            if res.status_code != 200:
+                logger.warning(
+                    f"기간별 매매손익 조회 실패 (status={res.status_code}, "
+                    f"{inqr_strt_dt}~{inqr_end_dt}): {res.text[:200]}"
+                )
+                break
+
+            data = res.json()
+            if str(data.get("rt_cd", "")) not in ("", "0"):
+                logger.warning(
+                    f"기간별 매매손익 응답 오류: rt_cd={data.get('rt_cd')} msg={data.get('msg1')}"
+                )
+                break
+
+            rows = data.get("output1") or []
+            if rows:
+                detail_frames.append(pd.DataFrame(rows))
+            out2 = data.get("output2") or []
+            if out2 and summary_df.empty:
+                summary_df = pd.DataFrame([out2[0]] if isinstance(out2, list) else [out2])
+
+            tr_cont_resp = str(res.headers.get("tr_cont", "")).strip().upper()
+            ctx_fk = str(data.get("ctx_area_fk100", "") or "").strip()
+            ctx_nk = str(data.get("ctx_area_nk100", "") or "").strip()
+            if tr_cont_resp in ("F", "M") and ctx_nk:
+                tr_cont = "N"
+                continue
+            break
+
+        detail_df = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
+        return detail_df, summary_df
+
     def order_cash(self, ord_dv: str, pdno: str, ord_dvsn: str, ord_qty: int, ord_unpr: int):
         """
         현금 주문

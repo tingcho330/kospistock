@@ -59,12 +59,13 @@
   - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).  
   - `direct_execute` 실패 시 같은 사이클에서 `trader.py --sell-only`로 **매도 fallback** (쿨다운 적용).
 - **KIS 토큰 공유** — 두 컨테이너가 `output/cache/kis_token.json`을 공유. 파일락·EGW00133 backoff·재인증 쿨다운으로 **1분 1회 발급 제한** 대응.
-- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill
+- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill. `inquire-daily-ccld`의 `avg_prvs`(체결가) 반영·체결 후 PnL 재계산
 - **연속 손실 집계** — `is_countable_loss_sell()` / `count_consecutive_losses()`로 **체결 확정·order_id 있는 손실만** 카운트 (`stop_trading_on_consecutive_losses`, 기본 3회). pending/failed·중복 SELL row 제외
 - **중복 SELL 방지** — `risk_manager` direct_execute 후 `trader.run_sell_logic`이 동일 종목을 재매도·재기록하지 않도록 pending 주문 skip + `order_id` 없는 SELL 중복 INSERT 차단
+- **매수 오기록 방지** — `trader._check_delayed_execution`은 **ODNO·매수/매도 구분** 필수. `split_buy.enabled=false` 시 분할 분기 미진입. `order_id` 없는 체결 BUY/SELL은 `recorder`에서 INSERT 차단
 - **월간 튜닝** — `reviewer.py` 성과 분석 후 `config.json` 파라미터 미세 조정(매월 1회 스케줄)
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화
-- **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 비교 후 Discord 전송. 실현 손익은 `trading_data.db` 체결 매도 `profit_loss` 합, 미실현은 계속 보유 종목 평가 변화
+- **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 + KIS 공식 수치(`nass_amt`, `rlzt_pfls`, `thdt_*`) 기반 Discord 전송. DB `profit_loss`는 보조·불일치 시 ⚠️ 표시
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
 ---
@@ -106,6 +107,7 @@
 | 09:00 | 장시작 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("open")` → `output/daily_balances/` |
 | 09:10 | 스크리너 | `screener.py` |
 | 10:15 | 매매 파이프라인 | `health_check` → `news_collector` → `gpt_analyzer` → `trader` |
+| 11:00 · 14:00 | 장중 경량 리컨실 | `integrated_manager.run_intraday_reconcile_job()` → `order_reconciler` |
 | 15:20 | 일괄 체결 확인 | `trader.py --batch-check-only` |
 | 15:22 | 주문 정합성 | `order_reconciler.py` |
 | 15:30 | 장종료 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("close")` |
@@ -116,20 +118,24 @@
 
 ### 3.2.1 일일 매매 요약 (Discord)
 
-`compare_balances()` + `send_daily_trading_summary()`가 `balance_open_YYYYMMDD.json` / `balance_close_YYYYMMDD.json`을 비교합니다.
+`compare_balances()` + `send_daily_trading_summary()`가 `balance_open_YYYYMMDD.json` / `balance_close_YYYYMMDD.json`을 비교합니다.  
+스냅샷 캡처 시 `account.py`가 KIS **`inquire-balance`** + **`inquire-balance-rlz-pl`**(TTTC8494R)을 호출해 `output/summary_rlz_*.json`에 실현손익을 저장합니다.
 
-| 표시 항목 | 계산 방식 |
-|-----------|-----------|
-| 잔액 변화 · 일일 수익률 | 장시작/종료 `total_balance` 차이 |
-| 현금 변화 · 보유평가 변화 | 각 스냅샷 `cash` / `holdings_value` 차이 (합 = 잔액 변화) |
-| 실현 손익 | 당일 체결 매도 `trade_records.profit_loss` 합 (`recorder`) |
+| 표시 항목 | 계산 방식 (1차 소스) |
+|-----------|----------------------|
+| 순자산 변화 · 일일 수익률 | 장시작/종료 **`nass_amt`**(순자산) 차이 — `tot_evlu_amt` 대신 KIS 앱과 동일 필드 우선 |
+| 금일 매수 / 매도 | KIS `thdt_buy_amt` / `thdt_sll_amt` |
+| 실현 손익 (KIS) | `inquire-balance-rlz-pl` → **`rlzt_pfls`** |
+| 실현 손익 (DB) | 당일 체결 매도 `trade_records.profit_loss` 합 — KIS와 ±3,000원 초과 시 ⚠️ |
 | 미실현 손익 | **장중 계속 보유** 종목만: 종료 평가액 − 시작 평가액 |
-| 수수료·세금 | 당일 체결 거래 `commission + tax` 합 |
+| 금일 제비용 | KIS `thdt_tlex_amt` (없으면 DB `commission + tax`) |
+| D+1 / D+2 정산 | `nxdy_excc_amt` / `prvs_rcdl_excc_amt` |
 | 매매 내역 | 스냅샷 기준 매도/매수 종목 수 (티커 집합 차이) |
 | 보유종목 | **장마감** 스냅샷 `holdings_count` |
 
-> 실현 손익이 0으로 나오면 당일 매도가 DB에 없거나 `profit_loss` 미계산일 수 있습니다. `order_reconciler` 실행 후 `recorder.recompute_profit_loss_for_order_id()`로 보정하세요.  
-> `account.py`는 수동 잔고 조회·`balance_*.json` 저장용이며, 스케줄 스냅샷 경로(`daily_balances/`)와는 별도입니다.
+> 예수금(`dnca_tot_amt`)은 T+2 결제 환경에서 당일 매매 직후 변하지 않을 수 있어 **「현금 변화」 단독 표시는 하지 않습니다.**  
+> DB 실현손익이 KIS와 다르면 `order_reconciler` 실행·`avg_prvs` 체결가 반영·phantom BUY row( `order_id` 없음) 여부를 점검하세요.  
+> `account.py`는 `balance_*.json`·`summary_*.json`·`summary_rlz_*.json` 저장용이며, 스케줄 스냅샷은 `daily_balances/`에 별도 저장됩니다.
 
 ### 3.3 스크리너 vs 매매 파이프라인
 
@@ -246,7 +252,7 @@ screener.py                              health_check.py
 | `screener_*`, `market_state_*` | `screener.py` |
 | `collected_news_*` | `news_collector.py` |
 | `gpt_trades_*`, `gpt_rotations_*` | `gpt_analyzer.py` (매매 계획·회전 샌드박스 제안) |
-| `balance_*`, `summary_*` | `account.py` (수동 조회) |
+| `balance_*`, `summary_*`, `summary_rlz_*` | `account.py` (`inquire-balance` + `inquire-balance-rlz-pl`) |
 | `daily_balances/balance_{open,close}_*.json` | `integrated_manager.capture_balance_snapshot` |
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
@@ -262,12 +268,13 @@ Git에는 `output/.gitkeep`만 추적합니다.
 |------|------|
 | 저장 | `output/trading_data.db` — 주문·체결 메타(`order_id`, `executed_qty`, `order_status`) |
 | 포지션 레벨 | `output/trading_data.db` — `positions` 테이블에 티커별 `entry_price/stop_price/target_price` 저장 (진입가 기준) |
-| 매매 기록 | `record_trade()` → `upsert_trade_record_by_order_id()` — `order_id` 있으면 UPSERT, 없으면 SELL 중복 검사 후 INSERT/skip |
+| 매매 기록 | `record_trade()` → `upsert_trade_record_by_order_id()` — `order_id` 있으면 UPSERT. **`executed`/`partial` BUY·SELL은 `order_id` 필수**(모의 `completed` 제외) |
 | 손실 집계 | `is_countable_loss_sell()` — `executed` + `order_id` + `profit_loss < 0` 만 연속·일일 손실에 반영. `pending`/`failed`/중복 row 제외 |
 | 중복 SELL | `find_recent_sell_duplicate()` — 동일 ticker·qty, 10분 이내, 가격 1% 이내. 기존 `order_id` 행 있으면 `duplicate_sell_without_order_id_skipped` 로그 후 skip |
-| 리컨실 (15:22) | `order_reconciler.py` — `pending`/`partial` + `order_id` 있는 행을 KIS와 상태 동기화 |
+| 리컨실 (15:22 · 장중 11:00/14:00) | `order_reconciler.py` — `pending`/`partial` + `order_id` 행을 KIS `inquire-orders` / `inquire-daily-ccld`로 동기화. 체결 시 `avg_prvs`→`price` 갱신 + `recompute_profit_loss_for_order_id` |
 | orphan backfill | 리컨실 마지막에 자동 실행 — `order_id` 빈 행을 KIS 일별 주문과 **유일 매칭** 시 backfill |
-| 수동 backfill | `python src/order_reconciler.py --since-hours 36 --backfill-only` |
+| 수동 backfill | `python /app/src/order_reconciler.py --since-hours 36 --backfill-only` |
+| subprocess 종료 | 성공 시 stdout JSON 1줄 (`{"ok": true, "updated": ...}`), 실패 시 exit≠0 |
 
 > `risk_manager` direct_execute → `pending` SELL 기록 후 `trader` fallback이 같은 종목을 `order_id` 없이 재기록하면 손실이 이중 집계될 수 있었습니다. 현재는 저장 단계·집계 단계 모두에서 차단합니다.  
 > 컨테이너 이미지에 `sqlite3` CLI가 없습니다. DB 확인은 아래 [7.3](#73-수동--단발-실행) Python 예시를 사용하세요.
@@ -289,7 +296,16 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 ### 3.6 KIS API 계층
 
 `api/kis_auth.KIS` → `api/domestic_stock/domestic_stock_functions.DomesticStock`  
-시세·잔고·`order_cash()` 주문·업종지수 시세(TR `FHKUP03500100`)를 한 경로에서 처리합니다.
+시세·잔고·주문·업종지수 시세(TR `FHKUP03500100`)를 한 경로에서 처리합니다.
+
+| 엔드포인트 | TR_ID | 용도 |
+|------------|-------|------|
+| `inquire-balance` | TTTC8434R | 잔고·요약 (`nass_amt`, `thdt_*`, `tot_evlu_amt`) |
+| `inquire-balance-rlz-pl` | TTTC8494R | **실현손익** (`rlzt_pfls`) 포함 잔고 |
+| `inquire-orders` | TTTC8001R | 미체결·부분체결 조회 |
+| `inquire-daily-ccld` | TTTC8001R | 일별 주문체결 (`avg_prvs`, `tot_ccld_qty`) |
+| `inquire-period-trade-profit` | TTTC8715R | 기간별 매매손익(종목별 검증용) |
+| `order-cash` | TTTC0801U/0802U | 현금 매수/매도 |
 
 - **인증:** `auth()` / `reauthenticate()` — 토큰 파일 캐시 + `request_get`/`request_post` 만료 시 1회 재시도
 - **설정:** `config/.env` + `config/kis_devlp.yaml` (`load_kis_config()`)
@@ -318,19 +334,19 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT/휴리스틱 2단계 분석 → `gpt_trades_*.json` (`매수`/`보류`/`미진입`), 리밸런싱 GPT 헬퍼, 예산 가드 |
-| `trader.py` | 매수/매도·체결·분할매수·연속 손실 체크·pending SELL skip·`--batch-check-only`·`--sell-only` |
+| `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`--batch-check-only`·`--sell-only` |
 
 ### 기록·정합성·분석
 
 | 파일 | 역할 |
 |------|------|
 | `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill, `is_countable_loss_sell`, 중복 SELL 방지 |
-| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + orphan `order_id` backfill |
+| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + `avg_prvs` 체결가 + PnL 재계산 + orphan `order_id` backfill |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
 | `rotation_manager.py` | 현금 부족 시 회전 시도·시장 동적 임계값·실행 |
 | `trader.py` | 슬롯 꽉 참 시 리밸런싱·`run_buy_logic` 회전 한도 관리 |
-| `account.py` | 잔고·요약 JSON |
+| `account.py` | KIS 잔고·실현손익 JSON (`balance_*`, `summary_*`, `summary_rlz_*`) |
 | `cleanup_output.py` | 오래된 `output/` 정리 (월간) |
 
 ### 공통·API
@@ -339,12 +355,12 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 |------|------|
 | `settings.py` | `config.json` 로드·기본값 |
 | `env_loader.py` | `config/.env` 로드 |
-| `utils.py` | KST, 캐시, `find_latest_file`, 개장일 등 |
+| `utils.py` | KST, 캐시, `extract_kis_official_summary`, `load_summary_rlz_dict`, 개장일 등 |
 | `notifier.py` | Discord 웹훅 |
 | `strategies.py` | 매도 전략 클래스 |
 | `db_debug.py` | DB 디버그 로그 (`DB_RECORD_DEBUG=1`) |
 | `api/kis_auth.py` | KIS 인증·토큰 캐시·파일락·EGW00133 backoff |
-| `api/domestic_stock/domestic_stock_functions.py` | 시세·주문 REST 래퍼 |
+| `api/domestic_stock/domestic_stock_functions.py` | 시세·잔고·실현손익·주문 REST 래퍼 |
 
 ### 4.1 회전 매매 (Rotation)
 
@@ -507,10 +523,11 @@ trader.run_buy_logic
 | 09:00 | 잔액 스냅샷 (`integrated_manager`) | KIS |
 | 09:10 | `screener.py` | KIS |
 | 10:15~ | `health_check` → `news` → `gpt` → `trader` | KIS, Naver, OpenAI(선택) |
+| 장중 11:00/14:00 | `order_reconciler` (경량) | KIS |
 | 장중 | `risk_manager` | KIS |
 | 15:20 | `trader.py --batch-check-only` | KIS |
-| 15:22 | `order_reconciler` | KIS |
-| 15:30 | 잔액 스냅샷 (`integrated_manager`) | KIS |
+| 15:22 | `order_reconciler` | KIS (`inquire-orders`, `inquire-daily-ccld`) |
+| 15:30 | 잔액 스냅샷 (`integrated_manager` + `account.py`) | KIS (`inquire-balance`, `inquire-balance-rlz-pl`) |
 | 15:35 | `send_daily_trading_summary` | Discord (선택) |
 | 월 1회 | `reviewer`, `cleanup_output` | DB·로컬 파일 |
 
@@ -653,6 +670,7 @@ kospistock/
 │   └── kis_devlp.yaml           # 로컬 KIS 기본값 (Git 제외, 선택)
 ├── output/
 │   ├── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
+│   ├── summary_rlz_*.json       # KIS 실현손익 스냅샷 (account.py, 런타임)
 │   └── daily_balances/          # balance_open_*.json, balance_close_*.json (런타임)
 ├── src/
 │   ├── api/

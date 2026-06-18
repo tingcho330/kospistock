@@ -35,6 +35,8 @@ __all__ = [
     "cache_load",
     "load_account_files_with_retry",
     "extract_cash_from_summary",
+    "extract_kis_official_summary",
+    "load_summary_rlz_dict",
     "_to_int_krw",  # ← 공개 심볼 추가
     "convert_screener_data_to_trader_format",  # ← 공통 변환 함수 추가
     # 추가: 계좌 스냅샷 캐시 프로바이더 & 호가 유틸
@@ -555,6 +557,64 @@ def extract_cash_from_summary(summary_dict: Dict[str, str]) -> Dict[str, int]:
 
     cash_map["available_cash"] = available
     return cash_map
+
+
+def extract_kis_official_summary(
+    summary_dict: Optional[Dict[str, Any]] = None,
+    rlz_summary_dict: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    """
+    KIS inquire-balance / inquire-balance-rlz-pl output2에서
+    일일 요약용 공식 수치를 추출한다.
+    """
+    merged: Dict[str, Any] = dict(summary_dict or {})
+    if rlz_summary_dict:
+        merged.update({k: v for k, v in rlz_summary_dict.items() if v is not None})
+
+    def _pick(*keys: str) -> int:
+        for key in keys:
+            if key in merged and merged[key] not in (None, ""):
+                return _to_int_krw(merged[key])
+        return 0
+
+    net_assets = _pick("nass_amt", "tot_evlu_amt")
+    realized = _pick("rlzt_pfls")
+    return {
+        "net_assets": net_assets,
+        "tot_evlu_amt": _pick("tot_evlu_amt"),
+        "realized_pnl": realized,
+        "thdt_buy_amt": _pick("thdt_buy_amt"),
+        "thdt_sll_amt": _pick("thdt_sll_amt"),
+        "thdt_tlex_amt": _pick("thdt_tlex_amt"),
+        "dnca_tot_amt": _pick("dnca_tot_amt"),
+        "nxdy_excc_amt": _pick("nxdy_excc_amt"),
+        "prvs_rcdl_excc_amt": _pick("prvs_rcdl_excc_amt"),
+        "asst_icdc_amt": _pick("asst_icdc_amt"),
+        "bfdy_tot_asst_evlu_amt": _pick("bfdy_tot_asst_evlu_amt"),
+    }
+
+
+def load_summary_rlz_dict(date_yyyymmdd: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """summary_rlz_YYYYMMDD.json 첫 레코드 로드."""
+    base = output_dir or OUTPUT_DIR
+    path = base / f"summary_rlz_{date_yyyymmdd}.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        data = payload.get("data") or []
+        if not data:
+            return {}
+        rec = data[0]
+        if isinstance(rec, dict):
+            if 0 in rec and isinstance(rec[0], dict):
+                return rec[0]
+            if "0" in rec and isinstance(rec["0"], dict):
+                return rec["0"]
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
 
 # ────────────────────────────────
 # Account Snapshot Provider (파일 mtime/락 기반 캐시)
