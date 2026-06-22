@@ -596,6 +596,50 @@ class DomesticStock:
             logger.debug("기간별시세 예외(ticker=%s): %s", fid_input_iscd, e)
             return pd.DataFrame()
 
+    def inquire_daily_price(
+        self,
+        *,
+        fid_cond_mrkt_div_code: str,
+        fid_input_iscd: str,
+        fid_period_div_code: str = "D",
+        fid_org_adj_prc: str = "0",
+    ) -> pd.DataFrame:
+        """
+        주식현재가 일자별 (최근 30거래일 + 외국인 소진율 등)
+        - TR: FHKST01010400
+        - URL: /uapi/domestic-stock/v1/quotations/inquire-daily-price
+        """
+        url = f"{self.url_base}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        tr_id = "FHKST01010400"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": fid_cond_mrkt_div_code,
+            "FID_INPUT_ISCD": fid_input_iscd,
+            "FID_PERIOD_DIV_CODE": fid_period_div_code,
+            "FID_ORG_ADJ_PRC": fid_org_adj_prc,
+        }
+        try:
+            res = self.request_get(url, headers={"tr_id": tr_id}, params=params, timeout=10)
+            if res.status_code != 200:
+                logger.debug(
+                    "일자별시세 실패(status=%s, ticker=%s): %s",
+                    res.status_code, fid_input_iscd, res.text[:200],
+                )
+                return pd.DataFrame()
+            data = res.json()
+            if str(data.get("rt_cd", "")) not in ("", "0"):
+                logger.debug(
+                    "일자별시세 응답 오류(ticker=%s): rt_cd=%s msg=%s",
+                    fid_input_iscd, data.get("rt_cd"), data.get("msg1"),
+                )
+                return pd.DataFrame()
+            out = data.get("output") or []
+            if not out:
+                return pd.DataFrame()
+            return pd.DataFrame(out)
+        except Exception as e:
+            logger.debug("일자별시세 예외(ticker=%s): %s", fid_input_iscd, e)
+            return pd.DataFrame()
+
     def inquire_investor_trend(
         self,
         *,

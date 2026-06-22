@@ -138,13 +138,15 @@ def get_cfg(path: Path = CONFIG_PATH) -> dict:
     s.setdefault("min_market_cap", 300_000_000_000)
     s.setdefault("max_market_cap", int(1e14))
     s.setdefault("min_trading_value_5d_avg", 20_000_000_000)
-    s.setdefault("min_score_threshold", 0.62)
-    s.setdefault("flow_weight", 0.20)
-    s.setdefault("momentum_weight", 0.20)
-    s.setdefault("tech_weight", 0.15)
+    s.setdefault("min_score_threshold", 0.0)
+    s.setdefault("top_n", 20)
+    s.setdefault("sector_cap", 0.25)
+    s.setdefault("flow_weight", 0.25)
+    s.setdefault("momentum_weight", 0.25)
+    s.setdefault("tech_weight", 0.0)
     s.setdefault("growth_weight", 0.15)
-    s.setdefault("fin_weight", 0.15)
-    s.setdefault("breakout_weight", 0.05)
+    s.setdefault("fin_weight", 0.10)
+    s.setdefault("breakout_weight", 0.15)
     s.setdefault("mkt_weight", 0.05)
     s.setdefault("sector_weight", 0.05)
     s.setdefault("sector_source_priority", ["kis"])
@@ -827,7 +829,8 @@ def convert_screener_data_to_trader_format(screener_data: Dict) -> Dict:
         'investor_flow': screener_data.get('investor_flow', None),
         'SectorSource': screener_data.get('sector_source', None),
         'exclude_reasons': screener_data.get('exclude_reasons', []),
-        'updated_at': screener_data.get('updated_at', '')
+        'updated_at': screener_data.get('updated_at', ''),
+        'target_weight': float(screener_data.get('target_weight', 0) or 0),
     }
 
     return out

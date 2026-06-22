@@ -983,6 +983,11 @@ def run_trading_pipeline():
             _notify(msg=f"ℹ️ {msg}", key="holiday", cooldown_sec=600)
             return
 
+        if not _should_run_trading_pipeline_today():
+            msg = "주간 리밸런싱 모드: 오늘은 매매 파이프라인 실행일이 아닙니다."
+            logger.info(msg)
+            return
+
         run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
@@ -1106,11 +1111,40 @@ def run_trading_pipeline():
 # 스케줄 시간 설정 (config.json에서 오버라이드 가능)
 SCHEDULE_TIMES = {
     "balance_open": "09:00",      # 장시작 잔액 캡처
-    "screener": "09:05",          # 스크리너 실행
-    "pipeline": "10:10",          # 파이프라인 실행
+    "screener": "09:05",          # 스크리너 실행 (일간 모드)
+    "screener_friday": "15:45",   # 주간 모드: 금요 선행 스크리너
+    "pipeline": "10:10",          # 파이프라인 실행 (일간 모드)
+    "weekly_rebalance": "09:30",  # 주간 리밸런싱 파이프라인
     "balance_close": "15:30",     # 장종료 잔액 캡처
     "daily_summary": "15:31",     # 일일 요약 전송
 }
+
+
+def _get_portfolio_cfg() -> dict:
+    try:
+        from settings import settings
+        cfg = getattr(settings, "_config", {}) or {}
+        sp = cfg.get("screener_params", {}) if isinstance(cfg.get("screener_params"), dict) else {}
+        pc = sp.get("portfolio", {}) if isinstance(sp.get("portfolio"), dict) else {}
+        return pc
+    except Exception:
+        return {}
+
+
+def _is_weekly_rebalance_mode() -> bool:
+    return str(_get_portfolio_cfg().get("rebalance_frequency", "")).lower() == "weekly"
+
+
+def _should_run_trading_pipeline_today() -> bool:
+    """주간 모드에서는 리밸런싱 요일(기본 월요일)에만 파이프라인 실행."""
+    pc = _get_portfolio_cfg()
+    if str(pc.get("rebalance_frequency", "")).lower() != "weekly":
+        return True
+    if bool(pc.get("intraday_trading_enabled", False)):
+        return True
+    weekday = datetime.now(KST).strftime("%A").lower()
+    target = str(pc.get("rebalance_weekday", "monday")).lower()
+    return weekday == target
 
 def load_schedule_config():
     """config.json에서 스케줄 시간 설정 로드"""
@@ -1132,8 +1166,12 @@ def load_schedule_config():
         schedule_times = config.get("schedule_times", {})
         if "screener_time" in schedule_times:
             SCHEDULE_TIMES["screener"] = schedule_times["screener_time"]
+        if "screener_friday_time" in schedule_times:
+            SCHEDULE_TIMES["screener_friday"] = schedule_times["screener_friday_time"]
         if "pipeline_time" in schedule_times:
             SCHEDULE_TIMES["pipeline"] = schedule_times["pipeline_time"]
+        if "weekly_rebalance_time" in schedule_times:
+            SCHEDULE_TIMES["weekly_rebalance"] = schedule_times["weekly_rebalance_time"]
 
         # 월간 유지보수 설정 오버라이드 (config.json > 환경변수 > 기본값)
         monthly_cfg = config.get("monthly_maintenance", {})
@@ -1152,17 +1190,33 @@ def register_jobs():
     """스케줄 작업 등록"""
     # 설정 로드
     load_schedule_config()
+
+    weekly_mode = _is_weekly_rebalance_mode()
+    portfolio_cfg = _get_portfolio_cfg()
+    intraday_enabled = bool(portfolio_cfg.get("intraday_trading_enabled", False))
+    rebalance_day = str(portfolio_cfg.get("rebalance_weekday", "monday")).lower()
+    try:
+        from settings import settings
+        schedule_times = (getattr(settings, "_config", {}) or {}).get("schedule_times", {})
+        if schedule_times.get("weekly_rebalance_day"):
+            rebalance_day = str(schedule_times["weekly_rebalance_day"]).lower()
+    except Exception:
+        pass
+    if portfolio_cfg.get("rebalance_time"):
+        SCHEDULE_TIMES["weekly_rebalance"] = str(portfolio_cfg["rebalance_time"])
     
     # 스케줄 등록
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
         # 장시작시 잔액 캡처
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["balance_open"]).do(capture_balance_snapshot, "open")
         
-        # 스크리너 실행
-        getattr(schedule.every(), day).at(SCHEDULE_TIMES["screener"]).do(run_screener_job)
+        # 스크리너: 주간 모드가 아닐 때만 평일 장초 실행
+        if not weekly_mode:
+            getattr(schedule.every(), day).at(SCHEDULE_TIMES["screener"]).do(run_screener_job)
         
-        # 파이프라인 실행
-        getattr(schedule.every(), day).at(SCHEDULE_TIMES["pipeline"]).do(run_trading_pipeline)
+        # 파이프라인: 일간 모드 또는 intraday 활성화 시 평일 실행
+        if (not weekly_mode) or intraday_enabled:
+            getattr(schedule.every(), day).at(SCHEDULE_TIMES["pipeline"]).do(run_trading_pipeline)
         
         # 15시 20분 일괄 체결 확인 (설정에서 시간 읽어오기)
         batch_check_time = settings._config.get("batch_execution_check", {}).get("check_time", "15:20")
@@ -1181,6 +1235,18 @@ def register_jobs():
         
         # 일일 요약 전송
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["daily_summary"]).do(send_daily_trading_summary)
+
+    # 주간 리밸런싱 모드: 금요 스크리너(당일 수급) + 리밸런싱 요일 파이프라인
+    if weekly_mode:
+        schedule.every().friday.at(SCHEDULE_TIMES["screener_friday"]).do(run_screener_job)
+        if rebalance_day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+            getattr(schedule.every(), rebalance_day).at(SCHEDULE_TIMES["weekly_rebalance"]).do(run_trading_pipeline)
+        logger.info(
+            "[SCHEDULE] 주간 리밸런싱: 금 %s 스크리너, %s %s 파이프라인",
+            SCHEDULE_TIMES["screener_friday"],
+            rebalance_day,
+            SCHEDULE_TIMES["weekly_rebalance"],
+        )
 
     # 월 1회 유지보수: 매일 점검하여 실행일에만 1회 실행(주말/휴일 포함)
     schedule.every().day.at(MONTHLY_MAINTENANCE_TIME).do(run_monthly_maintenance_if_due)

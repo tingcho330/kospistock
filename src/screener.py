@@ -51,11 +51,13 @@ from screener_core import (
     compute_growth_score,
     compute_fin_score_extended,
     compute_breakout_score,
-    compute_total_score_8axis,
+    compute_total_score_7axis,
+    compute_foreign_holding_change_score,
 )
+from portfolio_allocator import allocate_portfolio_weights
 
 # ─────── 스키마 메타 ───────
-SCHEMA_VERSION = "1.2"  # Output schema pinned
+SCHEMA_VERSION = "1.3"  # Output schema pinned
 
 # ─────── 캐시 버전 키 ───────
 # 버그 수정으로 기존 캐시를 강제 무효화해야 할 때 버전을 올린다(파일명에 포함됨).
@@ -412,7 +414,7 @@ def _prescore_ticker(
     cfg: Dict[str, Any],
 ) -> Optional[float]:
     """경량 프리스코어 (OHLCV 없이 flow/fin/growth)."""
-    flow_df = get_investor_flow(code, date_str)
+    flow_df = get_investor_flow(code, date_str, cfg=cfg)
     flow_score, flow_ok = compute_flow_score(flow_df, cfg)
     if not flow_ok:
         return None
@@ -422,8 +424,9 @@ def _prescore_ticker(
     per_val = fin_info.get("PER") if "PER" in fin_info.index else fin_info.get("per")
     pbr_val = fin_info.get("PBR") if "PBR" in fin_info.index else fin_info.get("pbr")
     roe_val = fin_ratio.get("roe_val") if fin_ratio else None
+    debt_val = fin_ratio.get("lblt_rate") if fin_ratio else None
     marcap = float(fin_info.get("Marcap", 0) or 0)
-    fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, marcap)
+    fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, marcap, debt_ratio=debt_val)
 
     prescore_cfg = cfg.get("prescore", {}) if isinstance(cfg.get("prescore"), dict) else {}
     weights = prescore_cfg.get("weights", {}) if isinstance(prescore_cfg.get("weights"), dict) else {}
@@ -1746,6 +1749,14 @@ def get_holdings_scores_from_file(date_str: str, market: str) -> Dict[str, Dict[
 
 # ─────────── 투자자별 수급 데이터 조회 ───────────
 _FLOW_DATE_SHIFT_LOGGED = False
+_INVESTOR_FLOW_CACHE: Dict[str, pd.DataFrame] = {}
+_DAILY_PRICE_CACHE: Dict[str, pd.DataFrame] = {}
+
+
+def _flow_lookback_days(cfg: Dict[str, Any]) -> int:
+    kis_data = cfg.get("kis_data", {}) if isinstance(cfg.get("kis_data"), dict) else {}
+    flow_params = cfg.get("flow_params", {}) if isinstance(cfg.get("flow_params"), dict) else {}
+    return int(flow_params.get("lookback_days") or kis_data.get("flow_lookback_days", 20) or 20)
 
 
 def _flow_api_base_date(date_str: str) -> str:
@@ -1769,14 +1780,26 @@ def _flow_api_base_date(date_str: str) -> str:
     return date_str
 
 
-def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Optional[pd.DataFrame]:
+def get_investor_flow(
+    ticker: str,
+    date_str: str,
+    days_lookback: Optional[int] = None,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[pd.DataFrame]:
     """지정된 기간 동안의 투자자별 거래대금(기관, 외국인 등)을 조회합니다."""
     global _FLOW_DATE_SHIFT_LOGGED
+    if days_lookback is None:
+        days_lookback = _flow_lookback_days(cfg or {})
     try:
         kis = _KIS_INSTANCE
         if kis is None:
             return None
         query_date = _flow_api_base_date(date_str)
+        cache_key = f"{str(ticker).zfill(6)}_{query_date}_{days_lookback}"
+        cached = _INVESTOR_FLOW_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
         if query_date != date_str and not _FLOW_DATE_SHIFT_LOGGED:
             logger.info(
                 "수급 API: 장중(15:40 이전) → 기준일 %s → %s (FHPTJ04160001)",
@@ -1824,10 +1847,63 @@ def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Op
             out["외국인합계"] = out["외국인합계"] * 1_000_000
         if "stck_bsop_date" in df_flow.columns:
             out = out.assign(_date=df_flow["stck_bsop_date"].astype(str)).sort_values("_date").drop(columns=["_date"])
-        return out.tail(days_lookback)
+        result = out.tail(days_lookback)
+        _INVESTOR_FLOW_CACHE[cache_key] = result.copy()
+        return result
     except Exception as e:
         logger.debug("[%s] 투자자별 수급 조회 실패: %s", ticker, str(e))
     return None
+
+
+def _kis_daily_price_safe(
+    kis: KIS,
+    code: str,
+    *,
+    market_div: str = "J",
+    retries: int = 3,
+) -> Optional[pd.DataFrame]:
+    """KIS 주식현재가 일자별(FHKST01010400) 안전 래퍼."""
+    for attempt in range(retries):
+        try:
+            if _KIS_RATE_LIMITER:
+                _KIS_RATE_LIMITER.wait()
+            df = kis.inquire_daily_price(
+                fid_cond_mrkt_div_code=market_div,
+                fid_input_iscd=str(code).zfill(6),
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            if _is_kis_ratelimit_error(e) and attempt < retries - 1:
+                time.sleep(0.5 * (2 ** attempt) + random.random() * 0.2)
+                continue
+            logger.debug("KIS 일자별시세 실패(%s): %s", code, str(e))
+            return None
+    return None
+
+
+def get_daily_price_flow(code: str, date_str: str) -> Optional[pd.DataFrame]:
+    """외국인 소진율 변화용 일자별 시세 (FHKST01010400)."""
+    kis = _KIS_INSTANCE
+    if kis is None:
+        return None
+    cache_key = f"{str(code).zfill(6)}_{_flow_api_base_date(date_str)}"
+    cached = _DAILY_PRICE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    disk = cache_load("kis_daily_price", cache_key)
+    if disk is not None:
+        _DAILY_PRICE_CACHE[cache_key] = disk
+        return disk.copy() if hasattr(disk, "copy") else disk
+    df = _kis_daily_price_safe(kis, code, retries=3)
+    if df is None or df.empty:
+        return None
+    try:
+        cache_save("kis_daily_price", cache_key, df)
+    except Exception:
+        pass
+    _DAILY_PRICE_CACHE[cache_key] = df.copy()
+    return df
 
 # ─────────── FDR Marcap 비정상 시 PYKRX 시총 폴백 ───────────
 def _get_marcap_series_from_pykrx(date_str: str, market: str) -> pd.Series:
@@ -2278,11 +2354,17 @@ def _calculate_scores_for_ticker(
         flow_score = 0.0
         flow_ok = False
         try:
-            df_investor_flow = get_investor_flow(code, date_str)
+            df_investor_flow = get_investor_flow(code, date_str, cfg=cfg)
+            holding_change_score = None
+            df_daily_price = get_daily_price_flow(code, date_str)
+            if df_daily_price is not None:
+                holding_change_score = compute_foreign_holding_change_score(df_daily_price, cfg)
             if df_investor_flow is not None and not df_investor_flow.empty:
                 df_investor_flow = df_investor_flow.fillna(0)
                 df_investor_flow.columns = [col.strip() for col in df_investor_flow.columns]
-                flow_score, flow_ok = compute_flow_score(df_investor_flow, cfg)
+                flow_score, flow_ok = compute_flow_score(
+                    df_investor_flow, cfg, holding_change_score=holding_change_score,
+                )
             if not flow_ok:
                 exclude_reasons.append("FLOW_UNAVAILABLE")
         except Exception as e:
@@ -2353,7 +2435,10 @@ def _calculate_scores_for_ticker(
 
         fin_ratio = _fetch_financial_ratio_row(code, cfg)
         roe_val = fin_ratio.get("roe_val") if fin_ratio else None
-        fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, float(marcap or 0))
+        debt_val = fin_ratio.get("lblt_rate") if fin_ratio else None
+        fin_score = compute_fin_score_extended(
+            per_val, pbr_val, roe_val, cfg, float(marcap or 0), debt_ratio=debt_val,
+        )
         growth_score = compute_growth_score(fin_ratio, cfg)
 
         sector_name = str(fin_info.get("Sector", "N/A")) if "Sector" in fin_info else "N/A"
@@ -2418,17 +2503,17 @@ def _calculate_scores_for_ticker(
             yey_pattern = False
             pattern_score = 0.0
 
-        # --- 8축 가중 합산 ---
-        total_score = compute_total_score_8axis(
+        # --- 7축 가중 합산 (Tech는 진입 보조, 선정 점수 제외) ---
+        total_score = compute_total_score_7axis(
             flow_score,
             momentum_score,
-            tech_score,
             growth_score,
             fin_score,
             breakout_score,
             mkt_score,
             sector_score,
             cfg,
+            tech=float(tech_score) if float(cfg.get("tech_weight", 0) or 0) > 0 else 0.0,
         )
 
         flow_min = float(cfg.get("flow_params", {}).get("min_flow_score", 0.25))
@@ -2539,7 +2624,10 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
 # ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
     global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE, _FLOW_DATE_SHIFT_LOGGED
+    global _INVESTOR_FLOW_CACHE, _DAILY_PRICE_CACHE
     _FLOW_DATE_SHIFT_LOGGED = False
+    _INVESTOR_FLOW_CACHE.clear()
+    _DAILY_PRICE_CACHE.clear()
     start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
@@ -2936,8 +3024,11 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
             _log_dropped(f"최종:고변동성>{volatility_threshold:.0%}", _before_tickers, _after_tickers)
 
-        top_n = min(int(screener_params.get("top_n", 10)), int(risk_params.get("max_positions", 10)))
-        sector_cap = float(screener_params.get("sector_cap", 0.3))
+        top_n = int(screener_params.get("top_n", 20))
+        portfolio_cfg = screener_params.get("portfolio", {}) if isinstance(screener_params.get("portfolio"), dict) else {}
+        if portfolio_cfg.get("target_positions"):
+            top_n = int(portfolio_cfg.get("target_positions", top_n))
+        sector_cap = float(screener_params.get("sector_cap", 0.25))
         
         # 다양화 (Ticker 컬럼 없으면 인덱스를 Ticker로 사용)
         if "Ticker" not in df_sorted.columns and len(df_sorted.columns) > 0:
@@ -2979,6 +3070,17 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         df_levels = pd.DataFrame(levels_data, index=final_candidates_base.index)
         final_candidates = pd.concat([final_candidates_base, df_levels], axis=1)
 
+        # 목표 비중 배분
+        weight_mode = str(portfolio_cfg.get("weight_mode", "equal"))
+        per_cap = float(settings.get("trading_params", {}).get("per_ticker_max_weight", 0.08))
+        cand_records = final_candidates.to_dict(orient="records")
+        weighted = allocate_portfolio_weights(
+            cand_records, mode=weight_mode, per_ticker_cap=per_cap if per_cap < 1.0 else None,
+        )
+        final_candidates = pd.DataFrame(weighted)
+        if not final_candidates.empty and "Ticker" in final_candidates.columns:
+            final_candidates = final_candidates.set_index("Ticker", drop=False)
+
         # 필수 컬럼 보장 - stop_loss/take_profit은 후보 0건이면 df_levels가 비어 있어 없을 수 있음
         if "손절가" not in final_candidates.columns:
             if "stop_loss" in final_candidates.columns:
@@ -3015,7 +3117,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "손절가", "목표가", "source", "stop_price", "target_price", "levels_source",
             "MA50", "MA200", "Score",
             "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
-            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D", "exclude_reasons",
+            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D", "target_weight", "exclude_reasons",
         ]
         keep = [c for c in cols if c in final_candidates.columns]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]
@@ -3066,6 +3168,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "FlowScore", "MomentumScore", "GrowthScore", "BreakoutScore",
             "FinScore", "TechScore", "MktScore", "SectorScore", "PatternScore",
             "VolKki", "Pos52w", "PER", "PBR", "RSI", "ATR", "MA50", "MA200",
+            "target_weight",
             "MA20Up", "AccumVol", "HigherLows", "Consolidation", "YEY",
             "affordability_filter_requested",
         ]

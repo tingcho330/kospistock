@@ -201,11 +201,27 @@ def get_historical_prices(
     return None
 
 
-def compute_flow_score(df_flow: Optional[pd.DataFrame], cfg: Dict[str, Any]) -> Tuple[float, bool]:
+def _norm_flow_amount(amount: float, scale: float = 5e10) -> float:
+    """순매수 금액을 0~1 점수로 정규화."""
+    if amount == 0:
+        return 0.5
+    if amount > 0:
+        return _clip_score(0.5 + min(amount / scale, 0.5))
+    return _clip_score(0.5 - min(abs(amount) / scale, 0.5))
+
+
+def _foreign_holding_delta_to_score(delta: float) -> float:
+    """외국인 소진율(또는 보유 프록시) 변화량 → 0~1."""
+    return _clip_score(0.5 + float(delta) / 5.0)
+
+
+def compute_flow_score(
+    df_flow: Optional[pd.DataFrame],
+    cfg: Dict[str, Any],
+    holding_change_score: Optional[float] = None,
+) -> Tuple[float, bool]:
     """외국인·기관 수급 점수 (0~1). (score, data_available)."""
     flow_params = cfg.get("flow_params", {}) if isinstance(cfg.get("flow_params"), dict) else {}
-    fw = float(flow_params.get("foreign_weight", 0.5))
-    iw = float(flow_params.get("institution_weight", 0.5))
 
     if df_flow is None or df_flow.empty:
         return 0.0, False
@@ -219,19 +235,41 @@ def compute_flow_score(df_flow: Optional[pd.DataFrame], cfg: Dict[str, Any]) -> 
     if inst.abs().sum() == 0 and frgn.abs().sum() == 0:
         return 0.0, False
 
+    # v2: 4축 가중 (신규 config)
+    if "foreign_cumulative_weight" in flow_params:
+        w_frgn = float(flow_params.get("foreign_cumulative_weight", 0.40))
+        w_inst = float(flow_params.get("institution_cumulative_weight", 0.30))
+        w_hold = float(flow_params.get("foreign_holding_change_weight", 0.20))
+        w_accel = float(flow_params.get("flow_acceleration_weight", 0.10))
+        accel_days = int(flow_params.get("acceleration_days", 5))
+
+        frgn_score = _norm_flow_amount(float(frgn.sum()))
+        inst_score = _norm_flow_amount(float(inst.sum()))
+
+        n = max(1, min(accel_days, len(frgn) // 2))
+        if len(frgn) >= 2 * n:
+            recent = float(frgn.iloc[-n:].sum()) + float(inst.iloc[-n:].sum())
+            prior = float(frgn.iloc[-2 * n:-n].sum()) + float(inst.iloc[-2 * n:-n].sum())
+            accel_score = _norm_flow_amount(recent - prior, scale=2e10)
+        else:
+            accel_score = 0.5
+
+        hold_score = float(holding_change_score) if holding_change_score is not None else 0.5
+        score = _clip_score(
+            w_frgn * frgn_score
+            + w_inst * inst_score
+            + w_hold * hold_score
+            + w_accel * accel_score
+        )
+        return score, True
+
+    # 레거시: 외국인/기관 50:50 + 동시매수 보너스
+    fw = float(flow_params.get("foreign_weight", 0.5))
+    iw = float(flow_params.get("institution_weight", 0.5))
     inst_sum = float(inst.sum())
     frgn_sum = float(frgn.sum())
-    inst_norm = _clip_score(inst_sum / max(abs(inst_sum), 1e9) * 0.5 + 0.5) if inst_sum != 0 else 0.5
-    frgn_norm = _clip_score(frgn_sum / max(abs(frgn_sum), 1e9) * 0.5 + 0.5) if frgn_sum != 0 else 0.5
-    if inst_sum > 0:
-        inst_norm = _clip_score(0.5 + min(inst_sum / 5e10, 0.5))
-    elif inst_sum < 0:
-        inst_norm = _clip_score(0.5 - min(abs(inst_sum) / 5e10, 0.5))
-    if frgn_sum > 0:
-        frgn_norm = _clip_score(0.5 + min(frgn_sum / 5e10, 0.5))
-    elif frgn_sum < 0:
-        frgn_norm = _clip_score(0.5 - min(abs(frgn_sum) / 5e10, 0.5))
-
+    inst_norm = _norm_flow_amount(inst_sum)
+    frgn_norm = _norm_flow_amount(frgn_sum)
     dual_days = int(((inst > 0) & (frgn > 0)).sum())
     dual_bonus = min(0.1, dual_days / max(len(df_flow), 1) * 0.1)
     score = _clip_score(fw * frgn_norm + iw * inst_norm + dual_bonus)
@@ -280,11 +318,12 @@ def compute_momentum_score(
             rel = stock_60 - idx_60
             score = _clip_score(0.85 * score + 0.15 * _clip_score(rel * 5 + 0.5))
 
-    mid_long = _period_return(close, 120)
-    short = _period_return(close, 20)
-    if mid_long is not None and short is not None:
-        accel = mid_long - short
-        score = _clip_score(0.9 * score + 0.1 * _clip_score(accel * 5 + 0.5))
+    if mom_params.get("use_return_accel_bonus", False):
+        mid_long = _period_return(close, 120)
+        short = _period_return(close, 20)
+        if mid_long is not None and short is not None:
+            accel = mid_long - short
+            score = _clip_score(0.9 * score + 0.1 * _clip_score(accel * 5 + 0.5))
 
     return _clip_score(score)
 
@@ -313,16 +352,19 @@ def compute_fin_score_extended(
     roe_val: Optional[float],
     cfg: Dict[str, Any],
     marcap: float = 0.0,
+    debt_ratio: Optional[float] = None,
 ) -> float:
-    """PER/PBR/ROE 기반 품질·밸류에이션 점수."""
+    """ROE·부채·PER·PBR 기반 품질·밸류에이션 점수."""
     fp = cfg.get("fin_params", {}) if isinstance(cfg.get("fin_params"), dict) else {}
-    per_w = float(fp.get("per_weight", 0.40))
-    pbr_w = float(fp.get("pbr_weight", 0.30))
-    roe_w = float(fp.get("roe_weight", 0.30))
+    per_w = float(fp.get("per_weight", 0.20))
+    pbr_w = float(fp.get("pbr_weight", 0.20))
+    roe_w = float(fp.get("roe_weight", 0.35))
+    debt_w = float(fp.get("debt_ratio_weight", 0.0))
 
     per = _to_float_safe(per_val, 20.0)
     pbr = _to_float_safe(pbr_val, 1.5)
     roe = _to_float_safe(roe_val)
+    debt = _to_float_safe(debt_ratio)
 
     if per is None:
         per = 20.0
@@ -342,6 +384,18 @@ def compute_fin_score_extended(
     else:
         roe_term = max(0.0, min(1.0, roe / 25.0))
 
+    if debt_w > 0:
+        if debt is None:
+            debt_term = 0.5
+        else:
+            debt_term = max(0.0, min(1.0, 1.0 - min(float(debt), 150.0) / 150.0))
+        w_sum = roe_w + debt_w + per_w + pbr_w
+        if w_sum <= 0:
+            w_sum = 1.0
+        return _clip_score(
+            (roe_w * roe_term + debt_w * debt_term + per_w * per_term + pbr_w * pbr_term) / w_sum
+        )
+
     return _clip_score(per_w * per_term + pbr_w * pbr_term + roe_w * roe_term)
 
 
@@ -350,17 +404,23 @@ def compute_breakout_score(
     price_info: Optional[Dict[str, Any]],
     cfg: Dict[str, Any],
 ) -> float:
-    """신고가 돌파·거래량 확대 점수."""
+    """52주 근접·거래량·박스권 돌파 점수 (연속 0~1)."""
     bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
     lookback = int(bp.get("lookback_high_days", 252))
-    vol_ratio_min = float(bp.get("volume_ratio_min", 1.5))
     buffer_pct = float(bp.get("breakout_buffer_pct", 0.005))
+    w_prox = float(bp.get("proximity_weight", 0.50))
+    w_vol = float(bp.get("volume_growth_weight", 0.30))
+    w_box = float(bp.get("box_breakout_weight", 0.20))
+    box_days = int(bp.get("box_lookback_days", 60))
+    vol_ratio_min = float(bp.get("volume_ratio_min", 1.5))
 
     if df_price is None or df_price.empty:
         return 0.0
 
     close = pd.to_numeric(df_price["Close"], errors="coerce")
     high = pd.to_numeric(df_price["High"], errors="coerce")
+    low_col = df_price["Low"] if "Low" in df_price.columns else df_price.get("low")
+    low = pd.to_numeric(low_col, errors="coerce") if low_col is not None else high * 0.98
     volume = pd.to_numeric(df_price["Volume"], errors="coerce").fillna(0)
     if close.empty:
         return 0.0
@@ -368,21 +428,43 @@ def compute_breakout_score(
     last_close = float(close.iloc[-1])
     window = min(lookback, len(high))
     high_52 = float(high.tail(window).max())
-    high_20 = float(high.tail(min(20, len(high))).max())
-
-    breakout_52 = 1.0 if last_close >= high_52 * (1.0 + buffer_pct) else 0.0
-    breakout_20 = 1.0 if last_close >= high_20 * (1.0 + buffer_pct) else 0.0
-
-    vol_ma20 = float(volume.tail(min(20, len(volume))).mean()) if len(volume) else 0.0
-    last_vol = float(volume.iloc[-1]) if len(volume) else 0.0
-    vol_score = 1.0 if vol_ma20 > 0 and last_vol >= vol_ma20 * vol_ratio_min else 0.0
 
     if price_info:
         w52 = _to_float_safe(price_info.get("w52_hgpr") or price_info.get("W52_HGPR"))
-        if w52 and w52 > 0 and last_close >= w52 * (1.0 + buffer_pct):
-            breakout_52 = max(breakout_52, 1.0)
+        if w52 and w52 > 0:
+            high_52 = max(high_52, float(w52))
 
-    return _clip_score(0.50 * breakout_52 + 0.30 * vol_score + 0.20 * breakout_20)
+    if high_52 > 0:
+        proximity = last_close / high_52
+        if proximity >= 1.0 - buffer_pct:
+            prox_score = 1.0
+        elif proximity >= 0.85:
+            prox_score = _clip_score((proximity - 0.85) / max(0.15 - buffer_pct, 1e-9))
+        else:
+            prox_score = _clip_score(proximity / 0.85 * 0.5)
+    else:
+        prox_score = 0.0
+
+    vol_ma20 = float(volume.tail(min(20, len(volume))).mean()) if len(volume) else 0.0
+    last_vol = float(volume.iloc[-1]) if len(volume) else 0.0
+    if vol_ma20 > 0:
+        vol_ratio = last_vol / vol_ma20
+        vol_score = _clip_score((vol_ratio - 1.0) / max(vol_ratio_min - 1.0, 0.5))
+    else:
+        vol_score = 0.0
+
+    box_n = min(box_days, len(high))
+    box_high = float(high.tail(box_n).max())
+    box_low = float(low.tail(box_n).min())
+    box_range = max(box_high - box_low, 1e-9)
+    if last_close >= box_high * (1.0 + buffer_pct):
+        box_score = 1.0
+    elif last_close >= box_high * 0.98:
+        box_score = _clip_score(0.7 + (last_close - box_high * 0.98) / (box_range * 0.05))
+    else:
+        box_score = _clip_score(max(0.0, (last_close - box_low) / box_range - 0.85) / 0.15)
+
+    return _clip_score(w_prox * prox_score + w_vol * vol_score + w_box * box_score)
 
 
 def compute_total_score_8axis(
@@ -416,6 +498,47 @@ def compute_total_score_8axis(
         + sector * w_sector
     )
     return _clip_score(total)
+
+
+def compute_total_score_7axis(
+    flow: float,
+    momentum: float,
+    growth: float,
+    fin: float,
+    breakout: float,
+    mkt: float,
+    sector: float,
+    cfg: Dict[str, Any],
+    tech: float = 0.0,
+) -> float:
+    """7축(선정) + 선택적 Tech 가중 합산. tech_weight=0이면 Tech 제외."""
+    return compute_total_score_8axis(
+        flow, momentum, tech, growth, fin, breakout, mkt, sector, cfg
+    )
+
+
+def compute_foreign_holding_change_score(
+    df_daily: Optional[pd.DataFrame],
+    cfg: Dict[str, Any],
+) -> Optional[float]:
+    """FHKST01010400 일자별 응답에서 외국인 소진율 변화 점수."""
+    if df_daily is None or df_daily.empty:
+        return None
+    col = None
+    for c in ("hts_frgn_ehrt", "HTS_FRGN_EHRT"):
+        if c in df_daily.columns:
+            col = c
+            break
+    if col is None:
+        return None
+    flow_params = cfg.get("flow_params", {}) if isinstance(cfg.get("flow_params"), dict) else {}
+    lookback = int(flow_params.get("holding_change_lookback_days", 20))
+    series = pd.to_numeric(df_daily[col], errors="coerce").dropna()
+    if len(series) < 2:
+        return None
+    lb = min(lookback, len(series) - 1)
+    delta = float(series.iloc[-1]) - float(series.iloc[-1 - lb])
+    return _foreign_holding_delta_to_score(delta)
 
 def _compute_levels(ticker: str, current_price: float, date_str: str, risk_params: Dict[str, Any], strategy_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """

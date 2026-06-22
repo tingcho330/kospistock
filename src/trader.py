@@ -213,6 +213,7 @@ SCHEMA_DEFAULTS: Dict[str, Any] = {
     "investor_flow": [],
     "Price": 0,
     "Score": 0.0,
+    "target_weight": 0.0,
 }
 
 # ── 가성비 통계 로그 ───────────────────────────────────────────
@@ -4302,15 +4303,21 @@ class Trader:
                     effective_slots = self._compute_effective_slots(remaining_cash)
 
                 # 개선된 포지션 사이징 로직
+                target_weight = float(info.get("target_weight", 0) or 0)
                 # 1. 종목당 최대 투입 가능 금액 계산 (per_ticker_max_weight 적용)
                 max_allowed_per_stock = int(remaining_cash * self.per_ticker_max_weight)
                 
-                # 2. 균등 분배 계산
-                equal_share = remaining_cash // max(1, slots_left if effective_slots <= 0 else min(slots_left, effective_slots))
-                
-                # 3. 최대 제한과 균등 분배 중 작은 값 선택
-                slot_cash = min(equal_share, max_allowed_per_stock)
-                budget_for_this_stock = int(slot_cash * (1 - buffer))
+                if target_weight > 0:
+                    slot_cash = int(remaining_cash * target_weight)
+                    budget_for_this_stock = int(slot_cash * (1 - buffer))
+                    budget_for_this_stock = min(budget_for_this_stock, max_allowed_per_stock)
+                    equal_share = slot_cash
+                else:
+                    # 2. 균등 분배 계산
+                    equal_share = remaining_cash // max(1, slots_left if effective_slots <= 0 else min(slots_left, effective_slots))
+                    # 3. 최대 제한과 균등 분배 중 작은 값 선택
+                    slot_cash = min(equal_share, max_allowed_per_stock)
+                    budget_for_this_stock = int(slot_cash * (1 - buffer))
                 
                 # 4. 리스크 가드 적용 (enforce_per_ticker_limit)
                 if self.trading_guards.get("enforce_per_ticker_limit", False):
