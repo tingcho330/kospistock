@@ -335,6 +335,9 @@ class RiskManager:
         try:
             kis_cfg = self.config.get("kis_broker", {})
             self._kis = KIS(config=kis_cfg, env=self.env)
+            if self._kis is not None:
+                from screener_core import set_kis_price_client
+                set_kis_price_client(self._kis)
         except Exception:
             self._kis = None
 

@@ -134,11 +134,22 @@ def get_cfg(path: Path = CONFIG_PATH) -> dict:
         cfg = {}  # Fallback to an empty dict
         
     s = cfg.get("screener_params", {})
-    s.setdefault("max_market_cap", int(1e13))
-    s.setdefault("vol_kki_weight", 0.10)
-    s.setdefault("pos_52w_weight", 0.05)
-    s.setdefault("exclude_newly_listed_days", 60)
-    s.setdefault("exclude_consecutive_up_days", 3)
+    s.setdefault("data_source", "kis_only")
+    s.setdefault("min_market_cap", 300_000_000_000)
+    s.setdefault("max_market_cap", int(1e14))
+    s.setdefault("min_trading_value_5d_avg", 20_000_000_000)
+    s.setdefault("min_score_threshold", 0.62)
+    s.setdefault("flow_weight", 0.20)
+    s.setdefault("momentum_weight", 0.20)
+    s.setdefault("tech_weight", 0.15)
+    s.setdefault("growth_weight", 0.15)
+    s.setdefault("fin_weight", 0.15)
+    s.setdefault("breakout_weight", 0.05)
+    s.setdefault("mkt_weight", 0.05)
+    s.setdefault("sector_weight", 0.05)
+    s.setdefault("sector_source_priority", ["kis"])
+    s.setdefault("exclude_newly_listed_days", 20)
+    s.setdefault("exclude_consecutive_up_days", 7)
     cfg.setdefault("trading_guards", {"min_cash_to_trade": 120000, "auto_shrink_slots": True})
     cfg.setdefault("prompting", {"core_questions": True})
     cfg.setdefault("rotation", {"enabled": True, "delta_score_min": 0.10})
@@ -785,6 +796,10 @@ def convert_screener_data_to_trader_format(screener_data: Dict) -> Dict:
         'Name': screener_data.get('name', f'종목_{ticker}'),
         'Price': int(screener_data.get('price', 0)),
         'Score': float(screener_data.get('score_total', 0.0)),
+        'FlowScore': float(screener_data.get('flow_score', 0.0)),
+        'MomentumScore': float(screener_data.get('momentum_score', 0.0)),
+        'GrowthScore': float(screener_data.get('growth_score', 0.0)),
+        'BreakoutScore': float(screener_data.get('breakout_score', 0.0)),
         'FinScore': float(screener_data.get('fin_score', 0.0)),
         'TechScore': float(screener_data.get('tech_score', 0.0)),
         'MktScore': float(screener_data.get('mkt_score', 0.0)),

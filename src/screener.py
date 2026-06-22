@@ -38,7 +38,21 @@ from utils import (
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
-from screener_core import MarketAnalyzer, MarketRegime, MarketState, get_historical_prices
+from screener_core import (
+    MarketAnalyzer,
+    MarketRegime,
+    MarketState,
+    get_historical_prices,
+    set_kis_price_client,
+    cache_index_close_series,
+    get_cached_index_close,
+    compute_flow_score,
+    compute_momentum_score,
+    compute_growth_score,
+    compute_fin_score_extended,
+    compute_breakout_score,
+    compute_total_score_8axis,
+)
 
 # ─────── 스키마 메타 ───────
 SCHEMA_VERSION = "1.2"  # Output schema pinned
@@ -343,6 +357,88 @@ def _kis_period_price_safe(
     return pd.DataFrame()
 
 
+def _kis_financial_ratio_safe(
+    kis: KIS,
+    code: str,
+    div_cls_code: str = "0",
+    market_div: str = "J",
+    retries: int = 3,
+) -> Optional[pd.DataFrame]:
+    """KIS 재무비율(FHKST66430300) 안전 래퍼."""
+    for attempt in range(retries):
+        try:
+            if _KIS_RATE_LIMITER:
+                _KIS_RATE_LIMITER.wait()
+            return kis.inquire_financial_ratio(
+                fid_div_cls_code=div_cls_code,
+                fid_input_iscd=str(code).zfill(6),
+                fid_cond_mrkt_div_code=market_div,
+            )
+        except Exception as e:
+            if _is_kis_ratelimit_error(e) and attempt < retries - 1:
+                time.sleep(0.5 * (2 ** attempt) + random.random() * 0.2)
+                continue
+            logger.debug("KIS 재무비율 실패(%s): %s", code, str(e))
+            return None
+    return None
+
+
+def _fetch_financial_ratio_row(code: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """최신 결산 1기 재무비율 행 반환."""
+    kis = _KIS_INSTANCE
+    if kis is None:
+        return None
+    kis_data = cfg.get("kis_data", {}) if isinstance(cfg.get("kis_data"), dict) else {}
+    div = str(kis_data.get("financial_div_cls_code", "0"))
+    cache_key = f"{str(code).zfill(6)}_{div}"
+    cached = cache_load("kis_fin", cache_key)
+    if cached is not None:
+        return cached
+    df = _kis_financial_ratio_safe(kis, code, div_cls_code=div)
+    if df is None or df.empty:
+        return None
+    row = df.iloc[0].to_dict()
+    try:
+        cache_save("kis_fin", cache_key, row)
+    except Exception:
+        pass
+    return row
+
+
+def _prescore_ticker(
+    code: str,
+    date_str: str,
+    fin_info: pd.Series,
+    cfg: Dict[str, Any],
+) -> Optional[float]:
+    """경량 프리스코어 (OHLCV 없이 flow/fin/growth)."""
+    flow_df = get_investor_flow(code, date_str)
+    flow_score, flow_ok = compute_flow_score(flow_df, cfg)
+    if not flow_ok:
+        return None
+
+    fin_ratio = _fetch_financial_ratio_row(code, cfg)
+    growth_score = compute_growth_score(fin_ratio, cfg)
+    per_val = fin_info.get("PER") if "PER" in fin_info.index else fin_info.get("per")
+    pbr_val = fin_info.get("PBR") if "PBR" in fin_info.index else fin_info.get("pbr")
+    roe_val = fin_ratio.get("roe_val") if fin_ratio else None
+    marcap = float(fin_info.get("Marcap", 0) or 0)
+    fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, marcap)
+
+    prescore_cfg = cfg.get("prescore", {}) if isinstance(cfg.get("prescore"), dict) else {}
+    weights = prescore_cfg.get("weights", {}) if isinstance(prescore_cfg.get("weights"), dict) else {}
+    min_amt = float(cfg.get("min_trading_value_5d_avg", 1) or 1)
+    amt5 = float(fin_info.get("Amount5D", 0) or 0)
+    liquidity = min(1.0, amt5 / min_amt) if min_amt > 0 else 0.5
+
+    return (
+        float(weights.get("flow", 0.35)) * flow_score
+        + float(weights.get("fin", 0.25)) * fin_score
+        + float(weights.get("growth", 0.25)) * growth_score
+        + float(weights.get("price_liquidity", 0.15)) * min(1.0, liquidity)
+    )
+
+
 def _kis_investor_trend_safe(
     kis: KIS,
     code: str,
@@ -575,11 +671,11 @@ def standardize_ohlcv(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optiona
     d.columns = [str(c).strip().lower() for c in d.columns]
 
     cand = {
-        "open":   ["open", "시가"],
-        "high":   ["high", "고가"],
-        "low":    ["low", "저가"],
-        "close":  ["close", "종가", "adj close", "adj_close", "adjclose", "adjusted_close", "close*"],
-        "volume": ["volume", "거래량", "vol"],
+        "open":   ["open", "시가", "stck_oprc"],
+        "high":   ["high", "고가", "stck_hgpr"],
+        "low":    ["low", "저가", "stck_lwpr"],
+        "close":  ["close", "종가", "adj close", "adj_close", "adjclose", "adjusted_close", "close*", "stck_clpr"],
+        "volume": ["volume", "거래량", "vol", "acml_vol"],
     }
 
     def _find(names: List[str]) -> Optional[str]:
@@ -2100,34 +2196,21 @@ def _calculate_scores_for_ticker(
                 _fail_stats["up_streak_calc"] += 1
                 _fail_rows.append({"Ticker": code, "reason": "up_streak_calc", "msg": f"{type(e).__name__}:{str(e)[:160]}"})
 
-        # 투자자별 수급 데이터 조회 (안전한 방식)
+        # 투자자별 수급 (KIS) — 실패 시 0 대체 금지
         df_investor_flow = None
+        flow_score = 0.0
+        flow_ok = False
         try:
             df_investor_flow = get_investor_flow(code, date_str)
             if df_investor_flow is not None and not df_investor_flow.empty:
-                # 데이터 정규화
                 df_investor_flow = df_investor_flow.fillna(0)
-                # 컬럼명 정리
                 df_investor_flow.columns = [col.strip() for col in df_investor_flow.columns]
-            else:
-                # 기본 투자자 흐름 데이터 생성 (실제 데이터가 없을 때)
-                end_date = datetime.strptime(date_str, "%Y%m%d")
-                dates = [end_date - timedelta(days=i) for i in range(10, 0, -1)]
-                df_investor_flow = pd.DataFrame({
-                    'Date': dates,
-                    '기관합계': [0] * 10,
-                    '외국인합계': [0] * 10
-                })
+                flow_score, flow_ok = compute_flow_score(df_investor_flow, cfg)
+            if not flow_ok:
+                exclude_reasons.append("FLOW_UNAVAILABLE")
         except Exception as e:
             logger.debug(f"[{code}] 투자자 흐름 데이터 조회 실패: {e}")
-            # 기본 데이터 생성
-            end_date = datetime.strptime(date_str, "%Y%m%d")
-            dates = [end_date - timedelta(days=i) for i in range(10, 0, -1)]
-            df_investor_flow = pd.DataFrame({
-                'Date': dates,
-                '기관합계': [0] * 10,
-                '외국인합계': [0] * 10
-            })
+            exclude_reasons.append("FLOW_UNAVAILABLE")
         
         # --- 차트 데이터 준비 ---
         close_series = df_price["Close"] if "Close" in df_price.columns else None
@@ -2196,28 +2279,42 @@ def _calculate_scores_for_ticker(
                 pbr_val = 1.5
             logger.debug(f"[{code}] PBR 결측(0/NaN) → 추정값 {pbr_val} 사용")
 
-        # PER 점수: 음수(적자)는 페널티(B안), 양수는 저평가일수록 고점
-        if per_val < 0:
-            per_term = 0.1  # 적자 기업 페널티(저평가가 아니라 수익성 부재)
-            logger.debug(f"[{code}] 음수 PER({per_val}) → 적자 페널티 적용(per_term=0.1)")
-        else:
-            per_term = max(0.0, min(1.0, (50 - per_val) / 50))
+        fin_ratio = _fetch_financial_ratio_row(code, cfg)
+        roe_val = fin_ratio.get("roe_val") if fin_ratio else None
+        fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, float(marcap or 0))
+        growth_score = compute_growth_score(fin_ratio, cfg)
 
-        # PBR 점수: 음수(자본잠식)는 페널티, 양수는 저평가일수록 고점
-        if pbr_val < 0:
-            pbr_term = 0.1  # 자본잠식 페널티
-            logger.debug(f"[{code}] 음수 PBR({pbr_val}) → 자본잠식 페널티 적용(pbr_term=0.1)")
-        else:
-            pbr_term = max(0.0, min(1.0, (5 - pbr_val) / 5))
-
-        fin_score = 0.5 * (per_term + pbr_term)
         sector_name = str(fin_info.get("Sector", "N/A")) if "Sector" in fin_info else "N/A"
         sector_score = float(sector_trends.get(sector_name, 0.5))
-        
-        # 신규 스코어
+        mkt_score = float(market_score)
+
+        index_key = cfg.get("kis_data", {}).get("index_code_kospi", "0001")
+        if str(fin_info.get("Market", "")).upper() == "KOSDAQ":
+            index_key = cfg.get("kis_data", {}).get("index_code_kosdaq", "1001")
+        index_close = get_cached_index_close(str(index_key))
+        momentum_score = compute_momentum_score(close_series, index_close, cfg)
+
+        price_info: Dict[str, Any] = {}
+        if _KIS_INSTANCE is not None:
+            try:
+                px = _kis_inquire_price_safe(_KIS_INSTANCE, code, retries=2)
+                if px is not None and not px.empty:
+                    price_info = px.iloc[0].to_dict()
+            except Exception:
+                pass
+        breakout_score = compute_breakout_score(df_price, price_info, cfg)
+
         df_price_lower_for_kki = df_price.rename(str.lower, axis=1)
         vol_kki = compute_kki_metrics(df_price_lower_for_kki)
         pos_52w = compute_52w_position(close_series)
+
+        annualized_vol = 0.0
+        try:
+            rets = close_series.pct_change().dropna()
+            if len(rets) >= 20:
+                annualized_vol = float(rets.std() * (252 ** 0.5))
+        except Exception:
+            pass
         
         # 패턴 분석 추가
         try:
@@ -2249,48 +2346,41 @@ def _calculate_scores_for_ticker(
             yey_pattern = False
             pattern_score = 0.0
 
-        # --- 가중치 및 최종 스코어 ---
-        fin_w = float(cfg.get("fin_weight", 0.25))
-        tech_w = float(cfg.get("tech_weight", 0.30))
-        mkt_w = float(cfg.get("mkt_weight", 0.15))
-        sector_w = float(cfg.get("sector_weight", 0.15))
-        vol_kki_w = float(cfg.get("vol_kki_weight", 0.10))
-        pos_52w_w = float(cfg.get("pos_52w_weight", 0.05))
-
-        total_score = (
-            fin_score * fin_w
-            + tech_score * tech_w
-            + market_score * mkt_w
-            + sector_score * sector_w
-            + vol_kki * vol_kki_w
-            + pos_52w * pos_52w_w
+        # --- 8축 가중 합산 ---
+        total_score = compute_total_score_8axis(
+            flow_score,
+            momentum_score,
+            tech_score,
+            growth_score,
+            fin_score,
+            breakout_score,
+            mkt_score,
+            sector_score,
+            cfg,
         )
-        total_score = float(np.clip(total_score, 0.0, 1.0))
-        
-        # 시장 분석 기반 스코어 조정
-        from screener_core import calculate_market_adjusted_score
-        if _CURRENT_MARKET_STATE is not None:
-            _score_before_mkt_adj = total_score
-            total_score = calculate_market_adjusted_score(total_score, _CURRENT_MARKET_STATE)
-            if abs(total_score - _score_before_mkt_adj) > 1e-9:
-                logger.debug(
-                    "[%s] 시장보정: %.4f → %.4f (regime=%s)",
-                    code, _score_before_mkt_adj, total_score,
-                    getattr(getattr(_CURRENT_MARKET_STATE, "regime", None), "value", "?"),
-                )
+
+        flow_min = float(cfg.get("flow_params", {}).get("min_flow_score", 0.25))
+        mom_min = float(cfg.get("momentum_params", {}).get("min_momentum_score", 0.30))
+        growth_min = float(cfg.get("growth_params", {}).get("min_growth_score", 0.0))
+        if flow_ok and flow_score < flow_min:
+            exclude_reasons.append("LOW_FLOW")
+        if momentum_score < mom_min:
+            exclude_reasons.append("LOW_MOMENTUM")
+        if growth_score <= growth_min:
+            exclude_reasons.append("LOW_GROWTH")
+
         name_val = fin_info.get("Name", "")
         sector_src = fin_info.get("SectorSource", "unknown")
 
-        # 디버깅: 종목별 컴포넌트 스코어 분해 로그
         logger.debug(
-            "[%s] 스코어=%.4f | Fin=%.3f(w%.2f) Tech=%.3f(w%.2f) Mkt=%.3f(w%.2f) "
-            "Sector=%.3f(w%.2f) VolKki=%.3f(w%.2f) Pos52w=%.3f(w%.2f) | "
-            "RSI=%.1f MA50=%.0f MA200=%.0f PER=%.1f PBR=%.2f%s",
+            "[%s] 스코어=%.4f | Flow=%.3f Mom=%.3f Tech=%.3f Growth=%.3f Fin=%.3f "
+            "Break=%.3f Mkt=%.3f Sector=%.3f | RSI=%.1f PER=%.1f PBR=%.2f%s",
             code, float(total_score),
-            float(fin_score), fin_w, float(tech_score), tech_w, float(market_score), mkt_w,
-            float(sector_score), sector_w, float(vol_kki), vol_kki_w, float(pos_52w), pos_52w_w,
-            float(rsi), float(ma50), float(ma200), float(per_val), float(pbr_val),
-            (" | 제외사유:" + ",".join(exclude_reasons)) if exclude_reasons else "",
+            float(flow_score), float(momentum_score), float(tech_score),
+            float(growth_score), float(fin_score), float(breakout_score),
+            float(mkt_score), float(sector_score),
+            float(rsi), float(per_val), float(pbr_val),
+            (" | 제외:" + ",".join(exclude_reasons)) if exclude_reasons else "",
         )
 
         return {
@@ -2301,13 +2391,18 @@ def _calculate_scores_for_ticker(
             "Price": int(round(float(close))),
             "Score": round(float(total_score), 4),
 
+            "FlowScore": round(float(flow_score), 4),
+            "MomentumScore": round(float(momentum_score), 4),
+            "GrowthScore": round(float(growth_score), 4),
+            "BreakoutScore": round(float(breakout_score), 4),
             "FinScore": round(float(fin_score), 4),
             "TechScore": round(float(tech_score), 4),
-            "MktScore": round(float(market_score), 4),
+            "MktScore": round(float(mkt_score), 4),
             "SectorScore": round(float(sector_score), 4),
             "VolKki": round(float(vol_kki), 4),
             "Pos52w": round(float(pos_52w), 4),
             "PatternScore": round(float(pattern_score), 4),
+            "AnnualizedVol": round(float(annualized_vol), 4),
 
             "PER": round(float(per_val), 2) if pd.notna(per_val) else 20.0,
             "PBR": round(float(pbr_val), 2) if pd.notna(pbr_val) else 1.5,
@@ -2429,6 +2524,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         return
     logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
     _KIS_INSTANCE = kis
+    set_kis_price_client(kis)
 
     # KIS 레이트 리밋/동시성 설정(설정값/환경변수/기본값)
     kis_limits = settings.get("kis_limits", {})
@@ -2461,8 +2557,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         kis_fetch_sector_and_listing_batch(kis, list(df_filtered.index), fixed_date, workers)
 
     with stage("섹터 보강", notify_key="screener_sector"):
-        # 기본 우선순위: pykrx 우선, FDR/캐시 다음, 실시간은 KIS 우선
-        order = screener_params.get("sector_source_priority", ["pykrx", "fdr", "kis"])
+        # KIS only
+        order = screener_params.get("sector_source_priority", ["kis"])
         df_filtered = _apply_sector_source_order(df_filtered, order, kis, workers, fixed_date, market)
 
     with stage("시장 레짐 계산", notify_key="screener_regime"):
@@ -2508,6 +2604,25 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         # 시장 상태를 전역 변수로 저장 (후속 단계에서 사용)
         _CURRENT_MARKET_STATE = market_state
 
+        # 지수 종가 캐시 (상대 모멘텀)
+        try:
+            kis_data = screener_params.get("kis_data", {}) if isinstance(screener_params.get("kis_data"), dict) else {}
+            idx_code = kis_data.get("index_code_kosdaq" if market.upper() == "KOSDAQ" else "index_code_kospi", "0001")
+            idx_close = market_analyzer._paginated_close(
+                lambda s, e: kis.inquire_industry_period_price(
+                    fid_input_iscd=str(idx_code),
+                    fid_input_date_1=s,
+                    fid_input_date_2=e,
+                ),
+                fixed_date,
+                min_bars=130,
+                max_pages=3,
+            )
+            if idx_close is not None:
+                cache_index_close_series(str(idx_code), idx_close)
+        except Exception as e:
+            logger.debug("지수 종가 캐시 실패: %s", e)
+
     with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
@@ -2526,6 +2641,22 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     # ✅ KIS 상장일 사전 캐싱 (로그 1회, 스코어링 전)
     with stage("상장일(KIS) 프리패치", notify_key=None):
         get_listing_date_kis_prefetch(kis, list(df_filtered.index), fixed_date, workers)
+
+    with stage("프리스코어(경량)", notify_key="screener_prescore"):
+        prescore_cfg = screener_params.get("prescore", {}) if isinstance(screener_params.get("prescore"), dict) else {}
+        if prescore_cfg.get("enabled", True) and len(df_filtered) > int(prescore_cfg.get("max_candidates", 50)):
+            max_c = int(prescore_cfg.get("max_candidates", 50))
+            before_n = len(df_filtered)
+            ranked: List[Tuple[str, float]] = []
+            for code, row in df_filtered.iterrows():
+                ps = _prescore_ticker(str(code), fixed_date, row, screener_params)
+                if ps is not None:
+                    ranked.append((str(code), float(ps)))
+            ranked.sort(key=lambda x: x[1], reverse=True)
+            top_codes = [c for c, _ in ranked[:max_c]]
+            if top_codes:
+                df_filtered = df_filtered.loc[df_filtered.index.astype(str).isin(top_codes)]
+                logger.info("프리스코어: %d → %d 종목 (max_candidates=%d)", before_n, len(df_filtered), max_c)
 
     with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         # 빈/무효 티커 제거 (All attempts failed for "" 방지)
@@ -2683,6 +2814,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         # Phase 3: 스크리너 필터링 강화
         n_scored_total = len(df_sorted)
         n_after_score = n_scored_total
+        n_after_flow = n_scored_total
         n_after_momentum = n_scored_total
         n_after_vol = n_scored_total
 
@@ -2696,71 +2828,36 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             logger.info(f"최소 점수 필터 ({min_score_threshold:.2f}): {before} → {len(df_sorted)} 종목")
             _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
             _log_dropped(f"최종:최소점수<{min_score_threshold:.2f}", _before_tickers, _after_tickers)
-        
-        # 2) 모멘텀 필터 (양의 모멘텀 필수)
-        if screener_params.get("require_positive_momentum", False):
+
+        # 2) FlowScore 필터
+        flow_min = float(screener_params.get("flow_params", {}).get("min_flow_score", 0.25))
+        if "FlowScore" in df_sorted.columns and flow_min > 0:
             before = len(df_sorted)
-            # 20일 수익률 계산 (간단한 모멘텀 지표)
-            momentum_mask = pd.Series(True, index=df_sorted.index)
-            for idx, row in df_sorted.iterrows():
-                ticker = row.get("Ticker", "")
-                try:
-                    # 가격 데이터 조회하여 모멘텀 계산
-                    price_data = get_historical_prices(ticker, 
-                        (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d"),
-                        date_str)
-                    if price_data is not None and len(price_data) >= 20:
-                        close_col = None
-                        for col in ["Close", "close", "종가"]:
-                            if col in price_data.columns:
-                                close_col = col
-                                break
-                        if close_col:
-                            prices = price_data[close_col].tolist()
-                            if len(prices) >= 20:
-                                momentum_20d = (prices[-1] - prices[-20]) / prices[-20] if prices[-20] > 0 else 0
-                                momentum_mask.loc[idx] = momentum_20d > 0
-                except Exception as e:
-                    logger.debug(f"[{ticker}] 모멘텀 계산 실패: {e}")
-                    momentum_mask.loc[idx] = True  # 오류 시 통과
-            
             _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            df_sorted = df_sorted[momentum_mask]
-            n_after_momentum = len(df_sorted)
-            logger.info(f"양의 모멘텀 필터: {before} → {len(df_sorted)} 종목")
+            df_sorted = df_sorted[df_sorted["FlowScore"] >= flow_min]
+            n_after_flow = len(df_sorted)
+            logger.info(f"FlowScore 필터 (≥{flow_min:.2f}): {before} → {len(df_sorted)} 종목")
             _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            _log_dropped("최종:음의모멘텀", _before_tickers, _after_tickers)
+            _log_dropped(f"최종:FlowScore<{flow_min:.2f}", _before_tickers, _after_tickers)
+
+        # 3) MomentumScore 필터
+        mom_min = float(screener_params.get("momentum_params", {}).get("min_momentum_score", 0.30))
+        if "MomentumScore" in df_sorted.columns and mom_min > 0:
+            before = len(df_sorted)
+            _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
+            df_sorted = df_sorted[df_sorted["MomentumScore"] >= mom_min]
+            n_after_momentum = len(df_sorted)
+            logger.info(f"MomentumScore 필터 (≥{mom_min:.2f}): {before} → {len(df_sorted)} 종목")
+            _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
+            _log_dropped(f"최종:MomentumScore<{mom_min:.2f}", _before_tickers, _after_tickers)
         
-        # 3) 변동성 필터 (고변동성 종목 제외)
+        # 4) 변동성 필터 (고변동성 종목 제외)
         if screener_params.get("exclude_high_volatility", False):
             volatility_threshold = screener_params.get("volatility_threshold", 0.30)
             before = len(df_sorted)
-            volatility_mask = pd.Series(True, index=df_sorted.index)
-            for idx, row in df_sorted.iterrows():
-                ticker = row.get("Ticker", "")
-                try:
-                    # 가격 데이터 조회하여 변동성 계산
-                    price_data = get_historical_prices(ticker,
-                        (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d"),
-                        date_str)
-                    if price_data is not None and len(price_data) >= 20:
-                        close_col = None
-                        for col in ["Close", "close", "종가"]:
-                            if col in price_data.columns:
-                                close_col = col
-                                break
-                        if close_col:
-                            prices = price_data[close_col].tolist()
-                            if len(prices) >= 20:
-                                returns = pd.Series(prices).pct_change().dropna()
-                                volatility = returns.std() * (252 ** 0.5)  # 연율화 변동성
-                                volatility_mask.loc[idx] = volatility <= volatility_threshold
-                except Exception as e:
-                    logger.debug(f"[{ticker}] 변동성 계산 실패: {e}")
-                    volatility_mask.loc[idx] = True  # 오류 시 통과
-            
             _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            df_sorted = df_sorted[volatility_mask]
+            if "AnnualizedVol" in df_sorted.columns:
+                df_sorted = df_sorted[df_sorted["AnnualizedVol"] <= volatility_threshold]
             n_after_vol = len(df_sorted)
             logger.info(f"변동성 필터 (≤{volatility_threshold:.0%}): {before} → {len(df_sorted)} 종목")
             _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
@@ -2781,7 +2878,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             [
                 ("스코어링 통과", n_scored_total),
                 (f"최소점수≥{min_score_threshold:.2f}", n_after_score),
-                ("양의 모멘텀", n_after_momentum),
+                (f"FlowScore≥{flow_min:.2f}", n_after_flow),
+                (f"MomentumScore≥{mom_min:.2f}", n_after_momentum),
                 ("변동성 필터", n_after_vol),
                 (f"섹터다양화(top{top_n})", len(final_candidates_base)),
             ],
@@ -2892,6 +2990,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         # 보유 종목 점수 캐시 (트레이더 교체 판단용) - 확장된 데이터 구조 (존재하는 컬럼만 사용)
         _score_cols = [
             "Ticker", "Name", "Sector", "Price", "Score",
+            "FlowScore", "MomentumScore", "GrowthScore", "BreakoutScore",
             "FinScore", "TechScore", "MktScore", "SectorScore", "PatternScore",
             "VolKki", "Pos52w", "PER", "PBR", "RSI", "ATR", "MA50", "MA200",
             "MA20Up", "AccumVol", "HigherLows", "Consolidation", "YEY",
@@ -2908,6 +3007,10 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 "Name": "name",
                 "Sector": "sector",
                 "Price": "price",
+                "FlowScore": "flow_score",
+                "MomentumScore": "momentum_score",
+                "GrowthScore": "growth_score",
+                "BreakoutScore": "breakout_score",
                 "FinScore": "fin_score",
                 "TechScore": "tech_score",
                 "MktScore": "mkt_score",

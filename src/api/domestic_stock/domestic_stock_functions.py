@@ -631,6 +631,48 @@ class DomesticStock:
             logger.debug("투자자추이 예외(ticker=%s): %s", fid_input_iscd, e)
             return pd.DataFrame()
 
+    def inquire_financial_ratio(
+        self,
+        *,
+        fid_div_cls_code: str,
+        fid_input_iscd: str,
+        fid_cond_mrkt_div_code: str = "J",
+    ) -> pd.DataFrame:
+        """
+        국내주식 재무비율 (매출/영업/순이익 증가율, ROE, EPS 등)
+        - TR: FHKST66430300
+        - URL: /uapi/domestic-stock/v1/finance/financial-ratio
+        """
+        url = f"{self.url_base}/uapi/domestic-stock/v1/finance/financial-ratio"
+        tr_id = "FHKST66430300"
+        params = {
+            "FID_DIV_CLS_CODE": fid_div_cls_code,
+            "FID_COND_MRKT_DIV_CODE": fid_cond_mrkt_div_code,
+            "FID_INPUT_ISCD": fid_input_iscd,
+        }
+        try:
+            res = self.request_get(url, headers={"tr_id": tr_id}, params=params, timeout=10)
+            if res.status_code != 200:
+                logger.debug(
+                    "재무비율 실패(status=%s, ticker=%s): %s",
+                    res.status_code, fid_input_iscd, res.text[:200],
+                )
+                return pd.DataFrame()
+            data = res.json()
+            if str(data.get("rt_cd", "")) not in ("", "0"):
+                logger.debug(
+                    "재무비율 응답 오류(ticker=%s): rt_cd=%s msg=%s",
+                    fid_input_iscd, data.get("rt_cd"), data.get("msg1"),
+                )
+                return pd.DataFrame()
+            out = data.get("output") or []
+            if not out:
+                return pd.DataFrame()
+            return pd.DataFrame(out)
+        except Exception as e:
+            logger.debug("재무비율 예외(ticker=%s): %s", fid_input_iscd, e)
+            return pd.DataFrame()
+
     def inquire_industry_period_price(
         self,
         *,

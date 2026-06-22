@@ -15,57 +15,404 @@ Screener Core Module - 최적화된 스크리너 핵심 기능
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 import numpy as np
 import pandas as pd
-import FinanceDataReader as fdr
-from pykrx import stock as pykrx
-
-# ───────────────── pykrx 커스텀 헤더 패치 적용 ─────────────────
-# 패치는 모듈 레벨에서 한 번만 적용되면 모든 곳에서 적용되므로,
-# screener.py에서 이미 적용되었더라도 중복 적용해도 안전합니다.
-CUSTOM_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
-}
-
-def _apply_pykrx_patch():
-    """pykrx 라이브러리에 커스텀 헤더 패치 적용 (내부 함수)"""
-    try:
-        from pykrx.website.comm import webio
-        import requests
-        
-        def _patched_get_read(self, **params):
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
-            }
-            return requests.get(self.url, headers=headers, params=params)
-        
-        def _patched_post_read(self, **params):
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
-            }
-            return requests.post(self.url, headers=headers, data=params)
-        
-        # 기존 메서드를 새 메서드로 대체
-        webio.Get.read = _patched_get_read
-        webio.Post.read = _patched_post_read
-        
-        return True
-    except Exception:
-        # 패치 실패 시 무시 (이미 다른 곳에서 적용되었을 수 있음)
-        return False
-
-# 패치 적용 (모듈 로드 시 자동 적용)
-_apply_pykrx_patch()
 
 # reviewer.py와 recorder.py에서 import
 from reviewer import MarketRegime, MarketState
 from recorder import DataRecorder
 
 logger = logging.getLogger(__name__)
+
+_KIS_PRICE_CLIENT: Optional[Any] = None
+_INDEX_CLOSE_CACHE: Dict[str, pd.Series] = {}
+
+
+def set_kis_price_client(kis: Any) -> None:
+    """KIS 클라이언트를 과거 시세 조회(get_historical_prices)에 등록."""
+    global _KIS_PRICE_CLIENT
+    _KIS_PRICE_CLIENT = kis
+
+
+def cache_index_close_series(key: str, series: pd.Series) -> None:
+    """시장 지수 종가 시계열 캐시 (상대 모멘텀용)."""
+    if series is not None and not series.empty:
+        _INDEX_CLOSE_CACHE[str(key)] = series
+
+
+def get_cached_index_close(key: str) -> Optional[pd.Series]:
+    return _INDEX_CLOSE_CACHE.get(str(key))
+
+
+def _clip_score(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return float(max(lo, min(hi, val)))
+
+
+def _to_float_safe(val: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if val is None or (isinstance(val, str) and not str(val).strip()):
+            return default
+        f = float(val)
+        if np.isnan(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _growth_rate_to_score(rate_pct: Optional[float], min_pct: float = -30.0, max_pct: float = 80.0) -> float:
+    if rate_pct is None or pd.isna(rate_pct):
+        return 0.0
+    return _clip_score((float(rate_pct) - min_pct) / max(max_pct - min_pct, 1e-9))
+
+
+def _normalize_kis_period_df(df: pd.DataFrame) -> pd.DataFrame:
+    """KIS inquire_period_price 응답 → standardize_ohlcv 호환 형식."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    rename_map = {
+        "stck_bsop_date": "date",
+        "stck_oprc": "open",
+        "stck_hgpr": "high",
+        "stck_lwpr": "low",
+        "stck_clpr": "close",
+        "acml_vol": "volume",
+    }
+    out = out.rename(columns={k: v for k, v in rename_map.items() if k in out.columns})
+    if "date" in out.columns:
+        out["date"] = out["date"].astype(str)
+        out = out.sort_values("date")
+        out = out.set_index("date")
+    return out
+
+
+def get_kis_ohlcv(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    kis: Optional[Any] = None,
+    market_div: str = "J",
+    min_bars: int = 60,
+    max_pages: int = 6,
+) -> Optional[pd.DataFrame]:
+    """KIS 기간별 시세(FHKST03010100) 페이지네이션으로 OHLCV 조회."""
+    client = kis or _KIS_PRICE_CLIENT
+    if client is None or not symbol or not str(symbol).strip():
+        return None
+
+    code = str(symbol).zfill(6)
+    merged_rows: Dict[str, Dict[str, Any]] = {}
+    cur_end = str(end_date)
+
+    for _ in range(max(1, max_pages)):
+        start = (datetime.strptime(cur_end, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
+        try:
+            df = client.inquire_period_price(
+                fid_cond_mrkt_div_code=market_div,
+                fid_input_iscd=code,
+                fid_input_date_1=start,
+                fid_input_date_2=cur_end,
+            )
+        except Exception as e:
+            logger.debug("KIS OHLCV 페이지 조회 실패(%s, end=%s): %s", code, cur_end, e)
+            break
+        if df is None or df.empty:
+            break
+        date_col = next((c for c in ["stck_bsop_date", "bsop_date", "date"] if c in df.columns), None)
+        if date_col is None:
+            break
+        prev_n = len(merged_rows)
+        for _, row in df.iterrows():
+            d = str(row[date_col])
+            if d:
+                merged_rows[d] = row.to_dict()
+        if len(merged_rows) >= min_bars:
+            break
+        if len(merged_rows) <= prev_n:
+            break
+        earliest = min(merged_rows.keys())
+        try:
+            next_end = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        except Exception:
+            break
+        if next_end >= cur_end:
+            break
+        cur_end = next_end
+
+    if not merged_rows:
+        return None
+
+    out = pd.DataFrame(list(merged_rows.values()))
+    out = _normalize_kis_period_df(out)
+    if out is None or out.empty:
+        return None
+    if start_date:
+        out = out[out.index >= str(start_date)]
+    return out if not out.empty else None
+
+
+def get_historical_prices(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    retries: int = 3,
+    *,
+    kis: Optional[Any] = None,
+) -> Optional[pd.DataFrame]:
+    """과거 시세 조회 (KIS 전용)."""
+    if not symbol or not str(symbol).strip():
+        logger.debug("get_historical_prices: empty symbol, skipping")
+        return None
+
+    client = kis or _KIS_PRICE_CLIENT
+    if client is None:
+        logger.warning("get_historical_prices: KIS client not set for %s", symbol)
+        return None
+
+    kis_data = {}
+    min_bars = int(kis_data.get("ohlcv_min_bars", 60)) if isinstance(kis_data, dict) else 60
+    max_pages = int(kis_data.get("ohlcv_max_pages", 6)) if isinstance(kis_data, dict) else 6
+
+    for attempt in range(retries):
+        try:
+            df = get_kis_ohlcv(
+                symbol,
+                start_date,
+                end_date,
+                kis=client,
+                min_bars=min(min_bars, 60),
+                max_pages=max_pages,
+            )
+            if df is not None and not df.empty:
+                logger.debug("KIS OHLCV success for %s: %d rows", symbol, len(df))
+                return df
+        except Exception as e:
+            logger.debug("KIS OHLCV attempt %d failed for %s: %s", attempt + 1, symbol, e)
+        if attempt < retries - 1:
+            time.sleep(0.5 * (attempt + 1))
+
+    logger.warning("KIS OHLCV failed for %s (%s to %s)", symbol, start_date, end_date)
+    return None
+
+
+def compute_flow_score(df_flow: Optional[pd.DataFrame], cfg: Dict[str, Any]) -> Tuple[float, bool]:
+    """외국인·기관 수급 점수 (0~1). (score, data_available)."""
+    flow_params = cfg.get("flow_params", {}) if isinstance(cfg.get("flow_params"), dict) else {}
+    fw = float(flow_params.get("foreign_weight", 0.5))
+    iw = float(flow_params.get("institution_weight", 0.5))
+
+    if df_flow is None or df_flow.empty:
+        return 0.0, False
+
+    needed = {"기관합계", "외국인합계"}
+    if not needed.issubset(set(df_flow.columns)):
+        return 0.0, False
+
+    inst = pd.to_numeric(df_flow["기관합계"], errors="coerce").fillna(0)
+    frgn = pd.to_numeric(df_flow["외국인합계"], errors="coerce").fillna(0)
+    if inst.abs().sum() == 0 and frgn.abs().sum() == 0:
+        return 0.0, False
+
+    inst_sum = float(inst.sum())
+    frgn_sum = float(frgn.sum())
+    inst_norm = _clip_score(inst_sum / max(abs(inst_sum), 1e9) * 0.5 + 0.5) if inst_sum != 0 else 0.5
+    frgn_norm = _clip_score(frgn_sum / max(abs(frgn_sum), 1e9) * 0.5 + 0.5) if frgn_sum != 0 else 0.5
+    if inst_sum > 0:
+        inst_norm = _clip_score(0.5 + min(inst_sum / 5e10, 0.5))
+    elif inst_sum < 0:
+        inst_norm = _clip_score(0.5 - min(abs(inst_sum) / 5e10, 0.5))
+    if frgn_sum > 0:
+        frgn_norm = _clip_score(0.5 + min(frgn_sum / 5e10, 0.5))
+    elif frgn_sum < 0:
+        frgn_norm = _clip_score(0.5 - min(abs(frgn_sum) / 5e10, 0.5))
+
+    dual_days = int(((inst > 0) & (frgn > 0)).sum())
+    dual_bonus = min(0.1, dual_days / max(len(df_flow), 1) * 0.1)
+    score = _clip_score(fw * frgn_norm + iw * inst_norm + dual_bonus)
+    return score, True
+
+
+def _period_return(close: pd.Series, days: int) -> Optional[float]:
+    if close is None or len(close) < days + 1:
+        return None
+    base = float(close.iloc[-days - 1])
+    if base <= 0:
+        return None
+    return (float(close.iloc[-1]) - base) / base
+
+
+def compute_momentum_score(
+    close: pd.Series,
+    index_close: Optional[pd.Series],
+    cfg: Dict[str, Any],
+) -> float:
+    """중기 모멘텀 점수 (0~1)."""
+    mom_params = cfg.get("momentum_params", {}) if isinstance(cfg.get("momentum_params"), dict) else {}
+    periods = mom_params.get("periods_days", [20, 60, 120])
+    weights = mom_params.get("period_weights", [0.45, 0.35, 0.20])
+    if len(weights) != len(periods):
+        weights = [1.0 / len(periods)] * len(periods)
+
+    parts: List[float] = []
+    wsum = 0.0
+    for period, w in zip(periods, weights):
+        ret = _period_return(close, int(period))
+        if ret is None:
+            continue
+        parts.append(float(w) * _clip_score(ret * 5 + 0.5))
+        wsum += float(w)
+
+    if wsum <= 0:
+        return 0.0
+
+    score = sum(parts) / wsum
+
+    if mom_params.get("relative_to_index", False) and index_close is not None and len(index_close) >= 61:
+        stock_60 = _period_return(close, 60)
+        idx_60 = _period_return(index_close, 60)
+        if stock_60 is not None and idx_60 is not None:
+            rel = stock_60 - idx_60
+            score = _clip_score(0.85 * score + 0.15 * _clip_score(rel * 5 + 0.5))
+
+    mid_long = _period_return(close, 120)
+    short = _period_return(close, 20)
+    if mid_long is not None and short is not None:
+        accel = mid_long - short
+        score = _clip_score(0.9 * score + 0.1 * _clip_score(accel * 5 + 0.5))
+
+    return _clip_score(score)
+
+
+def compute_growth_score(fin_ratio: Optional[Dict[str, Any]], cfg: Dict[str, Any]) -> float:
+    """실적 성장률 점수 (KIS financial-ratio)."""
+    if not fin_ratio:
+        return 0.0
+    gp = cfg.get("growth_params", {}) if isinstance(cfg.get("growth_params"), dict) else {}
+    rw = float(gp.get("revenue_yoy_weight", 0.40))
+    ow = float(gp.get("op_profit_yoy_weight", 0.35))
+    ew = float(gp.get("eps_yoy_weight", 0.25))
+    grs = _to_float_safe(fin_ratio.get("grs"))
+    bsop = _to_float_safe(fin_ratio.get("bsop_prfi_inrt"))
+    ntin = _to_float_safe(fin_ratio.get("ntin_inrt"))
+    return _clip_score(
+        rw * _growth_rate_to_score(grs, -20.0, 50.0)
+        + ow * _growth_rate_to_score(bsop, -30.0, 80.0)
+        + ew * _growth_rate_to_score(ntin, -30.0, 80.0)
+    )
+
+
+def compute_fin_score_extended(
+    per_val: Optional[float],
+    pbr_val: Optional[float],
+    roe_val: Optional[float],
+    cfg: Dict[str, Any],
+    marcap: float = 0.0,
+) -> float:
+    """PER/PBR/ROE 기반 품질·밸류에이션 점수."""
+    fp = cfg.get("fin_params", {}) if isinstance(cfg.get("fin_params"), dict) else {}
+    per_w = float(fp.get("per_weight", 0.40))
+    pbr_w = float(fp.get("pbr_weight", 0.30))
+    roe_w = float(fp.get("roe_weight", 0.30))
+
+    per = _to_float_safe(per_val, 20.0)
+    pbr = _to_float_safe(pbr_val, 1.5)
+    roe = _to_float_safe(roe_val)
+
+    if per is None:
+        per = 20.0
+    if pbr is None:
+        pbr = 1.5
+
+    if per < 0:
+        per_term = 0.1
+    else:
+        per_term = max(0.0, min(1.0, (50 - per) / 50))
+    if pbr < 0:
+        pbr_term = 0.1
+    else:
+        pbr_term = max(0.0, min(1.0, (5 - pbr) / 5))
+    if roe is None or roe <= 0:
+        roe_term = 0.2
+    else:
+        roe_term = max(0.0, min(1.0, roe / 25.0))
+
+    return _clip_score(per_w * per_term + pbr_w * pbr_term + roe_w * roe_term)
+
+
+def compute_breakout_score(
+    df_price: pd.DataFrame,
+    price_info: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> float:
+    """신고가 돌파·거래량 확대 점수."""
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    lookback = int(bp.get("lookback_high_days", 252))
+    vol_ratio_min = float(bp.get("volume_ratio_min", 1.5))
+    buffer_pct = float(bp.get("breakout_buffer_pct", 0.005))
+
+    if df_price is None or df_price.empty:
+        return 0.0
+
+    close = pd.to_numeric(df_price["Close"], errors="coerce")
+    high = pd.to_numeric(df_price["High"], errors="coerce")
+    volume = pd.to_numeric(df_price["Volume"], errors="coerce").fillna(0)
+    if close.empty:
+        return 0.0
+
+    last_close = float(close.iloc[-1])
+    window = min(lookback, len(high))
+    high_52 = float(high.tail(window).max())
+    high_20 = float(high.tail(min(20, len(high))).max())
+
+    breakout_52 = 1.0 if last_close >= high_52 * (1.0 + buffer_pct) else 0.0
+    breakout_20 = 1.0 if last_close >= high_20 * (1.0 + buffer_pct) else 0.0
+
+    vol_ma20 = float(volume.tail(min(20, len(volume))).mean()) if len(volume) else 0.0
+    last_vol = float(volume.iloc[-1]) if len(volume) else 0.0
+    vol_score = 1.0 if vol_ma20 > 0 and last_vol >= vol_ma20 * vol_ratio_min else 0.0
+
+    if price_info:
+        w52 = _to_float_safe(price_info.get("w52_hgpr") or price_info.get("W52_HGPR"))
+        if w52 and w52 > 0 and last_close >= w52 * (1.0 + buffer_pct):
+            breakout_52 = max(breakout_52, 1.0)
+
+    return _clip_score(0.50 * breakout_52 + 0.30 * vol_score + 0.20 * breakout_20)
+
+
+def compute_total_score_8axis(
+    flow: float,
+    momentum: float,
+    tech: float,
+    growth: float,
+    fin: float,
+    breakout: float,
+    mkt: float,
+    sector: float,
+    cfg: Dict[str, Any],
+) -> float:
+    """8축 가중 합산."""
+    w_flow = float(cfg.get("flow_weight", 0.20))
+    w_mom = float(cfg.get("momentum_weight", 0.20))
+    w_tech = float(cfg.get("tech_weight", 0.15))
+    w_growth = float(cfg.get("growth_weight", 0.15))
+    w_fin = float(cfg.get("fin_weight", 0.15))
+    w_break = float(cfg.get("breakout_weight", 0.05))
+    w_mkt = float(cfg.get("mkt_weight", 0.05))
+    w_sector = float(cfg.get("sector_weight", 0.05))
+    total = (
+        flow * w_flow
+        + momentum * w_mom
+        + tech * w_tech
+        + growth * w_growth
+        + fin * w_fin
+        + breakout * w_break
+        + mkt * w_mkt
+        + sector * w_sector
+    )
+    return _clip_score(total)
 
 def _compute_levels(ticker: str, current_price: float, date_str: str, risk_params: Dict[str, Any], strategy_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -206,78 +553,6 @@ def _compute_levels(ticker: str, current_price: float, date_str: str, risk_param
                 "목표가": 0,
                 "source": "error"
             }
-
-def get_historical_prices(symbol: str, start_date: str, end_date: str, retries: int = 3) -> Optional[pd.DataFrame]:
-    """
-    과거 시세 조회 (다단계 fallback 메커니즘)
-    
-    Args:
-        symbol: 종목 코드
-        start_date: 시작일 (YYYYMMDD)
-        end_date: 종료일 (YYYYMMDD)
-        retries: 재시도 횟수
-    
-    Returns:
-        DataFrame with OHLCV data or None if failed
-    """
-    import time
-    
-    if not symbol or not str(symbol).strip():
-        logger.debug("get_historical_prices: empty symbol, skipping")
-        return None
-
-    for attempt in range(retries):
-        try:
-            # 1단계: pykrx 시도
-            try:
-                df = pykrx.get_market_ohlcv(start_date, end_date, symbol)
-                if df is not None and not df.empty:
-                    logger.debug(f"pykrx success for {symbol}: {len(df)} rows")
-                    return df
-            except Exception as e:
-                logger.debug(f"pykrx attempt {attempt + 1} failed for {symbol}: {e}")
-            
-            # 2단계: fdr 시도
-            try:
-                start_dt = datetime.strptime(start_date, '%Y%m%d')
-                end_dt = datetime.strptime(end_date, '%Y%m%d')
-                
-                df = fdr.DataReader(symbol, start=start_dt, end=end_dt)
-                if df is not None and not df.empty:
-                    logger.debug(f"fdr success for {symbol}: {len(df)} rows")
-                    return df
-            except Exception as e:
-                logger.debug(f"fdr attempt {attempt + 1} failed for {symbol}: {e}")
-            
-            # 3단계: 날짜 범위 확장 시도 (마지막 시도에서만)
-            if attempt == retries - 1:
-                try:
-                    # 시작일을 더 앞으로 확장
-                    start_dt = datetime.strptime(start_date, '%Y%m%d') - timedelta(days=30)
-                    extended_start = start_dt.strftime('%Y%m%d')
-                    
-                    df = pykrx.get_market_ohlcv(extended_start, end_date, symbol)
-                    if df is not None and not df.empty:
-                        # 원하는 시작일 이후 데이터만 필터링
-                        df = df[df.index >= start_date]
-                        if not df.empty:
-                            logger.debug(f"pykrx with extended range success for {symbol}: {len(df)} rows")
-                            return df
-                except Exception as e:
-                    logger.debug(f"extended range pykrx failed for {symbol}: {e}")
-            
-            # 재시도 전 대기
-            if attempt < retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-                
-        except Exception as e:
-            logger.warning(f"Error in attempt {attempt + 1} for {symbol}: {e}")
-            if attempt < retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-    
-    if symbol and str(symbol).strip():
-        logger.warning(f"All attempts failed for {symbol} ({start_date} to {end_date})")
-    return None
 
 class MarketAnalyzer:
     """시장 분석기 (기본 기능)"""
