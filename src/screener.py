@@ -52,7 +52,10 @@ from screener_core import (
     compute_fin_score_extended,
     compute_breakout_score,
     compute_breakout_score_bonus,
+    compute_near_high_penalty,
+    compute_conviction_score,
     build_rank_reasons,
+    build_selection_summary,
     compute_total_score_7axis,
     compute_foreign_holding_change_score,
     filter_breakout_gate_tiered,
@@ -61,7 +64,7 @@ from screener_core import (
 from portfolio_allocator import allocate_portfolio_weights
 
 # ─────── 스키마 메타 ───────
-SCHEMA_VERSION = "1.5"  # Output schema pinned
+SCHEMA_VERSION = "1.6"  # Output schema pinned
 
 # ─────── 캐시 버전 키 ───────
 # 버그 수정으로 기존 캐시를 강제 무효화해야 할 때 버전을 올린다(파일명에 포함됨).
@@ -2545,7 +2548,13 @@ def _calculate_scores_for_ticker(
             tech=float(tech_score) if float(cfg.get("tech_weight", 0) or 0) > 0 else 0.0,
         )
         breakout_bonus = compute_breakout_score_bonus(breakout_score, cfg)
-        total_score = min(1.0, float(base_score) + float(breakout_bonus))
+        near_high_penalty, penalty_reason = compute_near_high_penalty(
+            float(pos_52w), float(breakout_score), cfg,
+        )
+        total_score = max(
+            0.0,
+            min(1.0, float(base_score) + float(breakout_bonus) - float(near_high_penalty)),
+        )
         rank_reason = build_rank_reasons(
             flow_score=float(flow_score),
             momentum_score=float(momentum_score),
@@ -2557,6 +2566,14 @@ def _calculate_scores_for_ticker(
             op_turnaround=bool(op_turnaround),
             growth_bonus=float(growth_bonus),
             cfg=cfg,
+        )
+        selection_summary = build_selection_summary(rank_reason)
+        conviction_score = compute_conviction_score(
+            float(flow_score),
+            float(momentum_score),
+            float(breakout_score),
+            float(growth_score),
+            cfg,
         )
 
         flow_min = float(cfg.get("flow_params", {}).get("min_flow_score", 0.25))
@@ -2598,6 +2615,9 @@ def _calculate_scores_for_ticker(
             "OpProfitTurnaround": bool(op_turnaround),
             "BreakoutScore": round(float(breakout_score), 4),
             "BreakoutBonus": round(float(breakout_bonus), 4),
+            "NearHighPenalty": round(float(near_high_penalty), 4),
+            "penalty_reason": penalty_reason,
+            "ConvictionScore": round(float(conviction_score), 4),
             "FinScore": round(float(fin_score), 4),
             "TechScore": round(float(tech_score), 4),
             "MktScore": round(float(mkt_score), 4),
@@ -2623,6 +2643,7 @@ def _calculate_scores_for_ticker(
 
             "exclude_reasons": exclude_reasons,
             "rank_reason": rank_reason,
+            "selection_summary": selection_summary,
             "daily_chart": daily_chart_data,
             "investor_flow": df_investor_flow.reset_index().to_dict('records') if df_investor_flow is not None else None,
         }
@@ -3137,7 +3158,10 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
         # 목표 비중 배분
         weight_mode = str(portfolio_cfg.get("weight_mode", "equal"))
-        per_cap = float(settings.get("trading_params", {}).get("per_ticker_max_weight", 0.08))
+        per_cap = float(
+            portfolio_cfg.get("per_ticker_max_weight")
+            or settings.get("trading_params", {}).get("per_ticker_max_weight", 0.075)
+        )
         cand_records = final_candidates.to_dict(orient="records")
         weighted = allocate_portfolio_weights(
             cand_records,
@@ -3188,7 +3212,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
             "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D",
             "target_weight", "GrowthBonus", "OpProfitTurnaround", "BreakoutBonus",
-            "gate_tier", "gate_reason", "rank_reason",
+            "NearHighPenalty", "penalty_reason", "ConvictionScore",
+            "gate_tier", "gate_reason", "rank_reason", "selection_summary",
             "exclude_reasons",
         ]
         keep = [c for c in cols if c in final_candidates.columns]

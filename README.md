@@ -30,17 +30,22 @@
 
 ## 1. 프로젝트 개요
 
+**KOSPI 주간 리밸런싱**을 기본 운용 모드로 하는 퀀트 자동매매 봇입니다.  
+전략 철학: **외국인·기관 수급 + 실적 성장 + 신고가 돌파 + KOSPI 대비 상대 모멘텀(RS)**.
+
 정해진 스케줄(KST)에 따라 다음을 자동 수행합니다.
 
 | 단계 | 설명 |
 |------|------|
-| 스크리닝 | 시총·거래대금·재무·기술·시장 국면·섹터 트렌드 기반 종목 후보 생성 |
+| 스크리닝 | 7축 점수·Breakout Gate·프리스코어로 Top 20 후보 생성 (`rank_tier` 목표 비중) |
 | 뉴스 수집 | 네이버 검색 API + 스크래핑 |
 | 분석 | OpenAI GPT 또는 휴리스틱(키 없을 때) |
-| 매매 | KIS Open API 매수/매도 |
+| 매매 | KIS Open API 매수/매도 (`target_weight` 기반 사이징) |
 | 리스크 | 장중 별도 프로세스에서 손절·익절·전략 매도 |
 | 사후 처리 | SQLite 기록, 주문 정합성, 월간 성과 리뷰·산출물 정리 |
 
+- **운용 시장:** KOSPI (`MARKET=KOSPI`, `screener_params.portfolio.rebalance_frequency: weekly`)
+- **주간 스케줄:** 금요일 15:45 스크리너 → 월요일 09:30 매매 파이프라인
 - **실행 환경:** Docker Compose (`integrated_manager` + `background_risk_manager`)
 - **설정:** `config/config.json`(전략·스케줄) + `config/.env`(비밀값, Git 제외)
 - **모듈 연동:** `output/` 아래 JSON·DB 파일 파이프라인
@@ -50,8 +55,13 @@
 
 ## 2. 주요 기능
 
-- **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
-- **다단계 스크리닝** — 1차 유동성 필터 → 종합 점수 → 모멘텀·변동성·섹터 다양화 (`--debug` 시 퍼널 로그)
+- **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·매매 파이프라인·잔액·체결확인·리컨실·요약 담당
+- **KOSPI 7축 스크리닝** — Flow 25% · RS Momentum 25% · Growth 15% · Breakout 15% · Fin 10% · Mkt 5% · Sector 5% (Tech 0%, 진입 보조만)
+- **Breakout Gate (2단)** — Tier1 `Br≥0.25 OR Pos≥0.90` → 부족 시 Tier2 `Br≥0.20 OR Pos≥0.85` 종료 (Tier3 없음). Pos52w 단독 통과 시 `Breakout≥0.05` 필수
+- **스코어 조정** — 강한 돌파 가산점(`BreakoutBonus` 최대 +0.08), 고점 근처·약한 돌파 감점(`NearHighPenalty` 최대 −0.05)
+- **확신도·해석 필드** — `ConvictionScore`, `rank_reason`, `selection_summary`, `penalty_reason`, `gate_tier` / `gate_reason` (후보 JSON schema **1.6**)
+- **포트폴리오 비중** — `rank_tier` (1~5위 7% / 6~10위 5% / 11~20위 3.5%, 정규화) + 종목당 상한 **7.5%** (`per_ticker_max_weight`)
+- **다단계 스크리닝** — 1차 유동성 필터 → 프리스코어(50종) → 상세 스코어링 → 변동성·게이트·섹터 다양화 (`--debug` 시 퍼널 로그)
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — 1차 필터(뉴스·점수) → 전술 계획(차트·패턴·예산 가드) 2단계. `OPENAI_API_KEY` 없으면 휴리스틱 폴백. 1차 필터 탈락 시 `gpt_trades_*.json`에 **`결정: "미진입"`** 기록(탈락 사유·`initial_filter` 메타 포함). `trader.py`는 **`결정 == "매수"`** 만 실행
 - **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·긴급 낙폭·전략 믹서 기반 매도  
@@ -100,21 +110,31 @@
 
 ### 3.2 평일 스케줄 (KST)
 
-`config/config.json`의 `daily_summary`, `schedule_times`, `batch_execution_check`로 오버라이드합니다. **저장소 기본값** 기준:
+`config/config.json`의 `daily_summary`, `schedule_times`, `screener_params.portfolio`로 오버라이드합니다.
 
-| 시각 | 작업 | 실행 |
-|------|------|------|
-| 09:00 | 장시작 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("open")` → `output/daily_balances/` |
-| 09:10 | 스크리너 | `screener.py` |
-| 10:15 | 매매 파이프라인 | `health_check` → `news_collector` → `gpt_analyzer` → `trader` |
-| 11:00 · 14:00 | 장중 경량 리컨실 | `integrated_manager.run_intraday_reconcile_job()` → `order_reconciler` |
-| 15:20 | 일괄 체결 확인 | `trader.py --batch-check-only` |
-| 15:22 | 주문 정합성 | `order_reconciler.py` |
-| 15:30 | 장종료 잔액 스냅샷 | `integrated_manager.capture_balance_snapshot("close")` |
-| 15:35 | 일일 요약 | Discord (`send_daily_trading_summary`) — `daily_summary.summary_send_time`으로 변경 가능 |
+#### 주간 리밸런싱 모드 (기본, `rebalance_frequency: weekly`)
+
+| 시각 | 요일 | 작업 | 실행 |
+|------|------|------|------|
+| 09:00 | 평일 | 장시작 잔액 스냅샷 | `capture_balance_snapshot("open")` |
+| **15:45** | **금요** | **스크리너** | `screener.py` → 후보·`target_weight` 산출 |
+| **09:30** | **월요** | **주간 매매 파이프라인** | `health_check` → `news` → `gpt` → `trader` |
+| 11:00 · 14:00 | 평일 | 장중 경량 리컨실 | `order_reconciler` |
+| 15:20 | 평일 | 일괄 체결 확인 | `trader.py --batch-check-only` |
+| 15:22 | 평일 | 주문 정합성 | `order_reconciler.py` |
+| 15:30 | 평일 | 장종료 잔액 스냅샷 | `capture_balance_snapshot("close")` |
+| 15:35 | 평일 | 일일 요약 | Discord (`daily_summary.summary_send_time` 변경 가능) |
 
 - 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day`)
-- **월간 유지보수:** 매일 점검 후 `monthly_maintenance.day`(기본 1일)에 1회 — `reviewer.py` → `cleanup_output.py` (기본 16:00)
+- `intraday_trading_enabled: false` 시 주간 모드에서 **화~목 일간 파이프라인·09:10 스크리너는 비활성**
+- **월간 유지보수:** 매월 1일 — `reviewer.py` → `cleanup_output.py` (기본 16:00)
+
+#### 일간 모드 (`rebalance_frequency` ≠ `weekly`)
+
+| 시각 | 작업 |
+|------|------|
+| 09:10 | 스크리너 |
+| 10:10~ | 매매 파이프라인 (`schedule_times.pipeline_time`) |
 
 ### 3.2.1 일일 매매 요약 (Discord)
 
@@ -139,17 +159,60 @@
 
 ### 3.3 스크리너 vs 매매 파이프라인
 
-스크리너는 **파이프라인 밖** 별도 스케줄 잡입니다. 당일 `screener_candidates_*.json` 등을 만든 뒤 파이프라인이 읽습니다.
+스크리너는 **파이프라인 밖** 별도 스케줄 잡입니다. 주간 모드에서는 **금요 후보 JSON**을 월요 파이프라인이 읽습니다.
 
 ```
-[09:10 screener]                         [10:15 pipeline]
-screener.py                              health_check.py
+[금 15:45 screener]                    [월 09:30 pipeline]
+screener.py                            health_check.py
   → screener_candidates_*.json             → news_collector.py
-  → screener_scores_*.json                   → gpt_analyzer.py
-  → market_state_*.json                      → trader.py → recorder → trading_data.db
+  → screener_candidates_full_*.json        → gpt_analyzer.py
+  → screener_scores_*.json                 → trader.py (target_weight 사이징)
+  → market_state_*.json                    → recorder → trading_data.db
          └──────────────────────────────────────────┘
                               (장중, 별도 컨테이너) risk_manager.py
 ```
+
+#### 3.3.1 KOSPI 7축 스코어링 (`screener_core.py`)
+
+| 축 | 비중 | 설명 |
+|----|------|------|
+| FlowScore | 25% | 외국인·기관 누적·가속·보유비중 변화 |
+| MomentumScore | 25% | KOSPI 대비 RS (20/60/120일, `relative_strength_mode: primary`) |
+| GrowthScore | 15% | 매출·영업이익·EPS YoY (+ 영업이익 턴어라운드 보너스 +0.05) |
+| BreakoutScore | 15% | 52주 고점 근접·거래량·박스 돌파 |
+| FinScore | 10% | ROE·부채·PER·PBR |
+| MktScore | 5% | 시장 레짐 보정 |
+| SectorScore | 5% | 섹터 트렌드 |
+| TechScore | 0% | 선정 점수 제외, 진입 타이밍 보조 |
+
+**최종 Score 조정 (게이트 이전):**
+
+```
+Score = clamp(0, 1, 7축합 + BreakoutBonus − NearHighPenalty)
+```
+
+| 조정 | 조건 | 값 |
+|------|------|-----|
+| BreakoutBonus | Br≥0.40 / 0.60 / 0.80 | +0.03 / +0.05 / +0.08 |
+| NearHighPenalty | Pos≥0.90 & Br<0.10 | −0.05 |
+| NearHighPenalty | Pos≥0.85 & Br<0.15 | −0.03 |
+
+**Breakout Gate (후보 필터, 최대 2단):**
+
+1. Tier1: `Breakout≥0.25` OR (`Pos52w≥0.90` AND `Breakout≥0.05`)
+2. Tier2 (후보<20 시): `Breakout≥0.20` OR (`Pos52w≥0.85` AND `Breakout≥0.05`) → **종료**
+
+**ConvictionScore** (비중·해석 보조, Score와 별도):
+
+```
+0.40×Flow + 0.30×Momentum + 0.20×Breakout + 0.10×Growth
+```
+
+**후보 JSON 주요 필드 (schema 1.6):** `Score`, `target_weight`, `BreakoutBonus`, `NearHighPenalty`, `penalty_reason`, `ConvictionScore`, `gate_tier`, `gate_reason`, `rank_reason`, `selection_summary`
+
+`rank_reason` 태그 예: `high_flow`, `high_rs`, `breakout`, `new_high`, `near_high`, `high_growth`, `turnaround`, `sector_leader`, `high_quality`
+
+오프라인 검증: `python scripts/replay_screener_logic.py [screener_candidates_full_*.json]`
 
 **`PIPELINE_SCRIPTS` (의존성 순):**
 
@@ -328,8 +391,9 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 
 | 파일 | 역할 |
 |------|------|
-| `screener.py` | 종목 스크리닝 CLI (`--market`, `--debug`) |
-| `screener_core.py` | 지표·점수·`MarketState` / `MarketRegime` |
+| `screener.py` | 종목 스크리닝 CLI (`--market KOSPI`, `--debug`) |
+| `screener_core.py` | 7축·RS·Growth Bonus·Breakout Gate·가산/감점·Conviction·`MarketState` |
+| `portfolio_allocator.py` | `rank_tier` / equal / score_proportional 목표 비중 + `per_ticker_max_weight` 캡 |
 | `kis_master.py` | KIS `.mst` 마스터 다운로드·캐시 |
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
@@ -590,6 +654,9 @@ docker compose exec integrated_manager python /app/run_integrated_manager.py --s
 # 스크리너만
 docker compose exec integrated_manager python -u /app/src/screener.py --market KOSPI --debug
 
+# 스크리너 로직 오프라인 리플레이 (게이트·가산/감점·비중 검증)
+python scripts/replay_screener_logic.py output/screener_candidates_full_YYYYMMDD_KOSPI.json
+
 # 파이프라인 단계만 (스크리너 결과가 output/에 있어야 함)
 docker compose exec integrated_manager python -u /app/src/health_check.py
 docker compose exec integrated_manager python -u /app/src/news_collector.py
@@ -680,6 +747,7 @@ kospistock/
 │   ├── integrated_manager.py
 │   ├── risk_manager.py
 │   ├── screener.py / screener_core.py / kis_master.py
+│   ├── portfolio_allocator.py
 │   ├── health_check.py / news_collector.py / gpt_analyzer.py / trader.py
 │   ├── recorder.py / order_reconciler.py / reviewer.py
 │   ├── rotation_policy.py / rotation_manager.py
@@ -688,6 +756,8 @@ kospistock/
 │   ├── cleanup_output.py / db_debug.py
 │   └── ...
 ├── .devcontainer/
+├── scripts/
+│   └── replay_screener_logic.py # 게이트·가산/감점·비중 오프라인 검증
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
 ├── docker-compose.yml

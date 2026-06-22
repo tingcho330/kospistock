@@ -16,6 +16,35 @@ def _rank_tier_weight(rank: int, tiers: List[Dict[str, Any]]) -> float:
     return 0.05
 
 
+def _apply_per_ticker_cap(weights: List[float], cap: float) -> List[float]:
+    """상한 초과분을 미달 종목에 비례 재분배 (반복)."""
+    if cap <= 0 or not weights:
+        return weights
+    w = [float(x) for x in weights]
+    for _ in range(len(w) + 2):
+        over_idx = [i for i, x in enumerate(w) if x > cap + 1e-12]
+        if not over_idx:
+            break
+        excess = sum(w[i] - cap for i in over_idx)
+        for i in over_idx:
+            w[i] = cap
+        under_idx = [i for i, x in enumerate(w) if x < cap - 1e-12]
+        if not under_idx or excess <= 0:
+            break
+        under_sum = sum(w[i] for i in under_idx)
+        if under_sum <= 0:
+            share = excess / len(under_idx)
+            for i in under_idx:
+                w[i] += share
+        else:
+            for i in under_idx:
+                w[i] += excess * (w[i] / under_sum)
+    wsum = sum(w)
+    if wsum > 0:
+        w = [x / wsum for x in w]
+    return w
+
+
 def allocate_portfolio_weights(
     candidates: List[Dict[str, Any]],
     *,
@@ -72,12 +101,10 @@ def allocate_portfolio_weights(
         for c, w in zip(out, weights):
             c["target_weight"] = round(float(w), 6)
 
-    if per_ticker_cap is not None and per_ticker_cap > 0 and mode != "rank_tier":
+    if per_ticker_cap is not None and per_ticker_cap > 0:
         cap = float(per_ticker_cap)
-        weights = [min(float(c.get("target_weight", 0)), cap) for c in out]
-        wsum = sum(weights)
-        if wsum > 0:
-            weights = [w / wsum for w in weights]
+        weights = [float(c.get("target_weight", 0)) for c in out]
+        weights = _apply_per_ticker_cap(weights, cap)
         for c, w in zip(out, weights):
             c["target_weight"] = round(float(w), 6)
 

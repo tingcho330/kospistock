@@ -491,15 +491,108 @@ def compute_breakout_score_bonus(breakout_score: float, cfg: Dict[str, Any]) -> 
                 break
     else:
         if br >= 0.80:
-            bonus = 0.06
+            bonus = 0.08
         elif br >= 0.60:
-            bonus = 0.04
+            bonus = 0.05
         elif br >= 0.40:
-            bonus = 0.02
+            bonus = 0.03
         else:
             bonus = 0.0
-    cap = float(bp.get("score_bonus_cap", 0.06))
+    cap = float(bp.get("score_bonus_cap", 0.08))
     return min(bonus, cap)
+
+
+def compute_near_high_penalty(
+    pos52w: float,
+    breakout_score: float,
+    cfg: Dict[str, Any],
+) -> Tuple[float, List[str]]:
+    """
+    고점 근처(Pos52w↑)이나 돌파(Breakout↓) 미약 시 Score 감점.
+    가장 강한 매칭 tier 1개만 적용.
+    """
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    pos = float(pos52w)
+    br = float(breakout_score)
+    tiers = bp.get("near_high_penalty_tiers")
+    if isinstance(tiers, list) and tiers:
+        matched: List[Tuple[float, str]] = []
+        for t in tiers:
+            pos_min = float(t.get("min_pos52w", 0.85))
+            br_max = float(t.get("max_breakout", 0.15))
+            penalty = float(t.get("penalty", 0.03))
+            reason = str(t.get("reason", "near_high_without_breakout"))
+            if pos >= pos_min and br < br_max:
+                matched.append((penalty, reason))
+        if not matched:
+            return 0.0, []
+        penalty, reason = max(matched, key=lambda x: x[0])
+        return penalty, [reason]
+    reasons: List[str] = []
+    if pos >= 0.90 and br < 0.10:
+        return 0.05, ["near_high_without_breakout"]
+    if pos >= 0.85 and br < 0.15:
+        return 0.03, ["near_high_without_breakout"]
+    return 0.0, reasons
+
+
+def compute_conviction_score(
+    flow_score: float,
+    momentum_score: float,
+    breakout_score: float,
+    growth_score: float,
+    cfg: Dict[str, Any],
+) -> float:
+    """수급·RS·돌파·성장 기반 확신도 (비중 판단 보조)."""
+    cp = cfg.get("conviction_params", {}) if isinstance(cfg.get("conviction_params"), dict) else {}
+    w_flow = float(cp.get("flow_weight", 0.40))
+    w_mom = float(cp.get("momentum_weight", 0.30))
+    w_br = float(cp.get("breakout_weight", 0.20))
+    w_growth = float(cp.get("growth_weight", 0.10))
+    raw = (
+        w_flow * float(flow_score)
+        + w_mom * float(momentum_score)
+        + w_br * float(breakout_score)
+        + w_growth * float(growth_score)
+    )
+    return max(0.0, min(1.0, raw))
+
+
+def build_selection_summary(rank_reasons: List[str]) -> str:
+    """rank_reason 태그 기반 영문 선정 요약."""
+    tags = set(rank_reasons or [])
+    if {"high_flow", "high_rs", "breakout"} <= tags:
+        return "Strong accumulation and breakout"
+    if {"high_flow", "high_rs", "new_high"} <= tags:
+        return (
+            "Strong foreign/institutional accumulation, high relative strength, "
+            "new high breakout"
+        )
+    if {"high_flow", "high_rs"} <= tags:
+        return "Strong foreign/institutional accumulation and high relative strength"
+    if {"high_flow", "breakout"} <= tags:
+        return "Strong accumulation with breakout momentum"
+    if {"high_rs", "breakout"} <= tags:
+        return "High relative strength with breakout candidate"
+    if {"high_growth", "high_rs"} <= tags:
+        return "Earnings growth with relative strength"
+    if "new_high" in tags and "breakout" in tags:
+        return "New high breakout with strong technical signal"
+    if "near_high" in tags and "high_flow" in tags:
+        return "Near 52-week high with institutional accumulation"
+    if "turnaround" in tags:
+        return "Earnings turnaround candidate"
+    if "high_flow" in tags:
+        return "Strong foreign/institutional accumulation"
+    if "high_rs" in tags:
+        return "High relative strength vs KOSPI"
+    if "breakout" in tags:
+        return "Breakout candidate"
+    if "high_growth" in tags:
+        return "Strong earnings growth"
+    if tags:
+        return "Multi-factor screen pass: " + ", ".join(sorted(tags))
+    return "Passed multi-factor screening criteria"
 
 
 def build_rank_reasons(
