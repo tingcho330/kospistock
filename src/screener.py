@@ -448,7 +448,7 @@ def _kis_investor_trend_safe(
     market_div: str = "J",
     retries: int = 3,
 ) -> pd.DataFrame:
-    """KIS 투자자별추이(FHKST01010900) 안전 래퍼."""
+    """KIS 종목별 투자자매매동향 일별(FHPTJ04160001) 안전 래퍼."""
     code = str(code).zfill(6)
     for attempt in range(max(1, retries)):
         try:
@@ -1758,9 +1758,11 @@ def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Op
             return None
 
         # 컬럼 후보(문서/응답 차이 대비)
-        # 금액/수량 모두 가능하지만, 기존은 "대금" 기반이므로 금액 우선
-        inst_cols = ["inst_tot_amt", "orgn_tot_amt", "기관합계대금", "기관합계", "inst_amt", "기관"]
-        frgn_cols = ["frgn_tot_amt", "frgn_tot_amt", "외국인합계대금", "외국인합계", "frgn_amt", "외국인"]
+        # FHPTJ04160001: frgn_ntby_tr_pbmn, orgn_ntby_tr_pbmn (백만원 단위)
+        inst_amt_cols = ["orgn_ntby_tr_pbmn", "inst_tot_amt", "orgn_tot_amt", "기관합계대금", "기관합계", "inst_amt", "기관"]
+        frgn_amt_cols = ["frgn_ntby_tr_pbmn", "frgn_tot_amt", "외국인합계대금", "외국인합계", "frgn_amt", "외국인"]
+        inst_qty_cols = ["orgn_ntby_qty"]
+        frgn_qty_cols = ["frgn_ntby_qty"]
 
         def _pick(cols: List[str]) -> Optional[str]:
             for c in cols:
@@ -1768,15 +1770,26 @@ def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Op
                     return c
             return None
 
-        c_inst = _pick(inst_cols)
-        c_frgn = _pick(frgn_cols)
+        c_inst = _pick(inst_amt_cols)
+        c_frgn = _pick(frgn_amt_cols)
+        use_qty_fallback = not c_inst or not c_frgn
+        if use_qty_fallback:
+            c_inst = _pick(inst_qty_cols)
+            c_frgn = _pick(frgn_qty_cols)
         if not c_inst or not c_frgn:
+            logger.debug("[%s] 수급 컬럼 매핑 실패: %s", ticker, list(df_flow.columns))
             return None
 
         out = df_flow.rename(columns={c_inst: "기관합계", c_frgn: "외국인합계"})
         out = out[["기관합계", "외국인합계"]].copy()
         out["기관합계"] = pd.to_numeric(out["기관합계"], errors="coerce").fillna(0)
         out["외국인합계"] = pd.to_numeric(out["외국인합계"], errors="coerce").fillna(0)
+        # KIS FHPTJ04160001 금액 필드는 백만원 단위
+        if c_inst in {"orgn_ntby_tr_pbmn"} or c_frgn in {"frgn_ntby_tr_pbmn"}:
+            out["기관합계"] = out["기관합계"] * 1_000_000
+            out["외국인합계"] = out["외국인합계"] * 1_000_000
+        if "stck_bsop_date" in df_flow.columns:
+            out = out.assign(_date=df_flow["stck_bsop_date"].astype(str)).sort_values("_date").drop(columns=["_date"])
         return out.tail(days_lookback)
     except Exception as e:
         logger.debug("[%s] 투자자별 수급 조회 실패: %s", ticker, str(e))
@@ -2391,7 +2404,7 @@ def _calculate_scores_for_ticker(
             exclude_reasons.append("LOW_FLOW")
         if momentum_score < mom_min:
             exclude_reasons.append("LOW_MOMENTUM")
-        if growth_score <= growth_min:
+        if growth_min > 0 and growth_score < growth_min:
             exclude_reasons.append("LOW_GROWTH")
 
         name_val = fin_info.get("Name", "")

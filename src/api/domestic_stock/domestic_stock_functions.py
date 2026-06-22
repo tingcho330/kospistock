@@ -602,20 +602,23 @@ class DomesticStock:
         fid_cond_mrkt_div_code: str,
         fid_input_iscd: str,
         fid_input_date_1: str,
-        fid_input_date_2: str,
+        fid_input_date_2: str = "",
     ) -> pd.DataFrame:
         """
-        주식 투자자별 추이 (외국인/기관 등)
-        - TR: FHKST01010900
-        - URL(문서 기준): /uapi/domestic-stock/v1/quotations/foreign-institution-total
+        종목별 투자자매매동향(일별) — 외국인/기관 순매수
+        - TR: FHPTJ04160001
+        - URL: /uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily
+        - FID_INPUT_DATE_1: 기준일(YYYYMMDD). output2에 과거 일별 데이터 반환.
         """
-        url = f"{self.url_base}/uapi/domestic-stock/v1/quotations/foreign-institution-total"
-        tr_id = "FHKST01010900"
+        base_date = (fid_input_date_2 or fid_input_date_1 or "").strip()
+        url = f"{self.url_base}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
+        tr_id = "FHPTJ04160001"
         params = {
             "FID_COND_MRKT_DIV_CODE": fid_cond_mrkt_div_code,
             "FID_INPUT_ISCD": fid_input_iscd,
-            "FID_INPUT_DATE_1": fid_input_date_1,
-            "FID_INPUT_DATE_2": fid_input_date_2,
+            "FID_INPUT_DATE_1": base_date,
+            "FID_ORG_ADJ_PRC": "0",
+            "FID_ETC_CLS_CODE": "0",
         }
         try:
             res = self.request_get(url, headers={"tr_id": tr_id}, params=params, timeout=10)
@@ -623,7 +626,13 @@ class DomesticStock:
                 logger.debug("투자자추이 실패(status=%s, ticker=%s): %s", res.status_code, fid_input_iscd, res.text[:200])
                 return pd.DataFrame()
             data = res.json()
-            out = data.get("output") or data.get("output2") or []
+            if str(data.get("rt_cd", "")) not in ("", "0"):
+                logger.debug(
+                    "투자자추이 응답 오류(ticker=%s): rt_cd=%s msg=%s",
+                    fid_input_iscd, data.get("rt_cd"), data.get("msg1"),
+                )
+                return pd.DataFrame()
+            out = data.get("output2") or data.get("output") or []
             if not out:
                 return pd.DataFrame()
             return pd.DataFrame(out)
