@@ -290,14 +290,32 @@ def compute_momentum_score(
     index_close: Optional[pd.Series],
     cfg: Dict[str, Any],
 ) -> float:
-    """중기 모멘텀 점수 (0~1)."""
+    """모멘텀 점수 (0~1). relative_strength_mode=primary 시 KOSPI 대비 RS 기반."""
     mom_params = cfg.get("momentum_params", {}) if isinstance(cfg.get("momentum_params"), dict) else {}
     periods = mom_params.get("periods_days", [20, 60, 120])
-    weights = mom_params.get("period_weights", [0.45, 0.35, 0.20])
+    weights = mom_params.get("period_weights", [0.40, 0.35, 0.25])
     if len(weights) != len(periods):
         weights = [1.0 / len(periods)] * len(periods)
 
-    parts: List[float] = []
+    rs_mode = str(mom_params.get("relative_strength_mode", "primary")).lower()
+    use_rs = bool(mom_params.get("relative_to_index", False)) or rs_mode == "primary"
+
+    if use_rs and index_close is not None and len(index_close) >= 21:
+        parts: List[float] = []
+        wsum = 0.0
+        for period, w in zip(periods, weights):
+            stock_ret = _period_return(close, int(period))
+            idx_ret = _period_return(index_close, int(period))
+            if stock_ret is None or idx_ret is None:
+                continue
+            rs = stock_ret - idx_ret
+            parts.append(float(w) * _clip_score(rs * 5 + 0.5))
+            wsum += float(w)
+        if wsum > 0:
+            return _clip_score(sum(parts) / wsum)
+        return 0.0
+
+    parts = []
     wsum = 0.0
     for period, w in zip(periods, weights):
         ret = _period_return(close, int(period))
@@ -305,18 +323,9 @@ def compute_momentum_score(
             continue
         parts.append(float(w) * _clip_score(ret * 5 + 0.5))
         wsum += float(w)
-
     if wsum <= 0:
         return 0.0
-
     score = sum(parts) / wsum
-
-    if mom_params.get("relative_to_index", False) and index_close is not None and len(index_close) >= 61:
-        stock_60 = _period_return(close, 60)
-        idx_60 = _period_return(index_close, 60)
-        if stock_60 is not None and idx_60 is not None:
-            rel = stock_60 - idx_60
-            score = _clip_score(0.85 * score + 0.15 * _clip_score(rel * 5 + 0.5))
 
     if mom_params.get("use_return_accel_bonus", False):
         mid_long = _period_return(close, 120)
@@ -328,8 +337,22 @@ def compute_momentum_score(
     return _clip_score(score)
 
 
+def _extract_op_profit_absolute(fin_row: Optional[Dict[str, Any]]) -> Optional[float]:
+    """KIS 재무비율 행에서 영업이익 절대값 추출."""
+    if not fin_row:
+        return None
+    for key in (
+        "bsop_prfi", "bsop_prti", "bsop_cprfi", "operating_profit",
+        "BSOP_PRFI", "BSOP_PRTI",
+    ):
+        val = _to_float_safe(fin_row.get(key))
+        if val is not None:
+            return val
+    return None
+
+
 def compute_growth_score(fin_ratio: Optional[Dict[str, Any]], cfg: Dict[str, Any]) -> float:
-    """실적 성장률 점수 (KIS financial-ratio)."""
+    """실적 성장률 기본 점수 (KIS financial-ratio, 보너스 미포함)."""
     if not fin_ratio:
         return 0.0
     gp = cfg.get("growth_params", {}) if isinstance(cfg.get("growth_params"), dict) else {}
@@ -344,6 +367,124 @@ def compute_growth_score(fin_ratio: Optional[Dict[str, Any]], cfg: Dict[str, Any
         + ow * _growth_rate_to_score(bsop, -30.0, 80.0)
         + ew * _growth_rate_to_score(ntin, -30.0, 80.0)
     )
+
+
+def compute_growth_score_with_bonus(
+    fin_ratio_now: Optional[Dict[str, Any]],
+    fin_ratio_prev: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[float, float, bool]:
+    """
+    성장 점수 + 영업이익 흑자전환 보너스.
+
+    Returns:
+        (growth_score, growth_bonus, op_profit_turnaround)
+    """
+    base = compute_growth_score(fin_ratio_now, cfg)
+    gp = cfg.get("growth_params", {}) if isinstance(cfg.get("growth_params"), dict) else {}
+    bonus = 0.0
+    turnaround = False
+    if gp.get("turnaround_bonus_enabled", True):
+        op_now = _extract_op_profit_absolute(fin_ratio_now)
+        op_prev = _extract_op_profit_absolute(fin_ratio_prev)
+        if op_prev is not None and op_now is not None and op_prev < 0 and op_now > 0:
+            bonus = float(gp.get("turnaround_bonus", 0.05))
+            turnaround = True
+    score = _clip_score(base + bonus)
+    return score, bonus, turnaround
+
+
+def _breakout_gate_reason(
+    breakout_score: float,
+    pos52w: float,
+    br_min: float,
+    pos_min: float,
+) -> str:
+    br_ok = float(breakout_score) >= br_min
+    pos_ok = float(pos52w) >= pos_min
+    if br_ok and pos_ok:
+        return "breakout_and_pos52w"
+    if br_ok:
+        return "breakout"
+    if pos_ok:
+        return "pos52w"
+    return "none"
+
+
+def filter_breakout_gate_tiered(
+    df: pd.DataFrame,
+    cfg: Dict[str, Any],
+    *,
+    min_count: int = 20,
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Breakout/Pos52w Tiered Fallback 게이트.
+
+    Tier 1: Break>=0.25 OR Pos52w>=0.90
+    Tier 2: Break>=0.20 OR Pos52w>=0.85
+    Tier 3: Break>=0.15 OR Pos52w>=0.80
+
+    min_count 이상이 되는 가장 엄격한 tier에서 종료.
+    """
+    if df is None or df.empty:
+        return df, 0
+
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    if not bp.get("require_breakout_gate", True):
+        out = df.copy()
+        out["gate_tier"] = 0
+        out["gate_reason"] = "gate_disabled"
+        return out, 0
+
+    default_tiers = [
+        {"tier": 1, "min_breakout_score": 0.25, "min_pos52w": 0.90},
+        {"tier": 2, "min_breakout_score": 0.20, "min_pos52w": 0.85},
+        {"tier": 3, "min_breakout_score": 0.15, "min_pos52w": 0.80},
+    ]
+    tiers = bp.get("gate_tiers", default_tiers)
+    if not isinstance(tiers, list) or not tiers:
+        tiers = default_tiers
+
+    br_col = "BreakoutScore" if "BreakoutScore" in df.columns else None
+    pos_col = "Pos52w" if "Pos52w" in df.columns else None
+    if br_col is None or pos_col is None:
+        out = df.copy()
+        out["gate_tier"] = 0
+        out["gate_reason"] = "missing_columns"
+        return out, 0
+
+    result: Optional[pd.DataFrame] = None
+    selected_tier = 0
+
+    for tier_cfg in sorted(tiers, key=lambda t: int(t.get("tier", 99))):
+        tier = int(tier_cfg.get("tier", 0))
+        br_min = float(tier_cfg.get("min_breakout_score", 0.25))
+        pos_min = float(tier_cfg.get("min_pos52w", 0.90))
+        mask = (pd.to_numeric(df[br_col], errors="coerce").fillna(0) >= br_min) | (
+            pd.to_numeric(df[pos_col], errors="coerce").fillna(0) >= pos_min
+        )
+        candidate = df.loc[mask].copy()
+        if candidate.empty:
+            continue
+        candidate["gate_tier"] = tier
+        candidate["gate_reason"] = candidate.apply(
+            lambda r: _breakout_gate_reason(
+                r.get(br_col, 0), r.get(pos_col, 0), br_min, pos_min,
+            ),
+            axis=1,
+        )
+        result = candidate
+        selected_tier = tier
+        if len(candidate) >= min_count:
+            break
+
+    if result is None:
+        out = df.iloc[0:0].copy()
+        out["gate_tier"] = pd.Series(dtype=int)
+        out["gate_reason"] = pd.Series(dtype=str)
+        return out, 0
+
+    return result, selected_tier
 
 
 def compute_fin_score_extended(

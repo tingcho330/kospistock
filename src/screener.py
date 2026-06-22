@@ -48,16 +48,18 @@ from screener_core import (
     get_cached_index_close,
     compute_flow_score,
     compute_momentum_score,
-    compute_growth_score,
+    compute_growth_score_with_bonus,
     compute_fin_score_extended,
     compute_breakout_score,
     compute_total_score_7axis,
     compute_foreign_holding_change_score,
+    filter_breakout_gate_tiered,
+    get_historical_prices,
 )
 from portfolio_allocator import allocate_portfolio_weights
 
 # ─────── 스키마 메타 ───────
-SCHEMA_VERSION = "1.3"  # Output schema pinned
+SCHEMA_VERSION = "1.4"  # Output schema pinned
 
 # ─────── 캐시 버전 키 ───────
 # 버그 수정으로 기존 캐시를 강제 무효화해야 할 때 버전을 올린다(파일명에 포함됨).
@@ -387,24 +389,35 @@ def _kis_financial_ratio_safe(
 
 def _fetch_financial_ratio_row(code: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """최신 결산 1기 재무비율 행 반환."""
+    pair = _fetch_financial_ratio_pair(code, cfg, periods=1)
+    return pair[0] if pair else None
+
+
+def _fetch_financial_ratio_pair(
+    code: str,
+    cfg: Dict[str, Any],
+    *,
+    periods: int = 2,
+) -> Optional[List[Dict[str, Any]]]:
+    """최신 N기 재무비율 행 반환 (0=최신, 1=직전기)."""
     kis = _KIS_INSTANCE
     if kis is None:
         return None
     kis_data = cfg.get("kis_data", {}) if isinstance(cfg.get("kis_data"), dict) else {}
     div = str(kis_data.get("financial_div_cls_code", "0"))
-    cache_key = f"{str(code).zfill(6)}_{div}"
-    cached = cache_load("kis_fin", cache_key)
-    if cached is not None:
+    cache_key = f"{str(code).zfill(6)}_{div}_p{periods}"
+    cached = cache_load("kis_fin_pair", cache_key)
+    if cached is not None and isinstance(cached, list):
         return cached
     df = _kis_financial_ratio_safe(kis, code, div_cls_code=div)
     if df is None or df.empty:
         return None
-    row = df.iloc[0].to_dict()
+    rows = [df.iloc[i].to_dict() for i in range(min(periods, len(df)))]
     try:
-        cache_save("kis_fin", cache_key, row)
+        cache_save("kis_fin_pair", cache_key, rows)
     except Exception:
         pass
-    return row
+    return rows
 
 
 def _prescore_ticker(
@@ -413,20 +426,30 @@ def _prescore_ticker(
     fin_info: pd.Series,
     cfg: Dict[str, Any],
 ) -> Optional[float]:
-    """경량 프리스코어 (OHLCV 없이 flow/fin/growth)."""
+    """경량 프리스코어 (Flow + Momentum RS + Growth + Liquidity)."""
     flow_df = get_investor_flow(code, date_str, cfg=cfg)
     flow_score, flow_ok = compute_flow_score(flow_df, cfg)
     if not flow_ok:
         return None
 
-    fin_ratio = _fetch_financial_ratio_row(code, cfg)
-    growth_score = compute_growth_score(fin_ratio, cfg)
-    per_val = fin_info.get("PER") if "PER" in fin_info.index else fin_info.get("per")
-    pbr_val = fin_info.get("PBR") if "PBR" in fin_info.index else fin_info.get("pbr")
-    roe_val = fin_ratio.get("roe_val") if fin_ratio else None
-    debt_val = fin_ratio.get("lblt_rate") if fin_ratio else None
-    marcap = float(fin_info.get("Marcap", 0) or 0)
-    fin_score = compute_fin_score_extended(per_val, pbr_val, roe_val, cfg, marcap, debt_ratio=debt_val)
+    fin_pair = _fetch_financial_ratio_pair(code, cfg, periods=2)
+    fin_ratio_now = fin_pair[0] if fin_pair else None
+    fin_ratio_prev = fin_pair[1] if fin_pair and len(fin_pair) > 1 else None
+    growth_score, _, _ = compute_growth_score_with_bonus(fin_ratio_now, fin_ratio_prev, cfg)
+
+    momentum_score = 0.0
+    try:
+        end_dt = datetime.strptime(str(date_str), "%Y%m%d")
+        start_dt = end_dt - timedelta(days=200)
+        df_px = get_historical_prices(
+            code, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"), kis=_KIS_INSTANCE,
+        )
+        if df_px is not None and not df_px.empty and "Close" in df_px.columns:
+            index_key = cfg.get("kis_data", {}).get("index_code_kospi", "0001")
+            index_close = get_cached_index_close(str(index_key))
+            momentum_score = compute_momentum_score(df_px["Close"], index_close, cfg)
+    except Exception as ex:
+        logger.debug("[%s] prescore momentum 실패: %s", code, ex)
 
     prescore_cfg = cfg.get("prescore", {}) if isinstance(cfg.get("prescore"), dict) else {}
     weights = prescore_cfg.get("weights", {}) if isinstance(prescore_cfg.get("weights"), dict) else {}
@@ -435,10 +458,10 @@ def _prescore_ticker(
     liquidity = min(1.0, amt5 / min_amt) if min_amt > 0 else 0.5
 
     return (
-        float(weights.get("flow", 0.35)) * flow_score
-        + float(weights.get("fin", 0.25)) * fin_score
-        + float(weights.get("growth", 0.25)) * growth_score
-        + float(weights.get("price_liquidity", 0.15)) * min(1.0, liquidity)
+        float(weights.get("flow", 0.40)) * flow_score
+        + float(weights.get("momentum", 0.30)) * momentum_score
+        + float(weights.get("growth", 0.20)) * growth_score
+        + float(weights.get("price_liquidity", 0.10)) * min(1.0, liquidity)
     )
 
 
@@ -2433,13 +2456,17 @@ def _calculate_scores_for_ticker(
                 pbr_val = 1.5
             logger.debug(f"[{code}] PBR 결측(0/NaN) → 추정값 {pbr_val} 사용")
 
-        fin_ratio = _fetch_financial_ratio_row(code, cfg)
+        fin_pair = _fetch_financial_ratio_pair(code, cfg, periods=2)
+        fin_ratio = fin_pair[0] if fin_pair else None
+        fin_ratio_prev = fin_pair[1] if fin_pair and len(fin_pair) > 1 else None
         roe_val = fin_ratio.get("roe_val") if fin_ratio else None
         debt_val = fin_ratio.get("lblt_rate") if fin_ratio else None
         fin_score = compute_fin_score_extended(
             per_val, pbr_val, roe_val, cfg, float(marcap or 0), debt_ratio=debt_val,
         )
-        growth_score = compute_growth_score(fin_ratio, cfg)
+        growth_score, growth_bonus, op_turnaround = compute_growth_score_with_bonus(
+            fin_ratio, fin_ratio_prev, cfg,
+        )
 
         sector_name = str(fin_info.get("Sector", "N/A")) if "Sector" in fin_info else "N/A"
         sector_score = float(sector_trends.get(sector_name, 0.5))
@@ -2551,6 +2578,8 @@ def _calculate_scores_for_ticker(
             "FlowScore": round(float(flow_score), 4),
             "MomentumScore": round(float(momentum_score), 4),
             "GrowthScore": round(float(growth_score), 4),
+            "GrowthBonus": round(float(growth_bonus), 4),
+            "OpProfitTurnaround": bool(op_turnaround),
             "BreakoutScore": round(float(breakout_score), 4),
             "FinScore": round(float(fin_score), 4),
             "TechScore": round(float(tech_score), 4),
@@ -2978,6 +3007,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         n_after_flow = n_scored_total
         n_after_momentum = n_scored_total
         n_after_vol = n_scored_total
+        n_after_breakout_gate = n_scored_total
+        applied_gate_tier = 0
 
         # 1) 최소 점수 임계값 필터
         min_score_threshold = screener_params.get("min_score_threshold", 0.0)
@@ -3029,6 +3060,21 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         if portfolio_cfg.get("target_positions"):
             top_n = int(portfolio_cfg.get("target_positions", top_n))
         sector_cap = float(screener_params.get("sector_cap", 0.25))
+
+        # 5) Breakout Gate (Tiered Fallback)
+        if screener_params.get("breakout_params", {}).get("require_breakout_gate", True):
+            before = len(df_sorted)
+            _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
+            df_sorted, applied_gate_tier = filter_breakout_gate_tiered(
+                df_sorted, screener_params, min_count=top_n,
+            )
+            n_after_breakout_gate = len(df_sorted)
+            logger.info(
+                "Breakout Gate (gate_tier=%s): %d → %d 종목",
+                applied_gate_tier, before, len(df_sorted),
+            )
+            _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
+            _log_dropped(f"최종:BreakoutGate(tier{applied_gate_tier})", _before_tickers, _after_tickers)
         
         # 다양화 (Ticker 컬럼 없으면 인덱스를 Ticker로 사용)
         if "Ticker" not in df_sorted.columns and len(df_sorted.columns) > 0:
@@ -3045,6 +3091,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 (f"FlowScore≥{flow_min:.2f}", n_after_flow),
                 (f"MomentumScore≥{mom_min:.2f}", n_after_momentum),
                 ("변동성 필터", n_after_vol),
+                (f"BreakoutGate(tier{applied_gate_tier})", n_after_breakout_gate),
                 (f"섹터다양화(top{top_n})", len(final_candidates_base)),
             ],
         )
@@ -3075,7 +3122,11 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         per_cap = float(settings.get("trading_params", {}).get("per_ticker_max_weight", 0.08))
         cand_records = final_candidates.to_dict(orient="records")
         weighted = allocate_portfolio_weights(
-            cand_records, mode=weight_mode, per_ticker_cap=per_cap if per_cap < 1.0 else None,
+            cand_records,
+            mode=weight_mode,
+            per_ticker_cap=per_cap if per_cap < 1.0 else None,
+            rank_tiers=portfolio_cfg.get("rank_tiers"),
+            normalize_weights=bool(portfolio_cfg.get("normalize_weights", True)),
         )
         final_candidates = pd.DataFrame(weighted)
         if not final_candidates.empty and "Ticker" in final_candidates.columns:
@@ -3117,7 +3168,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "손절가", "목표가", "source", "stop_price", "target_price", "levels_source",
             "MA50", "MA200", "Score",
             "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
-            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D", "target_weight", "exclude_reasons",
+            "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D",
+            "target_weight", "GrowthBonus", "OpProfitTurnaround", "gate_tier", "gate_reason",
+            "exclude_reasons",
         ]
         keep = [c for c in cols if c in final_candidates.columns]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]

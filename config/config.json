@@ -28,10 +28,10 @@
       "enabled": true,
       "max_candidates": 50,
       "weights": {
-        "flow": 0.35,
-        "fin": 0.25,
-        "growth": 0.25,
-        "price_liquidity": 0.15
+        "flow": 0.40,
+        "momentum": 0.30,
+        "growth": 0.20,
+        "price_liquidity": 0.10
       }
     },
     "kis_data": {
@@ -64,14 +64,17 @@
         0.35,
         0.25
       ],
-      "relative_to_index": false,
+      "relative_to_index": true,
+      "relative_strength_mode": "primary",
       "min_momentum_score": 0.0
     },
     "growth_params": {
       "revenue_yoy_weight": 0.30,
       "op_profit_yoy_weight": 0.40,
       "eps_yoy_weight": 0.30,
-      "min_growth_score": 0.0
+      "min_growth_score": 0.0,
+      "turnaround_bonus_enabled": true,
+      "turnaround_bonus": 0.05
     },
     "fin_params": {
       "roe_weight": 0.35,
@@ -87,10 +90,46 @@
       "proximity_weight": 0.50,
       "volume_growth_weight": 0.30,
       "box_breakout_weight": 0.20,
-      "box_lookback_days": 60
+      "box_lookback_days": 60,
+      "require_breakout_gate": true,
+      "gate_tiers": [
+        {
+          "tier": 1,
+          "min_breakout_score": 0.25,
+          "min_pos52w": 0.90
+        },
+        {
+          "tier": 2,
+          "min_breakout_score": 0.20,
+          "min_pos52w": 0.85
+        },
+        {
+          "tier": 3,
+          "min_breakout_score": 0.15,
+          "min_pos52w": 0.80
+        }
+      ]
     },
     "portfolio": {
-      "weight_mode": "equal",
+      "weight_mode": "rank_tier",
+      "normalize_weights": true,
+      "rank_tiers": [
+        {
+          "rank_from": 1,
+          "rank_to": 5,
+          "weight": 0.07
+        },
+        {
+          "rank_from": 6,
+          "rank_to": 10,
+          "weight": 0.05
+        },
+        {
+          "rank_from": 11,
+          "rank_to": 20,
+          "weight": 0.035
+        }
+      ],
       "target_positions": 20,
       "rebalance_frequency": "weekly",
       "rebalance_weekday": "monday",
