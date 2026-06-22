@@ -536,6 +536,40 @@ def compute_near_high_penalty(
     return 0.0, reasons
 
 
+def apply_weak_breakout_score_multiplier(
+    score: float,
+    breakout_score: float,
+    cfg: Dict[str, Any],
+) -> Tuple[float, float, List[str]]:
+    """
+    BreakoutScore가 매우 낮으면 최종 Score에 곱셈 감점 (누적).
+    Br<0.10 → ×0.95, Br<0.05 → 추가 ×0.90
+    """
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    br = float(breakout_score)
+    s = float(score)
+    mult = 1.0
+    reasons: List[str] = []
+    tiers = bp.get("weak_breakout_penalty_tiers")
+    if isinstance(tiers, list) and tiers:
+        for t in sorted(tiers, key=lambda x: float(x.get("max_breakout", 0)), reverse=True):
+            br_max = float(t.get("max_breakout", 0.10))
+            if br < br_max:
+                mult *= float(t.get("multiplier", 1.0))
+                reason = str(t.get("reason", "weak_breakout"))
+                if reason not in reasons:
+                    reasons.append(reason)
+    else:
+        if br < 0.10:
+            mult *= 0.95
+            reasons.append("weak_breakout")
+        if br < 0.05:
+            mult *= 0.90
+    if mult >= 1.0:
+        return s, 1.0, []
+    return max(0.0, min(1.0, s * mult)), mult, reasons
+
+
 def compute_conviction_score(
     flow_score: float,
     momentum_score: float,

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""스크리너 게이트·가산점·패널티·비중 로직 리플레이 및 검증 (오프라인)."""
+"""스크리너 게이트·가산/감점·Conviction 비중·거래대금 시나리오 리플레이."""
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from collections import Counter
@@ -15,6 +16,7 @@ from screener_core import (
     filter_breakout_gate_tiered,
     compute_breakout_score_bonus,
     compute_near_high_penalty,
+    apply_weak_breakout_score_multiplier,
     compute_conviction_score,
     build_rank_reasons,
     build_selection_summary,
@@ -29,47 +31,52 @@ def _load_cfg() -> dict:
             full = json.load(f)
         sp = full.get("screener_params", {})
         return sp if isinstance(sp, dict) else {}
-    return {
-        "breakout_gate": {
-            "pos52w_solo_min_breakout": 0.05,
-            "tiers": [
-                {"breakout": 0.25, "pos52w": 0.90},
-                {"breakout": 0.20, "pos52w": 0.85},
-            ],
-        },
-        "breakout_params": {"require_breakout_gate": True},
-        "top_n": 20,
-    }
+    return {"top_n": 20, "breakout_params": {"require_breakout_gate": True}}
+
+
+def _estimate_score_base(row: pd.Series) -> float:
+    if "ScoreBase" in row.index and pd.notna(row.get("ScoreBase")):
+        return float(row["ScoreBase"])
+    score = float(row.get("Score", 0) or 0)
+    bonus = float(row.get("BreakoutBonus", 0) or 0)
+    nh = float(row.get("NearHighPenalty", 0) or 0)
+    wmult = float(row.get("WeakBreakoutMultiplier", 1) or 1)
+    if wmult > 0 and wmult < 1.0 and nh == 0 and bonus == 0:
+        return score / wmult
+    return score - bonus + nh
 
 
 def _apply_score_adjustments(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     out = df.copy()
-    base_col = "ScoreBase" if "ScoreBase" in out.columns else "Score"
-    if base_col == "Score" and "ScoreBase" not in out.columns:
-        out["ScoreBase"] = out["Score"]
+    out["ScoreBase"] = out.apply(_estimate_score_base, axis=1)
 
-    bonuses, penalties, penalty_reasons, convictions = [], [], [], []
+    bonuses, nh_penalties, weak_mults, penalty_reasons, convictions, scores = [], [], [], [], [], []
     for _, row in out.iterrows():
         br = float(row.get("BreakoutScore", 0) or 0)
         pos = float(row.get("Pos52w", 0) or 0)
         flow = float(row.get("FlowScore", 0) or 0)
         mom = float(row.get("MomentumScore", 0) or 0)
         growth = float(row.get("GrowthScore", 0) or 0)
+        base = float(row.get("ScoreBase", 0) or 0)
         bonus = compute_breakout_score_bonus(br, cfg)
-        pen, preason = compute_near_high_penalty(pos, br, cfg)
+        nh_pen, preason = compute_near_high_penalty(pos, br, cfg)
+        subtotal = max(0.0, min(1.0, base + bonus - nh_pen))
+        final, wmult, wreasons = apply_weak_breakout_score_multiplier(subtotal, br, cfg)
+        reasons = list(preason or [])
+        reasons.extend(wreasons)
         bonuses.append(bonus)
-        penalties.append(pen)
-        penalty_reasons.append(preason)
-        convictions.append(
-            compute_conviction_score(flow, mom, br, growth, cfg)
-        )
+        nh_penalties.append(nh_pen)
+        weak_mults.append(wmult)
+        penalty_reasons.append(reasons)
+        convictions.append(compute_conviction_score(flow, mom, br, growth, cfg))
+        scores.append(final)
 
     out["BreakoutBonus"] = bonuses
-    out["NearHighPenalty"] = penalties
+    out["NearHighPenalty"] = nh_penalties
+    out["WeakBreakoutMultiplier"] = weak_mults
     out["penalty_reason"] = penalty_reasons
     out["ConvictionScore"] = convictions
-    base = pd.to_numeric(out.get("ScoreBase", out["Score"]), errors="coerce").fillna(0)
-    out["Score"] = (base + out["BreakoutBonus"] - out["NearHighPenalty"]).clip(lower=0, upper=1.0)
+    out["Score"] = scores
 
     if "rank_reason" not in out.columns:
         out["rank_reason"] = out.apply(
@@ -91,72 +98,128 @@ def _apply_score_adjustments(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return out
 
 
-def _print_gate_tier_counts(df: pd.DataFrame, cfg: dict, label: str) -> None:
-    tiers = cfg.get("breakout_gate", {}).get("tiers") or cfg.get("breakout_params", {}).get("gate_tiers", [])
-    pos_solo = float(
-        cfg.get("breakout_gate", {}).get("pos52w_solo_min_breakout")
-        or cfg.get("breakout_params", {}).get("pos52w_solo_min_breakout", 0.05)
+def _allocate(top: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    portfolio_cfg = cfg.get("portfolio", {}) if isinstance(cfg.get("portfolio"), dict) else {}
+    max_w = float(
+        portfolio_cfg.get("max_weight")
+        or portfolio_cfg.get("per_ticker_max_weight", 0.075)
     )
-    print(f"\n[{label}] tier별 통과 후보 수 (n={len(df)})")
-    for i, t in enumerate(tiers, start=1):
-        br = float(t.get("breakout", t.get("min_breakout_score", 0)))
-        pos = float(t.get("pos52w", t.get("min_pos52w", 0)))
-        n = (
-            (df["BreakoutScore"] >= br)
-            | ((df["Pos52w"] >= pos) & (df["BreakoutScore"] >= pos_solo))
-        ).sum()
-        print(f"  Tier {i}: Br>={br}, Pos>={pos} (solo Br>={pos_solo}) → {n}종")
+    min_w = float(portfolio_cfg.get("min_weight", 0.02))
+    ranked = allocate_portfolio_weights(
+        top.to_dict(orient="records"),
+        mode=str(portfolio_cfg.get("weight_mode", "conviction")),
+        per_ticker_cap=max_w,
+        min_ticker_weight=min_w,
+        max_ticker_weight=max_w,
+        rank_tiers=portfolio_cfg.get("rank_tiers"),
+        normalize_weights=bool(portfolio_cfg.get("normalize_weights", True)),
+    )
+    return pd.DataFrame(ranked)
 
 
-def _penalty_applied(series: pd.Series) -> pd.Series:
-    return series.apply(lambda x: isinstance(x, list) and len(x) > 0)
+def _run_pipeline(df: pd.DataFrame, cfg: dict, label: str) -> pd.DataFrame:
+    baseline_br = df["BreakoutScore"].mean() if len(df) else 0.0
+    print(f"\n{'='*60}\n[{label}] n={len(df)}")
+    if len(df) == 0:
+        return df
+    scored = _apply_score_adjustments(df, cfg)
+    gated, tier = filter_breakout_gate_tiered(
+        scored, cfg, min_count=int(cfg.get("top_n", 20)),
+    )
+    print(f"  Breakout Gate: tier={tier}, 생존={len(gated)}")
+    top_n = int(cfg.get("top_n", 20))
+    top = gated.sort_values("Score", ascending=False).head(top_n)
+    top = _allocate(top, cfg)
+    _print_validation(top, baseline_br_mean=baseline_br, label=label)
+    return top
 
 
-def _print_validation(top: pd.DataFrame, baseline_br_mean: float | None = None) -> None:
+def _has_weak_penalty(reasons) -> bool:
+    return isinstance(reasons, list) and "weak_breakout" in reasons
+
+
+def _print_validation(
+    top: pd.DataFrame,
+    *,
+    baseline_br_mean: float | None = None,
+    label: str = "검증",
+) -> None:
     n = len(top)
     if n == 0:
-        print("\n[검증] 최종 후보 0건")
+        print(f"  [{label}] 최종 후보 0건")
         return
 
+    br_lt_10 = (top["BreakoutScore"] < 0.10).sum()
+    weak_pen_n = top["penalty_reason"].apply(_has_weak_penalty).sum() if "penalty_reason" in top.columns else 0
     br_mean = top["BreakoutScore"].mean()
-    bonus_n = (top["BreakoutBonus"] > 0).sum()
-    penalty_n = _penalty_applied(top.get("penalty_reason", pd.Series(dtype=object))).sum()
-    conv_top5 = top.nlargest(min(5, n), "ConvictionScore")["ConvictionScore"].mean()
+    flow_mean = top["FlowScore"].mean()
+    conv_top5 = top.nlargest(min(5, n), "ConvictionScore")
 
-    print("\n[검증] Top 품질")
+    print(f"  Breakout<0.10: {br_lt_10}종")
+    print(f"  WeakBreakoutPenalty 적용: {weak_pen_n}종")
     print(f"  BreakoutScore 평균: {br_mean:.3f}", end="")
-    if baseline_br_mean is not None and baseline_br_mean > 0:
+    if baseline_br_mean and baseline_br_mean > 0:
         pct = (br_mean / baseline_br_mean - 1) * 100
-        ok_br = "✓" if pct >= 10 else "✗"
-        print(f" (기준 {baseline_br_mean:.3f} 대비 {pct:+.1f}%, 목표 +10% {ok_br})")
+        print(f" (입력 대비 {pct:+.1f}%)")
     else:
         print()
-    print(f"  FlowScore 평균: {top['FlowScore'].mean():.3f}")
+    print(f"  FlowScore 평균: {flow_mean:.3f}")
     print(f"  MomentumScore 평균: {top['MomentumScore'].mean():.3f}")
-    print(f"  BreakoutBonus 적용: {bonus_n}종 (목표 5+ {'✓' if bonus_n >= 5 else '✗'})")
-    print(f"  NearHighPenalty 적용: {penalty_n}종 (목표 2~5 {'✓' if 2 <= penalty_n <= 5 else '✗'})")
-    print(f"  ConvictionScore 상위5 평균: {conv_top5:.3f} (목표 0.80+ {'✓' if conv_top5 >= 0.80 else '✗'})")
 
     if "gate_tier" in top.columns:
-        print(f"  gate_tier 분포: {dict(Counter(top['gate_tier']))}")
+        print(f"  gate_tier: {dict(Counter(top['gate_tier']))}")
 
-    print("\n[ConvictionScore 상위 5]")
+    print("\n  [Conviction 상위 5]")
     cols = ["Ticker", "Name", "ConvictionScore", "Score", "BreakoutScore", "target_weight"]
     show = [c for c in cols if c in top.columns]
-    print(top.nlargest(5, "ConvictionScore")[show].to_string(index=False))
+    print(conv_top5[show].to_string(index=False))
 
     if "target_weight" in top.columns:
-        print("\n[종목별 최종 비중]")
-        for _, r in top.sort_values("Score", ascending=False).iterrows():
+        wmax = top["target_weight"].max()
+        wmin = top["target_weight"].min()
+        print(f"\n  비중 분포: min={wmin:.4f} max={wmax:.4f} sum={top['target_weight'].sum():.4f}")
+        top_conv = conv_top5.iloc[0] if len(conv_top5) else None
+        if top_conv is not None and "target_weight" in top_conv:
             print(
-                f"  {r.get('Ticker')} {r.get('Name')}: "
-                f"w={float(r.get('target_weight', 0)):.4f} Score={float(r.get('Score', 0)):.4f}"
+                f"  Conviction 1위({top_conv.get('Ticker')}) 비중={float(top_conv.get('target_weight', 0)):.4f}"
             )
 
 
+def _compare_amount5d(df: pd.DataFrame, cfg: dict) -> None:
+    if "Amount5D" not in df.columns:
+        print("\n[Amount5D 시나리오] Amount5D 컬럼 없음 — 전체 풀 JSON 필요")
+        return
+    amt = pd.to_numeric(df["Amount5D"], errors="coerce").fillna(0)
+    cases = [
+        ("Case A (200억)", 20_000_000_000),
+        ("Case B (300억)", 30_000_000_000),
+    ]
+    print("\n[Amount5D 시나리오 비교]")
+    for name, threshold in cases:
+        sub = df.loc[amt >= threshold].copy()
+        print(f"  {name}: 후보 {len(sub)}종 (≥{threshold:,})")
+    for name, threshold in cases:
+        sub = df.loc[amt >= threshold].copy()
+        if sub.empty:
+            continue
+        _run_pipeline(sub, cfg, label=name)
+
+
 def main() -> int:
-    default_candidates = Path.home() / "Downloads/screener_candidates_full_20260622_KOSPI (2).json"
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_candidates
+    parser = argparse.ArgumentParser(description="스크리너 리플레이·검증")
+    parser.add_argument("path", nargs="?", help="screener JSON 경로")
+    parser.add_argument(
+        "--amount5d-test",
+        action="store_true",
+        help="Amount5D 200억 vs 300억 시나리오 비교",
+    )
+    args = parser.parse_args()
+
+    defaults = [
+        Path.home() / "Downloads/screener_candidates_full_20260622_KOSPI.json",
+        Path.home() / "Downloads/screener_candidates_full_20260622_KOSPI (2).json",
+    ]
+    path = Path(args.path) if args.path else next((p for p in defaults if p.exists()), defaults[0])
     if not path.exists():
         print(f"파일 없음: {path}")
         return 1
@@ -166,49 +229,32 @@ def main() -> int:
     df = pd.DataFrame(rows)
     for col in (
         "BreakoutScore", "Pos52w", "Score", "MomentumScore", "FlowScore",
-        "GrowthScore", "FinScore", "SectorScore",
+        "GrowthScore", "FinScore", "SectorScore", "Amount5D",
     ):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # 기존 Score에서 bonus/penalty 역산해 base 추정 (이전 스키마 호환)
-    if "BreakoutBonus" in df.columns and "NearHighPenalty" not in df.columns:
-        df["ScoreBase"] = df["Score"] - pd.to_numeric(df["BreakoutBonus"], errors="coerce").fillna(0)
-    elif "NearHighPenalty" not in df.columns:
-        df["ScoreBase"] = df["Score"]
-
-    baseline_br_mean = df["BreakoutScore"].mean()
     print(f"입력: {path.name} ({len(df)}종)")
-    _print_gate_tier_counts(df, cfg, "입력 풀")
-
-    df = _apply_score_adjustments(df, cfg)
-    gated, tier = filter_breakout_gate_tiered(df, cfg, min_count=int(cfg.get("top_n", 20)))
-    print(f"\nTiered Fallback: applied_tier={tier}, 생존={len(gated)}종")
-
-    top_n = int(cfg.get("top_n", 20))
-    top = gated.sort_values("Score", ascending=False).head(top_n)
-
-    portfolio_cfg = cfg.get("portfolio", {}) if isinstance(cfg.get("portfolio"), dict) else {}
-    per_cap = float(portfolio_cfg.get("per_ticker_max_weight", 0.075))
-    ranked = allocate_portfolio_weights(
-        top.to_dict(orient="records"),
-        mode=str(portfolio_cfg.get("weight_mode", "rank_tier")),
-        per_ticker_cap=per_cap,
-        rank_tiers=portfolio_cfg.get("rank_tiers"),
-        normalize_weights=bool(portfolio_cfg.get("normalize_weights", True)),
+    print(
+        f"  운영 Amount5D 기준: {cfg.get('min_trading_value_5d_avg', 20_000_000_000):,} "
+        f"(config 변경 없음, 리플레이만)"
     )
-    top = pd.DataFrame(ranked)
+    print(f"  weight_mode: {cfg.get('portfolio', {}).get('weight_mode', 'conviction')}")
 
-    _print_validation(top, baseline_br_mean=baseline_br_mean)
+    if args.amount5d_test:
+        _compare_amount5d(df, cfg)
+        return 0
 
-    if len(top) > 0 and "selection_summary" in top.columns:
-        print("\nselection_summary 샘플:")
-        for _, r in top.head(3).iterrows():
-            print(f"  {r.get('Ticker')}: {r.get('selection_summary')}")
+    _run_pipeline(df, cfg, label="기본 리플레이")
 
-    wsum = sum(float(r.get("target_weight", 0) or 0) for r in ranked)
-    wmax = max((float(r.get("target_weight", 0) or 0) for r in ranked), default=0)
-    print(f"\nRank weight sum={wsum:.6f}, max={wmax:.4f} (cap={per_cap})")
+    if "Amount5D" in df.columns and len(df) >= 50:
+        print("\n[참고] --amount5d-test 로 200억/300억 시나리오 비교 가능")
+    elif len(df) < 50:
+        print(
+            f"\n[참고] 입력 {len(df)}종 — 1차 풀(118종) 대비 후보군 축소 검증은 "
+            "전체 스코어 풀 JSON 또는 Amount5D 포함 데이터 필요"
+        )
+
     return 0
 
 

@@ -37,7 +37,7 @@
 
 | 단계 | 설명 |
 |------|------|
-| 스크리닝 | 7축 점수·Breakout Gate·프리스코어로 Top 20 후보 생성 (`rank_tier` 목표 비중) |
+| 스크리닝 | 7축 점수·Breakout Gate·프리스코어로 Top 20 후보 생성 (`ConvictionScore` 기반 `target_weight`) |
 | 뉴스 수집 | 네이버 검색 API + 스크래핑 |
 | 분석 | OpenAI GPT 또는 휴리스틱(키 없을 때) |
 | 매매 | KIS Open API 매수/매도 (`target_weight` 기반 사이징) |
@@ -58,9 +58,9 @@
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·매매 파이프라인·잔액·체결확인·리컨실·요약 담당
 - **KOSPI 7축 스크리닝** — Flow 25% · RS Momentum 25% · Growth 15% · Breakout 15% · Fin 10% · Mkt 5% · Sector 5% (Tech 0%, 진입 보조만)
 - **Breakout Gate (2단)** — Tier1 `Br≥0.25 OR Pos≥0.90` → 부족 시 Tier2 `Br≥0.20 OR Pos≥0.85` 종료 (Tier3 없음). Pos52w 단독 통과 시 `Breakout≥0.05` 필수
-- **스코어 조정** — 강한 돌파 가산점(`BreakoutBonus` 최대 +0.08), 고점 근처·약한 돌파 감점(`NearHighPenalty` 최대 −0.05)
-- **확신도·해석 필드** — `ConvictionScore`, `rank_reason`, `selection_summary`, `penalty_reason`, `gate_tier` / `gate_reason` (후보 JSON schema **1.6**)
-- **포트폴리오 비중** — `rank_tier` (1~5위 7% / 6~10위 5% / 11~20위 3.5%, 정규화) + 종목당 상한 **7.5%** (`per_ticker_max_weight`)
+- **스코어 조정** — `BreakoutBonus`(최대 +0.08), `NearHighPenalty`(최대 −0.05), `WeakBreakoutPenalty`(Br<0.10 ×0.95, Br<0.05 추가 ×0.90)
+- **확신도·해석 필드** — `ConvictionScore`, `rank_reason`, `selection_summary`, `penalty_reason`, `WeakBreakoutMultiplier`, `gate_tier` / `gate_reason` (후보 JSON schema **1.7**)
+- **포트폴리오 비중** — `weight_mode: conviction` (`ConvictionScore` 비례, min **2%** / max **7.5%**). `rank_tier` 모드도 config로 선택 가능
 - **다단계 스크리닝** — 1차 유동성 필터 → 프리스코어(50종) → 상세 스코어링 → 변동성·게이트·섹터 다양화 (`--debug` 시 퍼널 로그)
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — 1차 필터(뉴스·점수) → 전술 계획(차트·패턴·예산 가드) 2단계. `OPENAI_API_KEY` 없으면 휴리스틱 폴백. 1차 필터 탈락 시 `gpt_trades_*.json`에 **`결정: "미진입"`** 기록(탈락 사유·`initial_filter` 메타 포함). `trader.py`는 **`결정 == "매수"`** 만 실행
@@ -188,7 +188,8 @@ screener.py                            health_check.py
 **최종 Score 조정 (게이트 이전):**
 
 ```
-Score = clamp(0, 1, 7축합 + BreakoutBonus − NearHighPenalty)
+subtotal = clamp(0, 1, 7축합 + BreakoutBonus − NearHighPenalty)
+Score    = subtotal × WeakBreakoutMultiplier
 ```
 
 | 조정 | 조건 | 값 |
@@ -196,23 +197,49 @@ Score = clamp(0, 1, 7축합 + BreakoutBonus − NearHighPenalty)
 | BreakoutBonus | Br≥0.40 / 0.60 / 0.80 | +0.03 / +0.05 / +0.08 |
 | NearHighPenalty | Pos≥0.90 & Br<0.10 | −0.05 |
 | NearHighPenalty | Pos≥0.85 & Br<0.15 | −0.03 |
+| WeakBreakoutMultiplier | Br<0.10 | ×0.95 |
+| WeakBreakoutMultiplier | Br<0.05 (누적) | ×0.90 |
 
 **Breakout Gate (후보 필터, 최대 2단):**
 
 1. Tier1: `Breakout≥0.25` OR (`Pos52w≥0.90` AND `Breakout≥0.05`)
 2. Tier2 (후보<20 시): `Breakout≥0.20` OR (`Pos52w≥0.85` AND `Breakout≥0.05`) → **종료**
 
-**ConvictionScore** (비중·해석 보조, Score와 별도):
+**ConvictionScore** (비중 산정·해석):
 
 ```
 0.40×Flow + 0.30×Momentum + 0.20×Breakout + 0.10×Growth
 ```
 
-**후보 JSON 주요 필드 (schema 1.6):** `Score`, `target_weight`, `BreakoutBonus`, `NearHighPenalty`, `penalty_reason`, `ConvictionScore`, `gate_tier`, `gate_reason`, `rank_reason`, `selection_summary`
+**목표 비중 (`portfolio_allocator.py`):**
+
+| `weight_mode` | 설명 |
+|---------------|------|
+| `conviction` (기본) | `ConvictionScore / Σ` 후 min/max 클립·재정규화 |
+| `rank_tier` | 순위 구간 고정 비중 (7% / 5% / 3.5%) |
+| `equal` / `score_proportional` | 균등·Score 비례 |
+
+```json
+"portfolio": {
+  "weight_mode": "conviction",
+  "min_weight": 0.02,
+  "max_weight": 0.075
+}
+```
+
+**후보 JSON 주요 필드 (schema 1.7):** `Score`, `target_weight`, `BreakoutBonus`, `NearHighPenalty`, `WeakBreakoutMultiplier`, `penalty_reason`, `ConvictionScore`, `gate_tier`, `gate_reason`, `rank_reason`, `selection_summary`
 
 `rank_reason` 태그 예: `high_flow`, `high_rs`, `breakout`, `new_high`, `near_high`, `high_growth`, `turnaround`, `sector_leader`, `high_quality`
 
-오프라인 검증: `python scripts/replay_screener_logic.py [screener_candidates_full_*.json]`
+**오프라인 검증:**
+
+```bash
+# 기본 리플레이 (게이트·감점·Conviction 비중)
+python scripts/replay_screener_logic.py output/screener_candidates_full_YYYYMMDD_KOSPI.json
+
+# 거래대금 200억 vs 300억 시나리오 (Amount5D 컬럼 필요, 운영값 변경 없음)
+python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
+```
 
 **`PIPELINE_SCRIPTS` (의존성 순):**
 
@@ -393,7 +420,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 |------|------|
 | `screener.py` | 종목 스크리닝 CLI (`--market KOSPI`, `--debug`) |
 | `screener_core.py` | 7축·RS·Growth Bonus·Breakout Gate·가산/감점·Conviction·`MarketState` |
-| `portfolio_allocator.py` | `rank_tier` / equal / score_proportional 목표 비중 + `per_ticker_max_weight` 캡 |
+| `portfolio_allocator.py` | `conviction` / `rank_tier` / equal / score_proportional 목표 비중 |
 | `kis_master.py` | KIS `.mst` 마스터 다운로드·캐시 |
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
@@ -654,8 +681,9 @@ docker compose exec integrated_manager python /app/run_integrated_manager.py --s
 # 스크리너만
 docker compose exec integrated_manager python -u /app/src/screener.py --market KOSPI --debug
 
-# 스크리너 로직 오프라인 리플레이 (게이트·가산/감점·비중 검증)
+# 스크리너 로직 오프라인 리플레이 (게이트·감점·Conviction 비중·Amount5D 시나리오)
 python scripts/replay_screener_logic.py output/screener_candidates_full_YYYYMMDD_KOSPI.json
+python scripts/replay_screener_logic.py --amount5d-test output/screener_candidates_full_YYYYMMDD_KOSPI.json
 
 # 파이프라인 단계만 (스크리너 결과가 output/에 있어야 함)
 docker compose exec integrated_manager python -u /app/src/health_check.py

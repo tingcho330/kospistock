@@ -113,6 +113,10 @@
         {"min_pos52w": 0.90, "max_breakout": 0.10, "penalty": 0.05, "reason": "near_high_without_breakout"},
         {"min_pos52w": 0.85, "max_breakout": 0.15, "penalty": 0.03, "reason": "near_high_without_breakout"}
       ],
+      "weak_breakout_penalty_tiers": [
+        {"max_breakout": 0.10, "multiplier": 0.95, "reason": "weak_breakout"},
+        {"max_breakout": 0.05, "multiplier": 0.90, "reason": "weak_breakout"}
+      ],
       "score_bonus_tiers": [
         {"min": 0.40, "bonus": 0.03},
         {"min": 0.60, "bonus": 0.05},
@@ -139,8 +143,10 @@
       "growth_weight": 0.10
     },
     "portfolio": {
-      "weight_mode": "rank_tier",
+      "weight_mode": "conviction",
       "normalize_weights": true,
+      "min_weight": 0.02,
+      "max_weight": 0.075,
       "per_ticker_max_weight": 0.075,
       "rank_tiers": [
         {

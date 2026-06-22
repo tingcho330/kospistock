@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""포트폴리오 목표 비중 배분 (equal / score_proportional / rank_tier)."""
+"""포트폴리오 목표 비중 배분 (equal / score_proportional / rank_tier / conviction)."""
 
 from __future__ import annotations
 
@@ -45,11 +45,47 @@ def _apply_per_ticker_cap(weights: List[float], cap: float) -> List[float]:
     return w
 
 
+def _apply_weight_bounds(
+    weights: List[float],
+    min_w: float,
+    max_w: float,
+) -> List[float]:
+    """min/max 클립 후 합=1 재정규화 (반복)."""
+    if not weights:
+        return weights
+    min_w = max(0.0, float(min_w))
+    max_w = max(min_w, float(max_w))
+    w = [float(x) for x in weights]
+    n = len(w)
+    for _ in range(n + 3):
+        w = _apply_per_ticker_cap(w, max_w)
+        below = [i for i, x in enumerate(w) if x < min_w - 1e-12]
+        if not below:
+            break
+        deficit = sum(min_w - w[i] for i in below)
+        for i in below:
+            w[i] = min_w
+        above = [i for i, x in enumerate(w) if w[i] > min_w + 1e-12]
+        if not above or deficit <= 0:
+            break
+        above_sum = sum(w[i] for i in above)
+        if above_sum <= 0:
+            break
+        for i in above:
+            w[i] = max(min_w, w[i] - deficit * (w[i] / above_sum))
+        wsum = sum(w)
+        if wsum > 0:
+            w = [x / wsum for x in w]
+    return w
+
+
 def allocate_portfolio_weights(
     candidates: List[Dict[str, Any]],
     *,
     mode: str = "equal",
     per_ticker_cap: Optional[float] = None,
+    min_ticker_weight: Optional[float] = None,
+    max_ticker_weight: Optional[float] = None,
     rank_tiers: Optional[List[Dict[str, Any]]] = None,
     normalize_weights: bool = True,
 ) -> List[Dict[str, Any]]:
@@ -58,16 +94,35 @@ def allocate_portfolio_weights(
 
     mode:
       - equal: 1/N
-      - score_proportional: Score 비례 (합=1), per_ticker_cap 적용 후 재정규화
-      - rank_tier: Score 순위 구간별 고정 비중 (normalize_weights로 100% 정규화)
+      - score_proportional: Score 비례 (합=1)
+      - rank_tier: Score 순위 구간별 고정 비중
+      - conviction: ConvictionScore 비례 (min/max_weight 적용)
     """
     if not candidates:
         return []
 
     n = len(candidates)
     out: List[Dict[str, Any]] = [dict(c) for c in candidates]
+    max_w = max_ticker_weight if max_ticker_weight is not None else per_ticker_cap
+    min_w = min_ticker_weight
 
-    if mode == "rank_tier":
+    if mode == "conviction":
+        convictions = [
+            max(0.0, float(c.get("ConvictionScore", 0) or 0))
+            for c in out
+        ]
+        total = sum(convictions)
+        if total <= 0:
+            weights = [1.0 / n] * n
+        else:
+            weights = [c / total for c in convictions]
+        floor = float(min_w) if min_w is not None else 0.0
+        cap = float(max_w) if max_w is not None and max_w > 0 else 1.0
+        if floor > 0 or (max_w is not None and cap < 1.0):
+            weights = _apply_weight_bounds(weights, floor, cap)
+        for c, w in zip(out, weights):
+            c["target_weight"] = round(float(w), 6)
+    elif mode == "rank_tier":
         tiers = rank_tiers or [
             {"rank_from": 1, "rank_to": 5, "weight": 0.07},
             {"rank_from": 6, "rank_to": 10, "weight": 0.05},
@@ -101,10 +156,9 @@ def allocate_portfolio_weights(
         for c, w in zip(out, weights):
             c["target_weight"] = round(float(w), 6)
 
-    if per_ticker_cap is not None and per_ticker_cap > 0:
-        cap = float(per_ticker_cap)
+    if mode != "conviction" and max_w is not None and max_w > 0:
         weights = [float(c.get("target_weight", 0)) for c in out]
-        weights = _apply_per_ticker_cap(weights, cap)
+        weights = _apply_per_ticker_cap(weights, float(max_w))
         for c, w in zip(out, weights):
             c["target_weight"] = round(float(w), 6)
 
