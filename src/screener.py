@@ -1745,15 +1745,49 @@ def get_holdings_scores_from_file(date_str: str, market: str) -> Dict[str, Dict[
         return {}
 
 # ─────────── 투자자별 수급 데이터 조회 ───────────
+_FLOW_DATE_SHIFT_LOGGED = False
+
+
+def _flow_api_base_date(date_str: str) -> str:
+    """KIS FHPTJ04160001 기준일 — 장중(15:40 이전)에는 전 영업일 사용."""
+    now = datetime.now(KST)
+    try:
+        dt = datetime.strptime(date_str, "%Y%m%d").date()
+    except ValueError:
+        return date_str
+
+    if dt != now.date():
+        return date_str
+
+    if (now.hour, now.minute) >= (15, 40):
+        return date_str
+
+    for i in range(1, 10):
+        prev = dt - timedelta(days=i)
+        if is_market_open_day(prev):
+            return prev.strftime("%Y%m%d")
+    return date_str
+
+
 def get_investor_flow(ticker: str, date_str: str, days_lookback: int = 10) -> Optional[pd.DataFrame]:
     """지정된 기간 동안의 투자자별 거래대금(기관, 외국인 등)을 조회합니다."""
+    global _FLOW_DATE_SHIFT_LOGGED
     try:
         kis = _KIS_INSTANCE
         if kis is None:
             return None
-        end_date = datetime.strptime(date_str, "%Y%m%d")
-        start_date = (end_date - timedelta(days=days_lookback * 3)).strftime("%Y%m%d")  # 주말 포함 여유
-        df_flow = _kis_investor_trend_safe(kis, str(ticker).zfill(6), start_date, date_str, market_div="J", retries=3)
+        query_date = _flow_api_base_date(date_str)
+        if query_date != date_str and not _FLOW_DATE_SHIFT_LOGGED:
+            logger.info(
+                "수급 API: 장중(15:40 이전) → 기준일 %s → %s (FHPTJ04160001)",
+                date_str, query_date,
+            )
+            _FLOW_DATE_SHIFT_LOGGED = True
+        end_date = datetime.strptime(query_date, "%Y%m%d")
+        start_date = (end_date - timedelta(days=days_lookback * 3)).strftime("%Y%m%d")
+        df_flow = _kis_investor_trend_safe(
+            kis, str(ticker).zfill(6), start_date, query_date, market_div="J", retries=3,
+        )
         if df_flow is None or df_flow.empty:
             return None
 
@@ -2504,7 +2538,8 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
 
 # ─────────── 메인 실행 ───────────
 def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
-    global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE
+    global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE, _FLOW_DATE_SHIFT_LOGGED
+    _FLOW_DATE_SHIFT_LOGGED = False
     start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
