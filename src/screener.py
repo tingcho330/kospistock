@@ -659,6 +659,43 @@ _fail_stats = defaultdict(int)
 _fail_rows: List[Dict[str, Any]] = []
 _fail_lock = threading.Lock()
 
+
+def _ohlcv_index_to_epoch_ms(idx: Any) -> int:
+    """OHLCV 인덱스(YYYYMMDD str / datetime) → epoch milliseconds."""
+    if idx is None:
+        return 0
+    if isinstance(idx, pd.Timestamp):
+        return int(idx.timestamp() * 1000)
+    if isinstance(idx, datetime):
+        return int(idx.timestamp() * 1000)
+    s = str(idx).strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        try:
+            dt = datetime.strptime(s[:8], "%Y%m%d")
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            pass
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_daily_chart_records(df_price: pd.DataFrame, tail: int = 60) -> List[Dict[str, Any]]:
+    """GPT/리스크용 daily_chart records (KIS str index 호환)."""
+    records: List[Dict[str, Any]] = []
+    for _, row in df_price.tail(tail).iterrows():
+        records.append({
+            "index": _ohlcv_index_to_epoch_ms(row.name),
+            "Open": int(row["Open"]),
+            "High": int(row["High"]),
+            "Low": int(row["Low"]),
+            "Close": int(row["Close"]),
+            "Volume": int(row["Volume"]),
+        })
+    return records
+
+
 def standardize_ohlcv(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
     다양한 컬럼명(영문 소문자/한글/조정종가/변형명)을 표준 OHLCV로 매핑.
@@ -1988,16 +2025,7 @@ def _calculate_scores_for_holdings_ticker(
             target_price = current_price * 1.15  # 15% 목표
             
             # 일봉 차트 데이터 (최근 30일)
-            daily_chart_data = []
-            for i, (_, row) in enumerate(df_price.tail(30).iterrows()):
-                daily_chart_data.append({
-                    "index": int(row.name.timestamp() * 1000),
-                    "Open": int(row["Open"]),
-                    "High": int(row["High"]),
-                    "Low": int(row["Low"]),
-                    "Close": int(row["Close"]),
-                    "Volume": int(row["Volume"])
-                })
+            daily_chart_data = _build_daily_chart_records(df_price, tail=30)
             
             # 투자자별 매매동향 (최근 10일) - 일시적으로 비활성화
             df_investor_flow = None
@@ -2221,12 +2249,7 @@ def _calculate_scores_for_ticker(
         daily_chart_data = None
         if df_price is not None and not df_price.empty and len(df_price) >= 20:
             try:
-                # 최근 60일 데이터만 사용 (메모리 절약)
-                recent_data = df_price.tail(60).copy()
-                # 인덱스를 날짜로 변환
-                if hasattr(recent_data.index, 'to_pydatetime'):
-                    recent_data.index = recent_data.index.to_pydatetime()
-                daily_chart_data = recent_data.reset_index().to_dict('records')
+                daily_chart_data = _build_daily_chart_records(df_price, tail=60)
             except Exception as e:
                 logger.debug(f"[{code}] daily_chart 데이터 준비 실패: {e}")
                 daily_chart_data = None
