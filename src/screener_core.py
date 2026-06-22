@@ -81,6 +81,9 @@ def _normalize_kis_period_df(df: pd.DataFrame) -> pd.DataFrame:
         "acml_vol": "volume",
     }
     out = out.rename(columns={k: v for k, v in rename_map.items() if k in out.columns})
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
     if "date" in out.columns:
         out["date"] = out["date"].astype(str)
         out = out.sort_values("date")
@@ -817,9 +820,9 @@ def calculate_atr(df_price: pd.DataFrame, period: int = 14) -> float:
             logger.error(f"필요한 컬럼을 찾을 수 없음: {df_price.columns.tolist()}")
             return 0.0
         
-        high = df_price[high_col]
-        low = df_price[low_col]
-        close = df_price[close_col]
+        high = pd.to_numeric(df_price[high_col], errors="coerce")
+        low = pd.to_numeric(df_price[low_col], errors="coerce")
+        close = pd.to_numeric(df_price[close_col], errors="coerce")
         
         # True Range 계산
         tr1 = high - low
@@ -840,16 +843,15 @@ def calculate_atr(df_price: pd.DataFrame, period: int = 14) -> float:
 def calculate_rsi(prices: List[float], period: int = 14) -> float:
     """RSI 계산"""
     try:
+        if hasattr(prices, "iloc"):
+            prices = pd.to_numeric(prices, errors="coerce").dropna().tolist()
+        else:
+            prices = [float(p) for p in prices if p is not None and pd.notna(p)]
+
         if len(prices) < period + 1:
             return 50.0
         
-        # prices가 pandas Series인지 리스트인지 확인
-        if hasattr(prices, 'iloc'):
-            # pandas Series인 경우
-            deltas = [prices.iloc[i] - prices.iloc[i-1] for i in range(1, len(prices))]
-        else:
-            # 리스트인 경우
-            deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
         
         gains = [d if d > 0 else 0 for d in deltas]
         losses = [-d if d < 0 else 0 for d in deltas]

@@ -261,8 +261,8 @@
     "summary_send_time": "15:35"
   },
   "schedule_times": {
-    "screener_time": "10:40",
-    "pipeline_time": "10:55"
+    "screener_time": "10:55",
+    "pipeline_time": "11:10"
   },
   "monthly_maintenance": {
     "day": 1,

@@ -701,6 +701,8 @@ def standardize_ohlcv(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optiona
             out[key.capitalize()] = d[found]
 
     std = pd.DataFrame(out, index=d.index)
+    for col in std.columns:
+        std[col] = pd.to_numeric(std[col], errors="coerce")
     try:
         std = std.sort_index()
     except Exception:
