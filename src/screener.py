@@ -51,6 +51,8 @@ from screener_core import (
     compute_growth_score_with_bonus,
     compute_fin_score_extended,
     compute_breakout_score,
+    compute_breakout_score_bonus,
+    build_rank_reasons,
     compute_total_score_7axis,
     compute_foreign_holding_change_score,
     filter_breakout_gate_tiered,
@@ -59,7 +61,7 @@ from screener_core import (
 from portfolio_allocator import allocate_portfolio_weights
 
 # ─────── 스키마 메타 ───────
-SCHEMA_VERSION = "1.4"  # Output schema pinned
+SCHEMA_VERSION = "1.5"  # Output schema pinned
 
 # ─────── 캐시 버전 키 ───────
 # 버그 수정으로 기존 캐시를 강제 무효화해야 할 때 버전을 올린다(파일명에 포함됨).
@@ -2530,8 +2532,8 @@ def _calculate_scores_for_ticker(
             yey_pattern = False
             pattern_score = 0.0
 
-        # --- 7축 가중 합산 (Tech는 진입 보조, 선정 점수 제외) ---
-        total_score = compute_total_score_7axis(
+        # --- 7축 가중 합산 + Breakout 가산점 ---
+        base_score = compute_total_score_7axis(
             flow_score,
             momentum_score,
             growth_score,
@@ -2541,6 +2543,20 @@ def _calculate_scores_for_ticker(
             sector_score,
             cfg,
             tech=float(tech_score) if float(cfg.get("tech_weight", 0) or 0) > 0 else 0.0,
+        )
+        breakout_bonus = compute_breakout_score_bonus(breakout_score, cfg)
+        total_score = min(1.0, float(base_score) + float(breakout_bonus))
+        rank_reason = build_rank_reasons(
+            flow_score=float(flow_score),
+            momentum_score=float(momentum_score),
+            growth_score=float(growth_score),
+            fin_score=float(fin_score),
+            breakout_score=float(breakout_score),
+            pos52w=float(pos_52w),
+            sector_score=float(sector_score),
+            op_turnaround=bool(op_turnaround),
+            growth_bonus=float(growth_bonus),
+            cfg=cfg,
         )
 
         flow_min = float(cfg.get("flow_params", {}).get("min_flow_score", 0.25))
@@ -2581,6 +2597,7 @@ def _calculate_scores_for_ticker(
             "GrowthBonus": round(float(growth_bonus), 4),
             "OpProfitTurnaround": bool(op_turnaround),
             "BreakoutScore": round(float(breakout_score), 4),
+            "BreakoutBonus": round(float(breakout_bonus), 4),
             "FinScore": round(float(fin_score), 4),
             "TechScore": round(float(tech_score), 4),
             "MktScore": round(float(mkt_score), 4),
@@ -2605,6 +2622,7 @@ def _calculate_scores_for_ticker(
             "YEY": bool(yey_pattern),
 
             "exclude_reasons": exclude_reasons,
+            "rank_reason": rank_reason,
             "daily_chart": daily_chart_data,
             "investor_flow": df_investor_flow.reset_index().to_dict('records') if df_investor_flow is not None else None,
         }
@@ -3169,7 +3187,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             "MA50", "MA200", "Score",
             "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
             "PER", "PBR", "RSI", "ATR", "Marcap", "Amount5D",
-            "target_weight", "GrowthBonus", "OpProfitTurnaround", "gate_tier", "gate_reason",
+            "target_weight", "GrowthBonus", "OpProfitTurnaround", "BreakoutBonus",
+            "gate_tier", "gate_reason", "rank_reason",
             "exclude_reasons",
         ]
         keep = [c for c in cols if c in final_candidates.columns]

@@ -83,6 +83,19 @@
       "pbr_weight": 0.20,
       "penalize_negative_per": true
     },
+    "breakout_gate": {
+      "pos52w_solo_min_breakout": 0.05,
+      "tiers": [
+        {
+          "breakout": 0.25,
+          "pos52w": 0.90
+        },
+        {
+          "breakout": 0.20,
+          "pos52w": 0.85
+        }
+      ]
+    },
     "breakout_params": {
       "lookback_high_days": 252,
       "volume_ratio_min": 1.5,
@@ -92,6 +105,16 @@
       "box_breakout_weight": 0.20,
       "box_lookback_days": 60,
       "require_breakout_gate": true,
+      "pos52w_solo_min_breakout": 0.05,
+      "rank_breakout": 0.25,
+      "rank_new_high": 0.98,
+      "rank_near_high": 0.85,
+      "score_bonus_tiers": [
+        {"min": 0.40, "bonus": 0.02},
+        {"min": 0.60, "bonus": 0.04},
+        {"min": 0.80, "bonus": 0.06}
+      ],
+      "score_bonus_cap": 0.06,
       "gate_tiers": [
         {
           "tier": 1,
@@ -102,11 +125,6 @@
           "tier": 2,
           "min_breakout_score": 0.20,
           "min_pos52w": 0.85
-        },
-        {
-          "tier": 3,
-          "min_breakout_score": 0.15,
-          "min_pos52w": 0.80
         }
       ]
     },

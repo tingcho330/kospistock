@@ -394,14 +394,81 @@ def compute_growth_score_with_bonus(
     return score, bonus, turnaround
 
 
+def _get_gate_tier_configs(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """breakout_gate.tiers 또는 breakout_params.gate_tiers (Tier3 제외, 최대 2단)."""
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    bg = cfg.get("breakout_gate", {}) if isinstance(cfg.get("breakout_gate"), dict) else {}
+
+    raw_tiers: List[Dict[str, Any]] = []
+    if isinstance(bg.get("tiers"), list) and bg["tiers"]:
+        for i, t in enumerate(bg["tiers"], start=1):
+            if not isinstance(t, dict):
+                continue
+            raw_tiers.append({
+                "tier": int(t.get("tier", i)),
+                "min_breakout_score": float(t.get("breakout", t.get("min_breakout_score", 0.25))),
+                "min_pos52w": float(t.get("pos52w", t.get("min_pos52w", 0.90))),
+            })
+    elif isinstance(bp.get("gate_tiers"), list) and bp["gate_tiers"]:
+        for t in bp["gate_tiers"]:
+            if not isinstance(t, dict):
+                continue
+            tier_n = int(t.get("tier", 0))
+            if tier_n > 2:
+                continue
+            raw_tiers.append({
+                "tier": tier_n or len(raw_tiers) + 1,
+                "min_breakout_score": float(t.get("min_breakout_score", t.get("breakout", 0.25))),
+                "min_pos52w": float(t.get("min_pos52w", t.get("pos52w", 0.90))),
+            })
+
+    if not raw_tiers:
+        raw_tiers = [
+            {"tier": 1, "min_breakout_score": 0.25, "min_pos52w": 0.90},
+            {"tier": 2, "min_breakout_score": 0.20, "min_pos52w": 0.85},
+        ]
+
+    raw_tiers = sorted(raw_tiers, key=lambda t: int(t.get("tier", 99)))[:2]
+    for i, t in enumerate(raw_tiers, start=1):
+        t["tier"] = i
+    return raw_tiers
+
+
+def _pos_solo_min_breakout(cfg: Dict[str, Any]) -> float:
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    bg = cfg.get("breakout_gate", {}) if isinstance(cfg.get("breakout_gate"), dict) else {}
+    if "pos52w_solo_min_breakout" in bg:
+        return float(bg["pos52w_solo_min_breakout"])
+    return float(bp.get("pos52w_solo_min_breakout", 0.05))
+
+
+def _row_passes_breakout_gate(
+    breakout_score: float,
+    pos52w: float,
+    br_min: float,
+    pos_min: float,
+    pos_solo_min_br: float,
+) -> bool:
+    br = float(breakout_score)
+    pos = float(pos52w)
+    if br >= br_min:
+        return True
+    if pos >= pos_min and br >= pos_solo_min_br:
+        return True
+    return False
+
+
 def _breakout_gate_reason(
     breakout_score: float,
     pos52w: float,
     br_min: float,
     pos_min: float,
+    pos_solo_min_br: float,
 ) -> str:
-    br_ok = float(breakout_score) >= br_min
-    pos_ok = float(pos52w) >= pos_min
+    br = float(breakout_score)
+    pos = float(pos52w)
+    br_ok = br >= br_min
+    pos_ok = pos >= pos_min and br >= pos_solo_min_br
     if br_ok and pos_ok:
         return "breakout_and_pos52w"
     if br_ok:
@@ -411,6 +478,72 @@ def _breakout_gate_reason(
     return "none"
 
 
+def compute_breakout_score_bonus(breakout_score: float, cfg: Dict[str, Any]) -> float:
+    """강한 돌파 구간별 가산점 (최고 구간 1개만 적용)."""
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    br = float(breakout_score)
+    tiers = bp.get("score_bonus_tiers")
+    if isinstance(tiers, list) and tiers:
+        bonus = 0.0
+        for t in sorted(tiers, key=lambda x: float(x.get("min", 0)), reverse=True):
+            if br >= float(t.get("min", 0)):
+                bonus = float(t.get("bonus", 0))
+                break
+    else:
+        if br >= 0.80:
+            bonus = 0.06
+        elif br >= 0.60:
+            bonus = 0.04
+        elif br >= 0.40:
+            bonus = 0.02
+        else:
+            bonus = 0.0
+    cap = float(bp.get("score_bonus_cap", 0.06))
+    return min(bonus, cap)
+
+
+def build_rank_reasons(
+    *,
+    flow_score: float,
+    momentum_score: float,
+    growth_score: float,
+    fin_score: float,
+    breakout_score: float,
+    pos52w: float,
+    sector_score: float,
+    op_turnaround: bool,
+    growth_bonus: float,
+    cfg: Dict[str, Any],
+) -> List[str]:
+    """종목 선정 해석용 rank_reason 태그."""
+    bp = cfg.get("breakout_params", {}) if isinstance(cfg.get("breakout_params"), dict) else {}
+    fp = cfg.get("flow_params", {}) if isinstance(cfg.get("flow_params"), dict) else {}
+    mp = cfg.get("momentum_params", {}) if isinstance(cfg.get("momentum_params"), dict) else {}
+    gp = cfg.get("growth_params", {}) if isinstance(cfg.get("growth_params"), dict) else {}
+    finp = cfg.get("fin_params", {}) if isinstance(cfg.get("fin_params"), dict) else {}
+
+    reasons: List[str] = []
+    if float(flow_score) >= float(fp.get("rank_high_flow", 0.70)):
+        reasons.append("high_flow")
+    if float(momentum_score) >= float(mp.get("rank_high_rs", 0.70)):
+        reasons.append("high_rs")
+    if float(growth_score) >= float(gp.get("rank_high_growth", 0.80)):
+        reasons.append("high_growth")
+    if op_turnaround or float(growth_bonus) > 0:
+        reasons.append("turnaround")
+    if float(breakout_score) >= float(bp.get("rank_breakout", 0.25)):
+        reasons.append("breakout")
+    if float(pos52w) >= float(bp.get("rank_new_high", 0.98)):
+        reasons.append("new_high")
+    elif float(pos52w) >= float(bp.get("rank_near_high", 0.85)):
+        reasons.append("near_high")
+    if float(fin_score) >= float(finp.get("rank_high_quality", 0.60)):
+        reasons.append("high_quality")
+    if float(sector_score) >= float(cfg.get("rank_sector_leader", 0.85)):
+        reasons.append("sector_leader")
+    return reasons
+
+
 def filter_breakout_gate_tiered(
     df: pd.DataFrame,
     cfg: Dict[str, Any],
@@ -418,13 +551,10 @@ def filter_breakout_gate_tiered(
     min_count: int = 20,
 ) -> Tuple[pd.DataFrame, int]:
     """
-    Breakout/Pos52w Tiered Fallback 게이트.
+    Breakout/Pos52w Tiered Fallback 게이트 (최대 2단, Tier3 없음).
 
-    Tier 1: Break>=0.25 OR Pos52w>=0.90
-    Tier 2: Break>=0.20 OR Pos52w>=0.85
-    Tier 3: Break>=0.15 OR Pos52w>=0.80
-
-    min_count 이상이 되는 가장 엄격한 tier에서 종료.
+    Tier 1: Break>=0.25 OR (Pos52w>=0.90 AND Break>=pos_solo_min)
+    Tier 2: Break>=0.20 OR (Pos52w>=0.85 AND Break>=pos_solo_min)
     """
     if df is None or df.empty:
         return df, 0
@@ -436,14 +566,8 @@ def filter_breakout_gate_tiered(
         out["gate_reason"] = "gate_disabled"
         return out, 0
 
-    default_tiers = [
-        {"tier": 1, "min_breakout_score": 0.25, "min_pos52w": 0.90},
-        {"tier": 2, "min_breakout_score": 0.20, "min_pos52w": 0.85},
-        {"tier": 3, "min_breakout_score": 0.15, "min_pos52w": 0.80},
-    ]
-    tiers = bp.get("gate_tiers", default_tiers)
-    if not isinstance(tiers, list) or not tiers:
-        tiers = default_tiers
+    tiers = _get_gate_tier_configs(cfg)
+    pos_solo_min_br = _pos_solo_min_breakout(cfg)
 
     br_col = "BreakoutScore" if "BreakoutScore" in df.columns else None
     pos_col = "Pos52w" if "Pos52w" in df.columns else None
@@ -456,12 +580,15 @@ def filter_breakout_gate_tiered(
     result: Optional[pd.DataFrame] = None
     selected_tier = 0
 
-    for tier_cfg in sorted(tiers, key=lambda t: int(t.get("tier", 99))):
-        tier = int(tier_cfg.get("tier", 0))
-        br_min = float(tier_cfg.get("min_breakout_score", 0.25))
-        pos_min = float(tier_cfg.get("min_pos52w", 0.90))
-        mask = (pd.to_numeric(df[br_col], errors="coerce").fillna(0) >= br_min) | (
-            pd.to_numeric(df[pos_col], errors="coerce").fillna(0) >= pos_min
+    for tier_cfg in tiers:
+        tier = int(tier_cfg["tier"])
+        br_min = float(tier_cfg["min_breakout_score"])
+        pos_min = float(tier_cfg["min_pos52w"])
+        br_series = pd.to_numeric(df[br_col], errors="coerce").fillna(0)
+        pos_series = pd.to_numeric(df[pos_col], errors="coerce").fillna(0)
+        mask = (
+            (br_series >= br_min)
+            | ((pos_series >= pos_min) & (br_series >= pos_solo_min_br))
         )
         candidate = df.loc[mask].copy()
         if candidate.empty:
@@ -469,7 +596,7 @@ def filter_breakout_gate_tiered(
         candidate["gate_tier"] = tier
         candidate["gate_reason"] = candidate.apply(
             lambda r: _breakout_gate_reason(
-                r.get(br_col, 0), r.get(pos_col, 0), br_min, pos_min,
+                r.get(br_col, 0), r.get(pos_col, 0), br_min, pos_min, pos_solo_min_br,
             ),
             axis=1,
         )
