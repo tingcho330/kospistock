@@ -18,6 +18,7 @@ services:
       - ./src:/app/src
       - ./config:/app/config
       - ./output:/app/output
+      - ./scripts:/app/scripts
     command: python /app/run_integrated_manager.py
     deploy:
       resources:
@@ -33,6 +34,7 @@ services:
       - ./src:/app/src
       - ./config:/app/config
       - ./output:/app/output
+      - ./scripts:/app/scripts
     command: python /app/run_background_risk_manager.py
     deploy:
       resources:
