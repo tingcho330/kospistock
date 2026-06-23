@@ -168,8 +168,15 @@ class RotationManager:
             price = _to_int(h.get("prpr", 0))
             score = float(scores_map.get(ticker, 0.0))
             proceeds = price * quantity
-            
+
             if quantity > 0:
+                try:
+                    from asset_allocator import is_bond_etf
+                    if is_bond_etf(ticker, self.settings):
+                        logger.debug(f"회전 매매 제외: {name}({ticker}) - bond_etf")
+                        continue
+                except ImportError:
+                    pass
                 is_eligible, _ = sell_eligible_for_rotation(ticker, self.settings, current_time)
                 if is_eligible:
                     holding_list.append(HoldingInfo(

@@ -990,6 +990,20 @@ class RiskManager:
         """
         ticker = str(holding.get("pdno", "")).zfill(6)
         name = holding.get("prdt_name", "N/A")
+
+        try:
+            from asset_allocator import is_bond_etf
+            aa_cfg = self.config.get("asset_allocation", {}) or {}
+            if aa_cfg.get("bond_etf_exclude_from_risk_sell", True) and is_bond_etf(ticker, self.config):
+                logger.info(f"[RISK_MANAGER] {ticker} is configured as bond_etf. Skip stock risk sell rules.")
+                return (
+                    "KEEP",
+                    f"{name}({ticker}) bond_etf excluded from stock risk sell",
+                    {"type": "KEEP", "context": {"reason": "bond_etf_excluded"}},
+                )
+        except ImportError:
+            pass
+
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))  # 현재가
         avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)

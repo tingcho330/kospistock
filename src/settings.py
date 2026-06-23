@@ -30,6 +30,7 @@ class Settings:
         self._config.setdefault("screener_params", {})
         self._config.setdefault("reporting", {})
         self._config.setdefault("rotation", {})
+        self._config.setdefault("asset_allocation", {})
 
         # 섹션 핸들
         self.strategy_params: Dict[str, Any]   = self._config["strategy_params"]
@@ -41,6 +42,32 @@ class Settings:
         self.screener_params: Dict[str, Any]   = self._config["screener_params"]
         self.reporting: Dict[str, Any]         = self._config["reporting"]
         self.rotation: Dict[str, Any]          = self._config["rotation"]
+        self.asset_allocation: Dict[str, Any]  = self._config["asset_allocation"]
+
+        # ── 자산배분 기본값 ───────────────────────────────────────────
+        aa = self.asset_allocation
+        aa.setdefault("enabled", False)
+        aa.setdefault("stock_target_weight", 0.70)
+        aa.setdefault("bond_target_weight", 0.20)
+        aa.setdefault("cash_target_weight", 0.10)
+        aa.setdefault("min_cash_weight", 0.05)
+        aa.setdefault("rebalance_tolerance", 0.03)
+        aa.setdefault("hard_rebalance_tolerance", 0.05)
+        aa.setdefault("sell_to_rebalance_enabled", False)
+        aa.setdefault("buy_only_rebalance_enabled", True)
+        aa.setdefault("bond_buy_enabled", True)
+        aa.setdefault("bond_sell_enabled", False)
+        aa.setdefault("stock_buy_block_when_overweight", True)
+        aa.setdefault("bond_etf_exclude_from_risk_sell", True)
+        aa.setdefault("bond_etf_exclude_from_rotation", True)
+        aa.setdefault("bond_etf_include_in_emergency_liquidation", False)
+        aa.setdefault("bond_etfs", [
+            {
+                "ticker": "459580",
+                "name": "KODEX CD금리액티브(합성)",
+                "target_weight": 1.0,
+            }
+        ])
 
         # ── 기본 전략 파라미터(기존) ─────────────────────────────────
         self.strategy_params.setdefault("atr_k_stop", 2.0)

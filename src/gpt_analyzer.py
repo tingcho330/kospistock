@@ -1133,6 +1133,12 @@ def run_pipeline(
                 suggestions = []
                 for h in holdings:
                     t = str(h.get("pdno", "")).zfill(6)
+                    try:
+                        from asset_allocator import is_bond_etf
+                        if is_bond_etf(t, cfg):
+                            continue
+                    except ImportError:
+                        pass
                     n = h.get("prdt_name", "N/A")
                     qty = int(h.get("hldg_qty", 0) or 0)
                     px = float(h.get("prpr", 0) or 0)

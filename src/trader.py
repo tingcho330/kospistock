@@ -47,6 +47,12 @@ from utils import (
 from api.kis_auth import KIS
 from risk_manager import RiskManager
 from settings import settings
+from asset_allocator import (
+    AllocationResult,
+    compute_allocation,
+    calculate_final_bond_buy_budget,
+    is_bond_etf,
+)
 from rotation_manager import RotationManager
 from rotation_policy import (
     apply_rotation_policy,
@@ -275,6 +281,20 @@ class Trader:
         self.volatility_threshold = float(self.dynamic_cash_config.get("volatility_threshold", 0.25))
         self.rebalance_frequency_hours = int(self.dynamic_cash_config.get("rebalance_frequency_hours", 6))
         self._last_cash_rebalance = 0  # 마지막 현금 리밸런싱 시간
+        self.asset_allocation_cfg = self.settings.get("asset_allocation", {}) or {}
+        self.asset_allocation_enabled = bool(self.asset_allocation_cfg.get("enabled", False))
+        if self.asset_allocation_enabled:
+            logger.info(
+                "[ASSET_ALLOCATION] config enabled=true "
+                f"(env={self.env}, real_trading={self.is_real_trading})"
+            )
+            if self.is_real_trading and not self._asset_allocation_prod_allowed():
+                logger.warning(
+                    "[ASSET_ALLOCATION] prod 실계좌 + enabled=true: "
+                    "모의(vps) 검증 전까지 run_buy_logic 차단. "
+                    "실계좌 적용 시 ASSET_ALLOCATION_ALLOW_PROD=1 필요"
+                )
+        self._last_allocation: Optional[AllocationResult] = None
         self.gpt_analysis_expansion = self.settings.get("gpt_params", {}).get("analysis_expansion", {})
         self._gpt_hold_decisions = set()  # GPT 보류 결정 추적
         self._analysis_log = []  # 분석 과정 로그
@@ -714,8 +734,11 @@ class Trader:
         dn = cash_map.get("dnca_tot_amt", 0)
         tot = cash_map.get("tot_evlu_amt", 0)
 
-        # 동적 현금 관리 적용
-        if self.dynamic_cash_enabled:
+        # 동적 현금 관리 적용 (asset_allocation.enabled 시 우회)
+        skip_dynamic_cash = self.asset_allocation_enabled
+        if skip_dynamic_cash and self.dynamic_cash_enabled:
+            logger.info("[ASSET_ALLOCATION] enabled=true; skip dynamic_cash_management")
+        if self.dynamic_cash_enabled and not skip_dynamic_cash:
             total_value = sum(_to_int(h.get("evlu_amt", 0)) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0) + available_cash
             adjusted_cash = self._apply_dynamic_cash_management(available_cash, total_value)
             
@@ -2908,6 +2931,8 @@ class Trader:
         for h in holdings:
             if _to_int(h.get("hldg_qty", 0)) > 0:
                 ticker = str(h.get("pdno", "")).zfill(6)
+                if is_bond_etf(ticker, self.settings):
+                    continue
                 value = _to_int(h.get("evlu_amt", 0))
                 weight = value / total_value
                 ticker_weights[ticker] = weight
@@ -4130,6 +4155,172 @@ class Trader:
             logger.warning(f"연속 손실 체크 실패: {e}")
             return True, ""  # 오류 시 안전하게 통과
 
+    def _count_stock_holding_slots(self, holdings: List[Dict]) -> int:
+        tickers = {
+            str(h.get("pdno", "")).zfill(6)
+            for h in holdings
+            if _to_int(h.get("hldg_qty", 0)) > 0
+            and not is_bond_etf(str(h.get("pdno", "")), self.settings)
+        }
+        return len(tickers)
+
+    def _asset_allocation_prod_allowed(self) -> bool:
+        """prod 실계좌에서 asset_allocation 주문 허용 여부 (Phase 6 fail-safe)."""
+        if not self.asset_allocation_enabled:
+            return True
+        if not self.is_real_trading:
+            return True
+        flag = os.getenv("ASSET_ALLOCATION_ALLOW_PROD", "").strip().lower()
+        return flag in ("1", "true", "yes")
+
+    def _resolve_stock_buy_budget(
+        self, available_cash: int, holdings: List[Dict]
+    ) -> Tuple[int, AllocationResult]:
+        allocation = compute_allocation(available_cash, holdings, self.settings)
+        self._last_allocation = allocation
+        if allocation.enabled:
+            self._log_asset_allocation(allocation)
+            return allocation.stock_buy_budget, allocation
+        return available_cash, allocation
+
+    def _remaining_cash_after_stock_buy(
+        self,
+        prev_remaining: int,
+        kis_cash: int,
+        *,
+        allocation: AllocationResult,
+        spent: int,
+    ) -> int:
+        """주식 매수 체결 후 다음 매수에 쓸 잔여 예산 (enabled 시 stock_buy_budget 상한 유지)."""
+        if not allocation.enabled:
+            return kis_cash
+        return min(kis_cash, max(0, prev_remaining - max(0, spent)))
+
+    def _log_asset_allocation(self, allocation: AllocationResult) -> None:
+        def _pct(w: float) -> str:
+            return f"{w * 100:.1f}%"
+
+        logger.info(
+            "[ASSET_ALLOCATION]\n"
+            f"총자산: {allocation.total_asset:,}원\n"
+            f"주식 평가액: {allocation.stock_value:,}원 ({_pct(allocation.stock_weight)})\n"
+            f"459580 평가액: {allocation.bond_value:,}원 ({_pct(allocation.bond_weight)})\n"
+            f"현재 가용 현금: {allocation.cash_value:,}원 ({_pct(allocation.cash_weight)})\n"
+            f"------------------------------------\n"
+            f"목표 주식 금액: {allocation.target_stock_value:,}원\n"
+            f"목표 459580 금액: {allocation.target_bond_value:,}원\n"
+            f"목표 현금: {allocation.target_cash_value:,}원\n"
+            f"최소 보전 현금(5%): {allocation.min_cash_amount:,}원\n"
+            f"stock_buy_budget: {allocation.stock_buy_budget:,}원\n"
+            f"initial_bond_buy_budget: {allocation.initial_bond_buy_budget:,}원\n"
+            f"can_buy_stock: {allocation.can_buy_stock}\n"
+            f"can_buy_bond: {allocation.can_buy_bond}\n"
+            f"reason: {allocation.reason}"
+        )
+        stock_ok = "가능" if allocation.can_buy_stock else "불가"
+        bond_ok = "가능" if allocation.can_buy_bond else "불가"
+        _notify_text(
+            f"[ASSET_ALLOCATION] 주식({stock_ok}) / 459580({bond_ok}) | "
+            f"stock_budget={allocation.stock_buy_budget:,} bond_initial={allocation.initial_bond_buy_budget:,}",
+            key=f"phase:asset_alloc:{self.run_id}",
+            cooldown=120,
+        )
+
+    def _buy_bond_etf_if_needed(self, allocation: AllocationResult) -> None:
+        cfg = self.asset_allocation_cfg
+        if not allocation.enabled or not cfg.get("bond_buy_enabled", True):
+            return
+        if not self._asset_allocation_prod_allowed():
+            logger.error(
+                "[ASSET_ALLOCATION_POST_STOCK_ORDER] prod 459580 매수 차단 "
+                "(ASSET_ALLOCATION_ALLOW_PROD=1 필요)"
+            )
+            return
+        if allocation.initial_bond_buy_budget <= 0 and not allocation.can_buy_bond:
+            return
+
+        bond_items = cfg.get("bond_etfs") or []
+        if not bond_items:
+            logger.warning("[ASSET_ALLOCATION_POST_STOCK_ORDER] bond_etfs 설정 없음 → 459580 매수 스킵")
+            return
+        bond_item = bond_items[0] if isinstance(bond_items[0], dict) else {"ticker": bond_items[0]}
+        ticker = str(bond_item.get("ticker", "459580")).zfill(6)
+        name = bond_item.get("name", ticker)
+
+        time.sleep(1.5)
+        post_stock_cash, _, _ = self._load_snapshot()
+        final_budget = calculate_final_bond_buy_budget(
+            allocation.initial_bond_buy_budget,
+            post_stock_cash,
+            allocation.min_cash_amount,
+        )
+
+        order_result = "skipped"
+        current_price = 0
+        order_qty = 0
+
+        if final_budget <= 0:
+            order_result = "skipped_zero_budget"
+        else:
+            price_info = self._get_realtime_price_with_quotes(ticker)
+            if not price_info:
+                order_result = "skipped_price_fetch_failed"
+            else:
+                current_price = _to_int(price_info.get("current_price", 0))
+                bid_price = _to_int(price_info.get("bid_price", 0)) or current_price
+                ask_price = _to_int(price_info.get("ask_price", 0)) or current_price
+                if current_price <= 0:
+                    order_result = "skipped_invalid_price"
+                else:
+                    buffer = self._eff_buffer()
+                    effective_budget = int(final_budget * (1 - max(0.0, self.fee_buffer_pct)))
+                    qty_est = int(effective_budget // current_price)
+                    qty_est = self._cap_qty_by_fee_buffer(qty_est, current_price, final_budget)
+                    order_price = self._calculate_dynamic_order_price(
+                        current_price, bid_price, ask_price, max(1, qty_est)
+                    )
+                    if order_price <= 0:
+                        order_result = "skipped_order_price"
+                    else:
+                        order_qty = int((int(final_budget * (1 - max(0.0, self.fee_buffer_pct))) // order_price))
+                        order_qty = self._cap_qty_by_fee_buffer(order_qty, order_price, final_budget)
+                        if order_qty < 1:
+                            order_result = "skipped_qty_lt_1"
+                        elif self.min_order_cash > 0 and (order_qty * order_price) < self.min_order_cash:
+                            order_result = "skipped_min_order_cash"
+                        elif not self.is_real_trading:
+                            order_result = "paper_executed"
+                            logger.info(
+                                f"[모의] {name}({ticker}) {order_qty}주 @{order_price:,}원 459580 매수 [{final_budget:,}원 한도]"
+                            )
+                        else:
+                            result = self._order_cash_retry(
+                                ord_dv="02",
+                                pdno=ticker,
+                                ord_dvsn="00",
+                                ord_qty=str(order_qty),
+                                ord_unpr=str(int(order_price)),
+                            )
+                            if result.get("ok"):
+                                order_result = "executed"
+                                self.stats["buy"] += 1
+                            else:
+                                order_result = f"failed:{result.get('msg1', 'unknown')}"
+                                logger.warning(
+                                    f"[ASSET_ALLOCATION_POST_STOCK_ORDER] 459580 주문 실패: {result.get('msg1')}"
+                                )
+
+        logger.info(
+            "[ASSET_ALLOCATION_POST_STOCK_ORDER]\n"
+            f"initial_bond_buy_budget: {allocation.initial_bond_buy_budget:,}원\n"
+            f"post_stock_cash: {post_stock_cash:,}원\n"
+            f"min_cash_amount: {allocation.min_cash_amount:,}원\n"
+            f"final_bond_buy_budget: {final_budget:,}원\n"
+            f"459580 current_price: {current_price:,}원\n"
+            f"459580 order_qty: {order_qty}주\n"
+            f"459580 order_result: {order_result}"
+        )
+
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):
         # [NEW] 매수 로직 활성화 여부 체크
         if not self.trading_params.get("buy_enabled", True):
@@ -4139,6 +4330,24 @@ class Trader:
         
         logger.info(f"--------- 신규/추가 매수 로직 실행 (가용 예산: {available_cash:,} 원) ---------")
         self._rotation_pairs_done_this_run = 0
+
+        stock_budget, allocation = self._resolve_stock_buy_budget(available_cash, holdings)
+        if allocation.enabled and not self._asset_allocation_prod_allowed():
+            logger.error(
+                "[ASSET_ALLOCATION] prod 실계좌 차단 → run_buy_logic 종료 "
+                "(vps 검증 후 ASSET_ALLOCATION_ALLOW_PROD=1)"
+            )
+            _notify_text(
+                "⚠️ asset_allocation prod 차단 — vps 먼저 검증",
+                key=f"phase:asset_alloc_prod_block:{self.run_id}",
+                cooldown=300,
+            )
+            return
+        if allocation.enabled:
+            logger.info(f"주식 매수 예산(stock_buy_budget): {stock_budget:,}원 (raw cash: {available_cash:,}원)")
+            if stock_budget <= 0:
+                logger.info("[ASSET_ALLOCATION] stock_buy_budget=0 → 주식 매수 스킵")
+        buy_cash = stock_budget
 
         # Phase 2: 일일 손실 제한 체크
         daily_loss_ok, daily_loss_msg = self._check_daily_loss_limit()
@@ -4172,7 +4381,7 @@ class Trader:
 
         # 동적 슬롯 축소 (초기 계산)
         if self.trading_guards.get("auto_shrink_slots", False):
-            effective_slots = self._compute_effective_slots(available_cash)
+            effective_slots = self._compute_effective_slots(buy_cash)
         else:
             effective_slots = self.max_positions
 
@@ -4213,37 +4422,46 @@ class Trader:
         min_order = int(self.trading_params.get("min_order_cash", 0))
 
         candidates_all = list(self.all_stock_data.values())
-        affordable = [c for c in candidates_all if _to_int(c.get("Price", 0)) <= int(available_cash * (1 - buffer))]
+        affordable = [c for c in candidates_all if _to_int(c.get("Price", 0)) <= int(buy_cash * (1 - buffer))]
 
         # 통계 로그(참고용) — 필터에는 min_order_cash를 사용하지 않음
-        log_affordability_stats(available_cash, buffer, candidates_all, min_order_cash=min_order)
+        log_affordability_stats(buy_cash, buffer, candidates_all, min_order_cash=min_order)
 
         if self.screener_params.get("affordability_filter", False) and not affordable:
             # LOW_FUNDS 전에 회전 시도. 단, rotation.enabled=false이면 회전 매매를 절대 실행하지 않음
             if not self._is_rotation_enabled():
                 cheapest = min((_to_int(c.get("Price", 0)) for c in candidates_all), default=0)
                 self._set_summary_reason("SKIPPED_LOW_FUNDS_ROTATION_DISABLED",
-                                         f"cheapest={cheapest:,} cash={available_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
+                                         f"cheapest={cheapest:,} cash={buy_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
                 logger.info("가용 예산 부족 & 회전매매 비활성화 → 매수 종료.")
+                if allocation.enabled:
+                    self._buy_bond_etf_if_needed(allocation)
                 return
 
-            rotated = self.try_rotation(candidates_all, holdings, available_cash)
+            rotated = self.try_rotation(candidates_all, holdings, buy_cash)
             if not rotated:
                 cheapest = min((_to_int(c.get("Price", 0)) for c in candidates_all), default=0)
                 self._set_summary_reason("SKIPPED_LOW_FUNDS_NO_ROTATION",
-                                         f"cheapest={cheapest:,} cash={available_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
+                                         f"cheapest={cheapest:,} cash={buy_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
                 logger.info("가용 예산 부족 & 회전 실패 → 매수 종료.")
+                if allocation.enabled:
+                    self._buy_bond_etf_if_needed(allocation)
                 return
             else:
                 # 회전 성공 시 현금/보유 최신화 후 계속 신규/추가 매수 진행
                 time.sleep(2)  # 3초 -> 2초로 단축
                 self._update_account_info(force=True)
                 available_cash, holdings, _ = self._load_snapshot()
+                buy_cash, allocation = self._resolve_stock_buy_budget(available_cash, holdings)
                 # 슬롯 재계산
-                effective_slots = self._compute_effective_slots(available_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
+                effective_slots = self._compute_effective_slots(buy_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
 
         # 보유 집합
-        holding_tickers = {str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0}
+        holding_tickers = {
+            str(h.get("pdno", "")).zfill(6)
+            for h in holdings
+            if _to_int(h.get("hldg_qty", 0)) > 0 and not is_bond_etf(str(h.get("pdno", "")), self.settings)
+        }
 
         # 후보 분리: 신규 / 추가매수 (gpt 계획이 있을 경우에만 사용)
         new_targets = []
@@ -4261,7 +4479,7 @@ class Trader:
                     if self._is_in_cooldown(ticker):
                         logger.info(f"[{name}({ticker})] 쿨다운 중 → 추가매수 제외")
                         continue
-                    ok, why = self._can_rebuy(ticker, info, holdings, available_cash)
+                    ok, why = self._can_rebuy(ticker, info, holdings, buy_cash)
                     if not ok:
                         logger.info(f"[REBUY-블록] {name}({ticker}) 제외: {why}")
                         continue
@@ -4272,7 +4490,7 @@ class Trader:
                         logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
                         continue
                     new_targets.append(plan)
-        remaining_cash = available_cash
+        remaining_cash = buy_cash
         any_order_placed = False
         def _execute_buy_batch(plans: List[Dict], batch_name: str):
             nonlocal remaining_cash, any_order_placed, effective_slots
@@ -4419,7 +4637,12 @@ class Trader:
                                 },
                             ))
                             
-                            remaining_cash = new_cash
+                            remaining_cash = self._remaining_cash_after_stock_buy(
+                                remaining_cash,
+                                new_cash,
+                                allocation=allocation,
+                                spent=executed_qty * order_price,
+                            )
                             any_order_placed = True
                             
                             _notify_embed(create_trade_embed({
@@ -4462,7 +4685,12 @@ class Trader:
                             },
                         ))
                         
-                        remaining_cash = new_cash
+                        remaining_cash = self._remaining_cash_after_stock_buy(
+                            remaining_cash,
+                            new_cash,
+                            allocation=allocation,
+                            spent=executed_qty * order_price,
+                        )
                         any_order_placed = True
                         
                         # 주문 처리 완료 표시 (부분 체결도 처리 완료로 간주)
@@ -4513,7 +4741,12 @@ class Trader:
                                     },
                                 ))
                                 
-                                remaining_cash = new_cash
+                                remaining_cash = self._remaining_cash_after_stock_buy(
+                                    remaining_cash,
+                                    new_cash,
+                                    allocation=allocation,
+                                    spent=max(0, remaining_cash - new_cash) or budget_for_this_stock,
+                                )
                                 any_order_placed = True
                                 
                                 # 주문 처리 완료 표시
@@ -4587,7 +4820,12 @@ class Trader:
                                     },
                                 ))
                                 
-                                remaining_cash = new_cash
+                                remaining_cash = self._remaining_cash_after_stock_buy(
+                                    remaining_cash,
+                                    new_cash,
+                                    allocation=allocation,
+                                    spent=max(0, remaining_cash - new_cash) or budget_for_this_stock,
+                                )
                                 any_order_placed = True
                                 
                                 _notify_embed(create_trade_embed({
@@ -4636,8 +4874,8 @@ class Trader:
         # 1) 추가매수 먼저
         _execute_buy_batch(rebuy_candidates, batch_name="REBUY")
 
-        # 2) 신규 진입: 슬롯 확인 (동적 슬롯 반영)
-        current_slots_used = len({str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0})
+        # 2) 신규 진입: 슬롯 확인 (동적 슬롯 반영, 459580 제외)
+        current_slots_used = self._count_stock_holding_slots(holdings)
         slots_to_fill = max(0, effective_slots - current_slots_used)
 
         if slots_to_fill <= 0:
@@ -4646,11 +4884,15 @@ class Trader:
                 self._set_summary_reason("SKIPPED_NO_SLOT_ROTATION_DISABLED",
                                          f"effective_slots={effective_slots} current_slots_used={current_slots_used}")
                 logger.info("신규 슬롯 없음 & 회전매매 비활성화(rotation.enabled=false) → 신규 매수 생략")
+                if allocation.enabled:
+                    self._buy_bond_etf_if_needed(allocation)
                 return
 
             if self._rotation_quota_remaining() <= 0:
                 logger.info("이번 매수 사이클 회전 한도(%d페어) 소진 → 리밸런싱 스킵",
                             max_pairs_per_run(self.settings))
+                if allocation.enabled:
+                    self._buy_bond_etf_if_needed(allocation)
                 return
 
             logger.info("=== 회전 매매(리밸런싱) 시작 ===")
@@ -4666,13 +4908,13 @@ class Trader:
             to_buy_plans: List[Dict] = []
             try:
                 to_sell_list, to_buy_plans = self._get_enhanced_rebalance_candidates(
-                    holdings, gpt_decisions, available_cash
+                    holdings, gpt_decisions, buy_cash
                 )
             except Exception as e:
                 logger.error("리밸런싱 후보 선정 실패: %s", e, exc_info=True)
                 to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)
                 to_sell_list, to_buy_plans = self._finalize_rotation_candidates(
-                    to_sell_list, to_buy_plans, available_cash
+                    to_sell_list, to_buy_plans, buy_cash
                 )
 
             if to_sell_list:
@@ -4705,7 +4947,7 @@ class Trader:
                         pr, _ = h_pr_map.get(t, (0, 0))
                         expected_proceeds += pr * qty
 
-                expected_cash = int(available_cash + expected_proceeds)
+                expected_cash = int(buy_cash + expected_proceeds)
                 eff_after = self._compute_effective_slots(expected_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
                 slots_after = max(0, eff_after - (current_slots_used - len(to_sell_list)))
 
@@ -4755,7 +4997,7 @@ class Trader:
                     self._update_account_info(force=True)
                     new_cash, holdings_after, _ = self._load_snapshot()
                     eff_now = self._compute_effective_slots(new_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
-                    slots_now = max(0, eff_now - len(holdings_after))
+                    slots_now = max(0, eff_now - self._count_stock_holding_slots(holdings_after))
 
                     logger.info(f"[SWAP-AFTER] new_cash={new_cash:,}, eff_slots_now={eff_now}, slots_now={slots_now}")
                     if slots_now > 0:
@@ -4790,11 +5032,14 @@ class Trader:
                 _notify_text("ℹ️ 신규 매수 대상 없음",
                              key=f"phase:no_targets:{self.run_id}", cooldown=300)
             else:
-                self._execute_sequential_buy(targets_to_buy, available_cash, holdings)
+                self._execute_sequential_buy(targets_to_buy, buy_cash, holdings, allocation=allocation)
 
         if any_order_placed:
             time.sleep(3)  # 5초 -> 3초로 단축
             self._update_account_info(force=True)
+
+        if allocation.enabled:
+            self._buy_bond_etf_if_needed(allocation)
 
     def _get_realtime_price_parallel(self, ticker: str) -> Optional[Dict]:
         """병렬 처리를 위한 가격 조회 래퍼 함수"""
@@ -4804,10 +5049,19 @@ class Trader:
             logger.warning(f"[{ticker}] 병렬 가격 조회 실패: {e}")
             return None
 
-    def _execute_sequential_buy(self, targets: List[Dict], available_cash: int, holdings: List[Dict]) -> None:
+    def _execute_sequential_buy(
+        self,
+        targets: List[Dict],
+        available_cash: int,
+        holdings: List[Dict],
+        *,
+        allocation: Optional[AllocationResult] = None,
+    ) -> None:
         """순차적 매수 실행 (실패 시 재시도 및 금액 재배분)"""
         if not targets:
             return
+        if allocation is None:
+            allocation = AllocationResult(enabled=False)
             
         logger.info(f"순차적 매수 시작: {len(targets)}개 종목, 예산: {available_cash:,}원")
         
@@ -4885,7 +5139,12 @@ class Trader:
                     time.sleep(0.5)  # 1초 -> 0.5초로 단축
                     self._batch_update_account_info()  # force=True 대신 배치 처리 사용
                     new_cash, new_holdings, _ = self._load_snapshot()
-                    remaining_cash = new_cash
+                    remaining_cash = self._remaining_cash_after_stock_buy(
+                        remaining_cash,
+                        new_cash,
+                        allocation=allocation,
+                        spent=max(0, remaining_cash - new_cash) or budget_for_this_stock,
+                    )
                     round_success = True
                     logger.info(f"  -> ✅ {name}({ticker}) 매수 성공, 잔여 현금: {remaining_cash:,}원")
                 else:
@@ -5200,6 +5459,11 @@ class Trader:
             t = str(h.get("pdno", "")).zfill(6)
             nm = h.get("prdt_name", "N/A")
             qty = _to_int(h.get("hldg_qty", 0))
+
+            if qty > 0 and is_bond_etf(t, self.settings):
+                excluded_count += 1
+                logger.debug(f"[DEBUG] bond_etf 제외: {nm}({t})")
+                continue
             
             # 최소 보유일 체크
             if min_holding_days > 0:

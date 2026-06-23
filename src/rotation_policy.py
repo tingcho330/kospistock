@@ -123,7 +123,11 @@ def pair_passes_budget(usable_cash: int, sell_proceeds: int, buy_price: int, set
     return buy_price <= affordable
 
 
-def lists_to_pairs(to_sell_list: List[Dict], to_buy_plans: List[Dict]) -> List[RotationPair]:
+def lists_to_pairs(
+    to_sell_list: List[Dict],
+    to_buy_plans: List[Dict],
+    settings: Optional[SettingsLike] = None,
+) -> List[RotationPair]:
     pairs: List[RotationPair] = []
     n = min(len(to_sell_list), len(to_buy_plans))
     for i in range(n):
@@ -134,6 +138,12 @@ def lists_to_pairs(to_sell_list: List[Dict], to_buy_plans: List[Dict]) -> List[R
         buy_ticker = str(info.get("Ticker", "")).zfill(6)
         if not sell_ticker or not buy_ticker or sell_ticker == buy_ticker:
             continue
+        try:
+            from asset_allocator import is_bond_etf
+            if settings is not None and is_bond_etf(sell_ticker, settings):
+                continue
+        except ImportError:
+            pass
         sell_score = _to_float(s.get("old_score", s.get("cached_score", 0.0)), 0.0)
         buy_score = _to_float(s.get("new_score", info.get("Score", 0.0)), 0.0)
         if buy_score <= 0:
@@ -248,7 +258,7 @@ def apply_rotation_policy(
     thr = delta_threshold
     if thr is None:
         thr = resolve_delta_threshold(settings, market_state, market_analyzer)
-    pairs = lists_to_pairs(to_sell_list, to_buy_plans)
+    pairs = lists_to_pairs(to_sell_list, to_buy_plans, settings)
     pairs = filter_valid_pairs(
         pairs,
         settings,

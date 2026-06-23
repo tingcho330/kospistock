@@ -1,5 +1,5 @@
 {
-  "trading_environment": "prod",
+  "trading_environment": "vps",
   "kis_limits": {
     "max_rps": 3,
     "max_concurrency": 2
@@ -319,6 +319,30 @@
       "split_timebox_sec": 20,
       "split_step_min_delay_sec": 1.0
     }
+  },
+  "asset_allocation": {
+    "enabled": true,
+    "stock_target_weight": 0.70,
+    "bond_target_weight": 0.20,
+    "cash_target_weight": 0.10,
+    "min_cash_weight": 0.05,
+    "rebalance_tolerance": 0.03,
+    "hard_rebalance_tolerance": 0.05,
+    "sell_to_rebalance_enabled": false,
+    "buy_only_rebalance_enabled": true,
+    "bond_buy_enabled": true,
+    "bond_sell_enabled": false,
+    "stock_buy_block_when_overweight": true,
+    "bond_etf_exclude_from_risk_sell": true,
+    "bond_etf_exclude_from_rotation": true,
+    "bond_etf_include_in_emergency_liquidation": false,
+    "bond_etfs": [
+      {
+        "ticker": "459580",
+        "name": "KODEX CD금리액티브(합성)",
+        "target_weight": 1.0
+      }
+    ]
   },
   "notifications": {
     "discord_cooldown_sec": 60,

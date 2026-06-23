@@ -382,6 +382,7 @@ DEFAULT_GIT_MAX_COMMITS = 50
 TRADING_RELEVANT_FILE_HINTS = (
     "config/config.json",
     "src/trader.py",
+    "src/asset_allocator.py",
     "src/risk_manager.py",
     "src/strategies.py",
     "src/rotation_",
