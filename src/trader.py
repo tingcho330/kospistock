@@ -1927,6 +1927,10 @@ class Trader:
             record_trade({
                 "side": "sell", "ticker": ticker, "name": name,
                 "qty": quantity, "price": 0, "trade_status": "completed",
+                "requested_qty": quantity,
+                "executed_qty": quantity,
+                "reason_code": reason_code,
+                "paper_db_only": True,
                 "strategy_details": {"reason": reason_text, "reason_code": reason_code},
                 "sell_reason": reason_text
             })
@@ -2751,6 +2755,7 @@ class Trader:
                     "requested_qty": quantity,
                     "executed_qty": quantity,
                     "reason_code": reason_code,
+                    "paper_db_only": True,
                     "strategy_details": {"reason": reason, "reason_code": reason_code},
                     "sell_reason": reason
                 })
@@ -4258,6 +4263,7 @@ class Trader:
         order_result = "skipped"
         current_price = 0
         order_qty = 0
+        order_price = 0
 
         if final_budget <= 0:
             order_result = "skipped_zero_budget"
@@ -4319,6 +4325,54 @@ class Trader:
             f"459580 current_price: {current_price:,}원\n"
             f"459580 order_qty: {order_qty}주\n"
             f"459580 order_result: {order_result}"
+        )
+
+        recorded = False
+        record_id = None
+        if order_result in ("paper_executed", "executed") and order_qty >= 1:
+            record_price = order_price if order_price > 0 else current_price
+            amount = order_qty * record_price
+            commission_rate = float(self.trading_params.get("commission_rate", 0.00015))
+            commission = int(amount * commission_rate)
+            structured_context = {
+                "initial_bond_buy_budget": allocation.initial_bond_buy_budget,
+                "final_bond_buy_budget": final_budget,
+                "post_stock_cash": post_stock_cash,
+                "min_cash_amount": allocation.min_cash_amount,
+                "current_price": current_price,
+                "order_result": order_result,
+                "mode": self.env,
+                "execution": "paper_db_only" if not self.is_real_trading else "live",
+            }
+            trade_status = "paper_executed" if not self.is_real_trading else "executed"
+            bond_payload = self._build_trade_record(
+                order_id="",
+                ticker=ticker,
+                name=name,
+                side="buy",
+                qty=order_qty,
+                price=record_price,
+                trade_status=trade_status,
+                requested_qty=order_qty,
+                executed_qty=order_qty,
+                reason_code="ASSET_ALLOCATION_BOND_BUY",
+                sell_reason="",
+                structured_context=structured_context,
+                paper_db_only=not self.is_real_trading,
+                commission=commission,
+                tax=0.0,
+                total_cost=amount + commission,
+                net_amount=amount,
+            )
+            recorded, record_id = record_trade(bond_payload)
+
+        exec_mode = "paper_db_only" if not self.is_real_trading else "live"
+        logger.info(
+            f"[ASSET_ALLOCATION_BOND_BUY] ticker={ticker} qty={order_qty} "
+            f"price={order_price if order_price > 0 else current_price} budget={final_budget} "
+            f"result={order_result} recorded={str(recorded).lower()} "
+            f"record_id={record_id if record_id is not None else '-'} "
+            f"mode={self.env} real_trading={self.is_real_trading} execution={exec_mode}"
         )
 
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):

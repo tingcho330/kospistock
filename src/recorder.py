@@ -139,7 +139,12 @@ class DataRecorder:
         
         self.db_path = db_path
         self.logger = logging.getLogger(__name__)
+        self._last_record_id: Optional[int] = None
         self._init_database()
+
+    def get_last_record_id(self) -> Optional[int]:
+        """가장 최근 save_trade_record INSERT row id."""
+        return self._last_record_id
     
     def _init_database(self):
         """데이터베이스 초기화"""
@@ -379,6 +384,7 @@ class DataRecorder:
                     getattr(trade_record, "structured_context", "") or "",
                 ))
                 row_id = cursor.lastrowid
+                self._last_record_id = int(row_id) if row_id else None
                 conn.commit()
                 self.logger.info(f"거래 기록 저장 완료: {trade_record.ticker} {trade_record.action} (status={status})")
                 _db_dbg_log(
@@ -460,6 +466,61 @@ class DataRecorder:
             self.logger.debug(f"find_recent_sell_duplicate 실패: {e}")
             return None
 
+    def find_same_day_mock_sell_duplicate(
+        self,
+        *,
+        ticker: str,
+        requested_qty: int,
+        reason_code: str,
+        reference_time: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        mock/paper SELL 중복 방지: 같은 날짜 + ticker + requested_qty + reason_code.
+        order_id 없고 price=0인 SELL만 대상.
+        """
+        ticker = str(ticker).zfill(6)
+        requested_qty = int(requested_qty)
+        reason_code = str(reason_code or "")
+        ref = reference_time or datetime.now()
+        ref_date = ref.date().isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, ticker, action, quantity, price, order_status, order_id,
+                           requested_qty, reason_code
+                    FROM trade_records
+                    WHERE ticker = ? AND UPPER(action) = 'SELL'
+                      AND date(timestamp) = date(?)
+                      AND requested_qty = ?
+                      AND reason_code = ?
+                      AND (order_id IS NULL OR order_id = '')
+                      AND price = 0
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (ticker, ref_date, requested_qty, reason_code),
+                )
+                row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "timestamp": row[1],
+                "ticker": row[2],
+                "action": row[3],
+                "quantity": int(row[4] or 0),
+                "price": float(row[5] or 0),
+                "order_status": row[6],
+                "order_id": row[7] or "",
+                "requested_qty": int(row[8] or 0),
+                "reason_code": row[9] or "",
+            }
+        except Exception as e:
+            self.logger.debug(f"find_same_day_mock_sell_duplicate 실패: {e}")
+            return None
+
     def _handle_sell_without_order_id(self, trade_record: TradeRecord) -> Optional[bool]:
         """
         order_id 없는 SELL 저장 시 중복 여부 처리.
@@ -467,6 +528,37 @@ class DataRecorder:
         - 반환 None: 중복 아님 → caller가 일반 INSERT 진행
         - 반환 True/False: 처리 완료
         """
+        price = float(trade_record.price)
+        reason_code = str(getattr(trade_record, "reason_code", "") or "")
+        requested_qty = int(getattr(trade_record, "requested_qty", 0) or trade_record.quantity)
+        order_status = str(getattr(trade_record, "order_status", "executed") or "").lower()
+        paper_db_only = bool(getattr(trade_record, "_paper_db_only", False))
+
+        if (
+            paper_db_only
+            or (price <= 0 and order_status in ("executed", "completed", "paper_executed"))
+        ):
+            same_day = self.find_same_day_mock_sell_duplicate(
+                ticker=trade_record.ticker,
+                requested_qty=requested_qty,
+                reason_code=reason_code,
+                reference_time=trade_record.timestamp,
+            )
+            if same_day:
+                self.logger.info(
+                    f"[recorder] mock SELL duplicate skip: ticker={trade_record.ticker} "
+                    f"requested_qty={requested_qty} reason_code={reason_code or '(empty)'}"
+                )
+                _db_dbg_skip(
+                    "recorder.mock_sell.DUPLICATE_SKIP",
+                    reason="same-day mock SELL exists",
+                    ticker=trade_record.ticker,
+                    requested_qty=requested_qty,
+                    reason_code=reason_code,
+                    existing_row_id=same_day.get("id"),
+                )
+                return False
+
         dup = self.find_recent_sell_duplicate(
             ticker=trade_record.ticker,
             quantity=int(trade_record.quantity),
@@ -501,7 +593,7 @@ class DataRecorder:
 
         _db_dbg_skip(
             "duplicate_sell_without_order_id_skipped",
-            "matching SELL with order_id exists; skip no-order_id INSERT",
+            reason="matching SELL with order_id exists; skip no-order_id INSERT",
             ticker=trade_record.ticker,
             qty=int(trade_record.quantity),
             price=float(trade_record.price),
@@ -1626,8 +1718,8 @@ def initialize_db():
     """데이터베이스 초기화 (하위 호환성)"""
     get_recorder()
 
-def record_trade(trade_data: Dict[str, Any]) -> bool:
-    """거래 기록 저장 (하위 호환성)"""
+def record_trade(trade_data: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
+    """거래 기록 저장 (하위 호환성). 반환: (성공 여부, record_id)."""
     try:
         recorder = get_recorder()
         logger = logging.getLogger(__name__)
@@ -1638,7 +1730,7 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
         if quantity <= 0:
             logger.warning(f"거래 기록 건너뜀: 수량이 0 이하 (ticker={trade_data.get('ticker')}, qty={quantity})")
             _db_dbg_skip("record_trade.SKIP", reason="qty<=0", ticker=trade_data.get("ticker"), qty=quantity)
-            return False
+            return False, None
         
         ticker = _normalize_ticker_6(trade_data.get("ticker", ""))
         action = trade_data.get("side", "").upper()
@@ -1717,16 +1809,20 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
         except Exception:
             structured_context = ""
         
-        # order_status: pending(주문 접수만) | executed(체결) | cancelled(미체결 취소)
-        order_status = str(trade_data.get("trade_status", "executed")).lower()
-        if order_status not in ("pending", "submitted", "executed", "completed", "partial", "failed", "cancelled", "market_executed"):
+        # order_status: pending(주문 접수만) | executed(체결) | paper_executed(모의) | cancelled
+        raw_trade_status = str(trade_data.get("trade_status", "executed")).lower()
+        order_status = raw_trade_status
+        if order_status not in (
+            "pending", "submitted", "executed", "completed", "partial", "failed",
+            "cancelled", "market_executed", "paper_executed",
+        ):
             order_status = "executed"
         if order_status in ("submitted",):
             order_status = "pending"
         if order_status in ("completed", "market_executed", "limit_executed", "split_executed"):
             order_status = "executed"
 
-        if executed_qty <= 0 and order_status == "executed" and quantity > 0:
+        if executed_qty <= 0 and order_status in ("executed", "paper_executed") and quantity > 0:
             executed_qty = quantity
 
         # pending without order_id → reconciler가 추적 불가한 orphan INSERT 방지
@@ -1741,9 +1837,8 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             logging.getLogger(__name__).warning(
                 f"pending 거래 기록 생략 (order_id 없음): {ticker} {action}"
             )
-            return False
+            return False, None
 
-        raw_trade_status = str(trade_data.get("trade_status", "executed")).lower()
         if order_status in ("executed", "partial") and not order_id:
             if raw_trade_status not in ("completed",) or action not in ("BUY", "SELL"):
                 _db_dbg_skip(
@@ -1756,7 +1851,12 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
                 logging.getLogger(__name__).warning(
                     f"체결 거래 기록 생략 (order_id 없음): {ticker} {action}"
                 )
-                return False
+                return False, None
+
+        commission = float(trade_data.get("commission", 0.0))
+        tax = float(trade_data.get("tax", 0.0))
+        total_cost = float(trade_data.get("total_cost", amount + commission))
+        net_amount = float(trade_data.get("net_amount", amount))
         
         # TradeRecord 객체 생성
         trade_record = TradeRecord(
@@ -1766,10 +1866,10 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             quantity=quantity,
             price=price,
             amount=amount,
-            commission=0.0,  # 기본값
-            tax=0.0,  # 기본값
-            total_cost=amount,
-            net_amount=amount,
+            commission=commission,
+            tax=tax,
+            total_cost=total_cost,
+            net_amount=net_amount,
             profit_loss=profit_loss,
             holding_period_days=holding_period_days,
             sector=trade_data.get("strategy_details", {}).get("sector", ""),
@@ -1783,10 +1883,13 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             reason_code=str(reason_code or ""),
             structured_context=structured_context,
         )
+        if trade_data.get("paper_db_only"):
+            trade_record._paper_db_only = True  # type: ignore[attr-defined]
 
         # order_id가 있으면 UPSERT로 상태를 갱신하고, 없으면 기존 저장 방식 유지
         path = "upsert" if order_id else "insert_via_upsert_fallback"
         ok = recorder.upsert_trade_record_by_order_id(trade_record)
+        record_id = recorder.get_last_record_id() if ok else None
         _db_dbg_trade_out(
             "record_trade.OUT",
             ok=ok,
@@ -1796,13 +1899,14 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             order_status=order_status,
             order_id=order_id or "(empty)",
             profit_loss=profit_loss,
+            record_id=record_id,
         )
-        return ok
+        return ok, record_id
         
     except Exception as e:
         logging.getLogger(__name__).error(f"거래 기록 저장 실패: {e}", exc_info=True)
         _db_dbg_log("record_trade.EXCEPTION", error=str(e), caller=_db_dbg_caller(2))
-        return False
+        return False, None
 
 
 def get_position(ticker: str) -> Optional[Dict[str, Any]]:

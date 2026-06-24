@@ -287,8 +287,46 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
     orphans = recorder.get_orphan_trade_records(since_ts=since_ts, limit=limit)
     logger.info(f"orphan backfill 대상 {len(orphans)}건 (since={since_ts})")
 
+    if not orphans:
+        logger.info("[OrderReconciler] orphan backfill skip: no orphan records")
+        _db_dbg_skip(
+            "reconciler.backfill.SKIP",
+            reason="no orphan records",
+            step="backfill",
+            since_hours=since_hours,
+            limit=limit,
+            orphan_count=0,
+            daily_order_count=0,
+        )
+        return {
+            "backfill_orphans": 0,
+            "backfill_updated": 0,
+            "backfill_skipped_ambiguous": 0,
+            "backfill_skipped_no_match": 0,
+            "kis_daily_orders": 0,
+        }
+
     daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
     logger.info(f"KIS 일자별 주문(daily) backfill 조회: {len(daily_orders)}건 ({start_ymd}~{end_ymd})")
+
+    if not daily_orders:
+        logger.info("[OrderReconciler] orphan backfill skip: no daily orders found")
+        _db_dbg_skip(
+            "reconciler.backfill.SKIP",
+            reason="no daily orders found",
+            step="backfill",
+            since_hours=since_hours,
+            limit=limit,
+            orphan_count=len(orphans),
+            daily_order_count=0,
+        )
+        return {
+            "backfill_orphans": len(orphans),
+            "backfill_updated": 0,
+            "backfill_skipped_ambiguous": 0,
+            "backfill_skipped_no_match": 0,
+            "kis_daily_orders": 0,
+        }
 
     updated = 0
     skipped_ambiguous = 0
@@ -302,6 +340,7 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
             skipped_no_match += 1
             _db_dbg_skip(
                 "reconciler.backfill.NO_MATCH",
+                reason="no KIS candidate for orphan row",
                 row_id=row_id,
                 ticker=row.get("ticker"),
                 action=row.get("action"),
@@ -312,6 +351,7 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
             skipped_ambiguous += 1
             _db_dbg_skip(
                 "reconciler.backfill.AMBIGUOUS",
+                reason="multiple KIS candidates for orphan row",
                 row_id=row_id,
                 ticker=row.get("ticker"),
                 candidate_order_ids=[c.get("order_id") for c in candidates[:5]],
