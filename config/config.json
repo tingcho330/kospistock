@@ -1,5 +1,5 @@
 {
-  "trading_environment": "vps",
+  "trading_environment": "kis_paper",
   "kis_limits": {
     "max_rps": 3,
     "max_concurrency": 2

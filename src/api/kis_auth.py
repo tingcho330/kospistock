@@ -28,9 +28,94 @@ _last_reauth_attempt: float = 0.0
 _DEFAULT_KIS_URLS = {
     "prod": "https://openapi.koreainvestment.com:9443",
     "vps": "https://openapivts.koreainvestment.com:29443",
+    "kis_paper": "https://openapivts.koreainvestment.com:29443",
     "ops": "ws://ops.koreainvestment.com:21000",
     "vops": "ws://ops.koreainvestment.com:31000",
 }
+
+_VALID_KIS_ENVS = frozenset({"prod", "vps", "kis_paper"})
+_PAPER_KIS_ENVS = frozenset({"vps", "kis_paper"})
+
+
+def _mask_account_partial(account: Optional[str]) -> str:
+    """계좌번호 앞/뒤 일부만 노출."""
+    if not account:
+        return "N/A"
+    t = str(account).strip()
+    if len(t) <= 6:
+        return (t[:2] + "..." + t[-2:]) if len(t) > 4 else "***"
+    return t[:3] + "..." + t[-3:]
+
+
+def _endpoint_label(url_base: str) -> str:
+    if "openapivts" in (url_base or ""):
+        return "openapivts"
+    if "openapi.koreainvestment" in (url_base or ""):
+        return "openapi"
+    return "unknown"
+
+
+def _validate_kis_env_credentials(
+    env: str,
+    config: dict,
+    *,
+    app_key: str,
+    app_secret: str,
+    cano: str,
+) -> None:
+    """env와 key/account 조합 불일치 시 RuntimeError."""
+    paper_app = str(config.get("paper_app") or "").strip()
+    paper_sec = str(config.get("paper_sec") or "").strip()
+    paper_stock = str(config.get("my_paper_stock") or "").strip()
+    prod_app = str(config.get("my_app") or "").strip()
+    prod_sec = str(config.get("my_sec") or "").strip()
+    prod_stock = str(config.get("my_acct_stock") or "").strip()
+    key = str(app_key or "").strip()
+    sec = str(app_secret or "").strip()
+    acct = str(cano or "").strip()
+
+    if env in _PAPER_KIS_ENVS:
+        if prod_app and key == prod_app:
+            raise RuntimeError(
+                f"[KIS] env={env} 인데 실계좌 APP KEY(KIS_MY_APP)가 사용됨 — 모의 키만 허용"
+            )
+        if prod_sec and sec == prod_sec:
+            raise RuntimeError(
+                f"[KIS] env={env} 인데 실계좌 SECRET(KIS_MY_SEC)가 사용됨 — 모의 키만 허용"
+            )
+        if prod_stock and acct == prod_stock:
+            raise RuntimeError(
+                f"[KIS] env={env} 인데 실계좌 종합계좌(KIS_MY_ACCT_STOCK)가 사용됨 — 모의 계좌만 허용"
+            )
+        if paper_app and key and key != paper_app:
+            raise RuntimeError(
+                f"[KIS] env={env} 인데 모의 APP KEY(KIS_PAPER_APP)와 불일치"
+            )
+        if paper_stock and acct and acct != paper_stock:
+            raise RuntimeError(
+                f"[KIS] env={env} 인데 모의 계좌(KIS_MY_PAPER_STOCK)와 불일치"
+            )
+    elif env == "prod":
+        if paper_app and key == paper_app:
+            raise RuntimeError(
+                "[KIS] env=prod 인데 모의 APP KEY(KIS_PAPER_APP)가 사용됨 — 실계좌 키만 허용"
+            )
+        if paper_sec and sec == paper_sec:
+            raise RuntimeError(
+                "[KIS] env=prod 인데 모의 SECRET(KIS_PAPER_SEC)가 사용됨 — 실계좌 키만 허용"
+            )
+        if paper_stock and acct == paper_stock:
+            raise RuntimeError(
+                "[KIS] env=prod 인데 모의 계좌(KIS_MY_PAPER_STOCK)가 사용됨 — 실계좌만 허용"
+            )
+        if prod_app and key and key != prod_app:
+            raise RuntimeError(
+                "[KIS] env=prod 인데 실계좌 APP KEY(KIS_MY_APP)와 불일치"
+            )
+        if prod_stock and acct and acct != prod_stock:
+            raise RuntimeError(
+                "[KIS] env=prod 인데 실계좌 종합계좌(KIS_MY_ACCT_STOCK)와 불일치"
+            )
 
 # YAML 키 → 환경 변수 (config/.env)
 _KIS_ENV_MAP = {
@@ -46,6 +131,7 @@ _KIS_ENV_MAP = {
     "my_prod": "KIS_MY_PROD",
     "prod": "KIS_PROD_URL",
     "vps": "KIS_VPS_URL",
+    "kis_paper": "KIS_PAPER_URL",
     "ops": "KIS_OPS_URL",
     "vops": "KIS_VOPS_URL",
     "my_agent": "KIS_MY_AGENT",
@@ -124,6 +210,9 @@ class KIS(DomesticStock):
             config = load_kis_config()
             print("[KIS] 설정 로드 완료 (.env + kis_devlp.yaml)")
 
+        if env not in _VALID_KIS_ENVS:
+            raise ValueError(f"알 수 없는 env: {env} (허용: {sorted(_VALID_KIS_ENVS)})")
+
         if env == 'prod':
             print("[KIS] PROD 모드로 설정")
             self.app_key = config['my_app']
@@ -131,17 +220,32 @@ class KIS(DomesticStock):
             self.cano = config['my_acct_stock']
             self.acnt_prdt_cd = config['my_prod']
             self.url_base = config['prod']
-        elif env == 'vps':
-            print("[KIS] VPS 모드로 설정")
+            account_type = "prod"
+        elif env in _PAPER_KIS_ENVS:
+            mode_label = "KIS_PAPER" if env == "kis_paper" else "VPS"
+            print(f"[KIS] {mode_label} 모드로 설정 (모의 endpoint)")
             self.app_key = config['paper_app']
             self.app_secret = config['paper_sec']
             self.cano = config['my_paper_stock']
             self.acnt_prdt_cd = config['my_prod']
-            self.url_base = config['vps']
+            self.url_base = config.get('kis_paper') or config['vps']
+            account_type = "paper"
         else:
             raise ValueError(f"알 수 없는 env: {env}")
 
+        _validate_kis_env_credentials(
+            env, config,
+            app_key=self.app_key,
+            app_secret=self.app_secret,
+            cano=self.cano,
+        )
+
         self.env = env
+        ep = _endpoint_label(self.url_base)
+        print(
+            f"[KIS_MODE] env={env} endpoint={ep} account_type={account_type} "
+            f"account={_mask_account_partial(self.cano)} acnt_prdt_cd={self.acnt_prdt_cd}"
+        )
         self.auth_token = self.auth()  # 최초 인증/로딩
 
     # =========================

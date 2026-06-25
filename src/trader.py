@@ -204,6 +204,14 @@ def _mask_sensitive(text_or_obj: Any) -> str:
     s = _SENSITIVE_RE.sub(r'\1***\3', s)
     return s[:2000]  # 너무 긴 로그 방지
 
+def _mask_account_partial(account: Optional[str]) -> str:
+    if not account:
+        return "N/A"
+    t = str(account).strip()
+    if len(t) <= 6:
+        return (t[:2] + "..." + t[-2:]) if len(t) > 4 else "***"
+    return t[:3] + "..." + t[-3:]
+
 # ── 스키마 관용성(디폴트) ────────────────────────────────────────────
 SCHEMA_DEFAULTS: Dict[str, Any] = {
     "Sector": "N/A",
@@ -236,7 +244,14 @@ class Trader:
     def __init__(self, settings_obj):
         self.settings = settings_obj._config
         self.env = self.settings.get("trading_environment", "vps")
+        _valid_envs = ("vps", "kis_paper", "prod")
+        if self.env not in _valid_envs:
+            raise ValueError(f"알 수 없는 trading_environment: {self.env} (허용: {_valid_envs})")
         self.is_real_trading = (self.env == "prod")
+        self.is_prod_order_api = (self.env == "prod")
+        self.is_kis_paper_order_api = (self.env == "kis_paper")
+        self.is_paper_db_only = (self.env == "vps")
+        self.kis_order_api_enabled = self.env in ("kis_paper", "prod")
         self.risk_params = self.settings.get("risk_params", {}) or {}
         self.trading_params = self.settings.get("trading_params", {}) or {}
         self.trading_guards = self.settings.get("trading_guards", {}) or {}
@@ -286,9 +301,10 @@ class Trader:
         if self.asset_allocation_enabled:
             logger.info(
                 "[ASSET_ALLOCATION] config enabled=true "
-                f"(env={self.env}, real_trading={self.is_real_trading})"
+                f"(env={self.env}, real_trading={self.is_real_trading}, "
+                f"kis_order_api={self.kis_order_api_enabled})"
             )
-            if self.is_real_trading and not self._asset_allocation_prod_allowed():
+            if self.is_prod_order_api and not self._asset_allocation_prod_allowed():
                 logger.warning(
                     "[ASSET_ALLOCATION] prod 실계좌 + enabled=true: "
                     "모의(vps) 검증 전까지 run_buy_logic 차단. "
@@ -354,6 +370,7 @@ class Trader:
             if not getattr(self, "kis", None) or not getattr(self.kis, "auth_token", None):
                 raise ConnectionError("KIS API 인증에 실패했습니다 (토큰 없음).")
             logger.info(f"'{self.env}' 모드로 KIS API 인증 완료.")
+            self._log_kis_mode()
         except Exception as e:
             logger.error(f"KIS API 초기화 중 오류 발생: {e}", exc_info=True)
             raise ConnectionError("KIS API 초기화에 실패했습니다.") from e
@@ -364,13 +381,58 @@ class Trader:
         self.all_stock_data = self._load_all_stock_data()
 
         _notify_text(
-            f" Trader 초기화 완료 (env={self.env}, real_trading={self.is_real_trading}, run_id={self.run_id})",
+            f" Trader 초기화 완료 (env={self.env}, real_trading={self.is_real_trading}, "
+            f"kis_order_api={self.kis_order_api_enabled}, run_id={self.run_id})",
             key=f"phase:init:{self.run_id}", cooldown=60
         )
 
         # positions(진입가 기준 레벨) 운용 파라미터
         self._entry_price_update_abs_won = 1.0
         self._entry_price_update_rel = 0.001  # 0.1%
+
+    def _execution_mode(self) -> str:
+        if self.is_paper_db_only:
+            return "paper_db_only"
+        if self.is_kis_paper_order_api:
+            return "kis_paper_api"
+        return "prod_api"
+
+    def _account_type_label(self) -> str:
+        return "prod" if self.is_prod_order_api else "paper"
+
+    def _endpoint_label(self) -> str:
+        try:
+            base = getattr(self.kis, "url_base", "") or ""
+            if "openapivts" in base:
+                return "openapivts"
+            if "openapi.koreainvestment" in base:
+                return "openapi"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def _log_kis_mode(self) -> None:
+        logger.info(
+            f"[KIS_MODE] env={self.env} endpoint={self._endpoint_label()} "
+            f"account_type={self._account_type_label()} "
+            f"kis_order_api={str(self.kis_order_api_enabled).lower()} "
+            f"prod_order_api={str(self.is_prod_order_api).lower()} "
+            f"real_trading={str(self.is_real_trading).lower()}"
+        )
+        if getattr(self, "kis", None):
+            logger.info(
+                f"[KIS_MODE] account={_mask_account_partial(getattr(self.kis, 'cano', ''))} "
+                f"endpoint={self._endpoint_label()} account_type={self._account_type_label()}"
+            )
+
+    def _log_order_mode(self, ticker: str, side: str) -> None:
+        acct = _mask_account_partial(getattr(self.kis, "cano", ""))
+        logger.info(
+            f"[ORDER_MODE] env={self.env} ticker={ticker} side={side.upper()} "
+            f"execution={self._execution_mode()} account={acct} "
+            f"account_type={self._account_type_label()} "
+            f"kis_order_api={str(self.kis_order_api_enabled).lower()}"
+        )
 
     def _load_latest_market_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -887,11 +949,23 @@ class Trader:
     def _order_cash_retry(self, max_retries: int = 3, backoff_base: float = 0.5, **kwargs) -> Dict[str, Any]:
         """
         주문 재시도 래퍼:
+        - vps(paper_db_only)에서는 KIS 주문 API 호출 금지
         - 첫 실패가 가격밴드/호가 관련이면 호가 1틱(매수: -1틱 / 매도: +1틱) 보정 후 즉시 1회 재시도.
         - 일시 오류는 지수 백오프.
         - 브로커 REJECT이고 retry_on_reject=True면 max_retries_on_reject 만큼 추가 재시도(+ retry_delay_ms 간격)
           * 매수 시 첫 REJECT 재시도에는 1틱 하향 보정 시도
         """
+        if self.is_paper_db_only:
+            raise RuntimeError(
+                "[ORDER_MODE] env=vps: KIS 주문 API 호출 금지 (execution=paper_db_only)"
+            )
+
+        pdno = str(kwargs.get("pdno") or kwargs.get("ticker") or "").zfill(6)
+        ord_dv = str(kwargs.get("ord_dv") or "")
+        side = "BUY" if ord_dv == "02" else "SELL" if ord_dv == "01" else "UNKNOWN"
+        if pdno and pdno != "000000" and self.kis_order_api_enabled:
+            self._log_order_mode(pdno, side)
+
         backoff = backoff_base
         last_res = None
 
@@ -1334,7 +1408,7 @@ class Trader:
     def _get_recent_orders(self, ticker: str, limit: int = 10, side: Optional[str] = None) -> List[Dict]:
         """최근 주문 내역 조회"""
         try:
-            if not self.is_real_trading:
+            if not self.kis_order_api_enabled:
                 return []
 
             executed = True if side in ("buy", "sell") else None
@@ -1350,7 +1424,7 @@ class Trader:
         side: 'buy'|'sell'|None, executed: True|False|None
         """
         try:
-            if not self.is_real_trading:
+            if not self.kis_order_api_enabled:
                 return []
             
             # 1차: get_pending_orders() 우선 사용 (inquire_orders() 기반)
@@ -1848,7 +1922,7 @@ class Trader:
 
         logger.info(f"[REBALANCE] 매도 실행: {name}({ticker}) {quantity}주 | 사유={reason_text}")
 
-        if self.is_real_trading:
+        if self.kis_order_api_enabled:
             pre_qty = quantity
 
             result = self._order_cash_retry(
@@ -2179,7 +2253,7 @@ class Trader:
                 continue
 
             logger.info(f"[SPLIT {i+1}/{slices}] BUY {name}({ticker}) x{qty_capped} @ {price_i:,} [{batch_name}]")
-            if self.is_real_trading:
+            if self.kis_order_api_enabled:
                 # 완전한 검증 시스템을 사용한 주문 실행 + 공통 후처리
                 context = f"SPLIT {i+1}/{slices}"
                 res = self._execute_order_with_full_validation(ticker, name, qty_capped, price_i, context)
@@ -2215,13 +2289,14 @@ class Trader:
                 spent_cash += qty_capped * price_i
                 record_trade({
                     "side": "buy", "ticker": ticker, "name": name,
-                    "qty": qty_capped, "price": price_i, "trade_status": "completed",
-                    "strategy_details": {"batch": f"{batch_name}:SPLIT#{i+1}/{slices}"}
+                    "qty": qty_capped, "price": price_i, "trade_status": "paper_executed",
+                    "strategy_details": {"batch": f"{batch_name}:SPLIT#{i+1}/{slices}", "execution": "paper_db_only"},
+                    "paper_db_only": True,
                 })
                 _notify_text(f" [모의] BUY {name}({ticker}) x{qty_capped} @ {price_i:,} [{batch_name}:SPLIT#{i+1}/{slices}]",
                              key=f"phase:paper_buy:{ticker}:{self.run_id}", cooldown=20)
 
-        if any_ok and self.is_real_trading:
+        if any_ok and self.kis_order_api_enabled:
             # 슬라이스 완료 후 1회만 계좌 갱신, 통계 1회만 반영
             self._update_account_info(force=True)
             self.stats["buy"] += 1
@@ -2290,7 +2365,7 @@ class Trader:
         # 분할이 비활성 또는 조건 미충족이면 단일 주문 (완전한 검증 시스템 적용)
         logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty} @ {order_price:,}")
 
-        if self.is_real_trading:
+        if self.kis_order_api_enabled:
             # 완전 검증 + 공통 후처리 사용
             res = self._execute_order_with_full_validation(ticker, name, qty, order_price, batch_name)
             status, executed_qty = self._finalize_buy_result(
@@ -2311,8 +2386,9 @@ class Trader:
         else:
             record_trade({
                 "side": "buy", "ticker": ticker, "name": name,
-                "qty": qty, "price": order_price, "trade_status": "completed",
-                "strategy_details": {"batch": batch_name}
+                "qty": qty, "price": order_price, "trade_status": "paper_executed",
+                "strategy_details": {"batch": batch_name, "execution": "paper_db_only"},
+                "paper_db_only": True,
             })
             _notify_text(
                 f" [모의] BUY {name}({ticker}) x{qty} @ {order_price:,} [{batch_name}]",
@@ -2505,8 +2581,8 @@ class Trader:
                     self.stats["hold"] += 1
                     continue
                 
-                if not self.is_real_trading:
-                    logger.info(f"ℹ️ 부분 익절 조건 충족했으나 실거래 모드 아님: {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%}) - 시뮬레이션 모드")
+                if not self.kis_order_api_enabled:
+                    logger.info(f"ℹ️ 부분 익절 조건 충족했으나 주문 API 비활성(env={self.env}): {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%}) - paper_db_only")
                     # 부분익절 후 재매수(재진입/추가매수) 차단: 모의환경도 동일하게 처리
                     try:
                         self._mark_partial_sell(ticker)
@@ -2592,7 +2668,7 @@ class Trader:
             
             executed_sell = True
 
-            if self.is_real_trading:
+            if self.kis_order_api_enabled:
                 pre_qty = self._get_qty(holdings, ticker)
 
                 # 매도 주문 타입 결정 (시장가 vs 지정가)
@@ -2746,7 +2822,7 @@ class Trader:
                     # 연속 실패 누적 → 기준 도달 시에만 쿨독
                     self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=True)
 
-            else:
+            elif self.is_paper_db_only:
                 logger.info(f"[모의] {name}({ticker}) {quantity}주 시장가 매도 실행.")
                 record_trade({
                     "side": "sell", "ticker": ticker, "name": name,
@@ -3152,7 +3228,7 @@ class Trader:
             logger.info(f"종목 {ticker} 비중 조정 매도: {sell_qty}주 (현재: {current_qty}주, 비중: {current_weight:.1%} → {target_weight:.1%})")
             
             # 매도 주문 실행
-            if self.is_real_trading:
+            if self.kis_order_api_enabled:
                 result = self._order_cash_retry(
                     ord_dv="01",  # 매도
                     pdno=ticker, 
@@ -3172,7 +3248,7 @@ class Trader:
                 else:
                     logger.error(f"❌ {ticker} 비중 조정 매도 실패: {result}")
                     return False
-            else:
+            elif self.is_paper_db_only:
                 logger.info(f"[SIMULATION] {ticker} 비중 조정 매도 시뮬레이션: {sell_qty}주")
                 return True
                 
@@ -4173,7 +4249,7 @@ class Trader:
         """prod 실계좌에서 asset_allocation 주문 허용 여부 (Phase 6 fail-safe)."""
         if not self.asset_allocation_enabled:
             return True
-        if not self.is_real_trading:
+        if not self.is_prod_order_api:
             return True
         flag = os.getenv("ASSET_ALLOCATION_ALLOW_PROD", "").strip().lower()
         return flag in ("1", "true", "yes")
@@ -4264,6 +4340,7 @@ class Trader:
         current_price = 0
         order_qty = 0
         order_price = 0
+        order_api_result: Optional[Dict[str, Any]] = None
 
         if final_budget <= 0:
             order_result = "skipped_zero_budget"
@@ -4294,12 +4371,13 @@ class Trader:
                             order_result = "skipped_qty_lt_1"
                         elif self.min_order_cash > 0 and (order_qty * order_price) < self.min_order_cash:
                             order_result = "skipped_min_order_cash"
-                        elif not self.is_real_trading:
+                        elif self.is_paper_db_only:
                             order_result = "paper_executed"
                             logger.info(
-                                f"[모의] {name}({ticker}) {order_qty}주 @{order_price:,}원 459580 매수 [{final_budget:,}원 한도]"
+                                f"[모의] {name}({ticker}) {order_qty}주 @{order_price:,}원 459580 매수 "
+                                f"[{final_budget:,}원 한도] execution=paper_db_only"
                             )
-                        else:
+                        elif self.kis_order_api_enabled:
                             result = self._order_cash_retry(
                                 ord_dv="02",
                                 pdno=ticker,
@@ -4307,6 +4385,7 @@ class Trader:
                                 ord_qty=str(order_qty),
                                 ord_unpr=str(int(order_price)),
                             )
+                            order_api_result = result
                             if result.get("ok"):
                                 order_result = "executed"
                                 self.stats["buy"] += 1
@@ -4315,6 +4394,8 @@ class Trader:
                                 logger.warning(
                                     f"[ASSET_ALLOCATION_POST_STOCK_ORDER] 459580 주문 실패: {result.get('msg1')}"
                                 )
+                        else:
+                            order_result = "skipped_order_api_disabled"
 
         logger.info(
             "[ASSET_ALLOCATION_POST_STOCK_ORDER]\n"
@@ -4334,6 +4415,7 @@ class Trader:
             amount = order_qty * record_price
             commission_rate = float(self.trading_params.get("commission_rate", 0.00015))
             commission = int(amount * commission_rate)
+            exec_mode = self._execution_mode()
             structured_context = {
                 "initial_bond_buy_budget": allocation.initial_bond_buy_budget,
                 "final_bond_buy_budget": final_budget,
@@ -4342,11 +4424,15 @@ class Trader:
                 "current_price": current_price,
                 "order_result": order_result,
                 "mode": self.env,
-                "execution": "paper_db_only" if not self.is_real_trading else "live",
+                "endpoint_type": self._account_type_label(),
+                "kis_order_api": self.kis_order_api_enabled,
+                "execution": exec_mode,
             }
-            trade_status = "paper_executed" if not self.is_real_trading else "executed"
+            if order_api_result is not None:
+                structured_context["kis_order_response"] = order_api_result
+            trade_status = "paper_executed" if self.is_paper_db_only else "executed"
             bond_payload = self._build_trade_record(
-                order_id="",
+                res=order_api_result,
                 ticker=ticker,
                 name=name,
                 side="buy",
@@ -4358,7 +4444,7 @@ class Trader:
                 reason_code="ASSET_ALLOCATION_BOND_BUY",
                 sell_reason="",
                 structured_context=structured_context,
-                paper_db_only=not self.is_real_trading,
+                paper_db_only=self.is_paper_db_only,
                 commission=commission,
                 tax=0.0,
                 total_cost=amount + commission,
@@ -4366,13 +4452,16 @@ class Trader:
             )
             recorded, record_id = record_trade(bond_payload)
 
-        exec_mode = "paper_db_only" if not self.is_real_trading else "live"
+        exec_mode = self._execution_mode()
+        order_id_log = ""
+        if order_api_result is not None:
+            order_id_log = self._extract_order_id(order_api_result) or ""
         logger.info(
             f"[ASSET_ALLOCATION_BOND_BUY] ticker={ticker} qty={order_qty} "
             f"price={order_price if order_price > 0 else current_price} budget={final_budget} "
             f"result={order_result} recorded={str(recorded).lower()} "
             f"record_id={record_id if record_id is not None else '-'} "
-            f"mode={self.env} real_trading={self.is_real_trading} execution={exec_mode}"
+            f"mode={self.env} execution={exec_mode} order_id={order_id_log or '-'}"
         )
 
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):
@@ -4659,7 +4748,7 @@ class Trader:
                     continue
 
                 # ② 분할이 아니면 단일 주문 (개선된 로직)
-                if self.is_real_trading:
+                if self.kis_order_api_enabled:
                     # 1차: 동적 지정가로 주문 시도
                     result = self._order_cash_retry(
                         ord_dv="02", pdno=ticker, ord_dvsn="00", ord_qty=str(quantity), ord_unpr=str(int(order_price))
@@ -4908,13 +4997,14 @@ class Trader:
                     actual_spent = quantity * order_price
                     remaining_cash -= actual_spent
                     any_order_placed = True
-                    # ✅ 매수 통계 반영(모의)
+                    # ✅ 매수 통계 반영(vps paper_db_only)
                     self.stats["buy"] += 1
                     record_trade(self._build_trade_record(
                         order_id="", ticker=ticker, name=name, side="buy",
-                        qty=quantity, price=order_price, trade_status="completed",
+                        qty=quantity, price=order_price, trade_status="paper_executed",
                         gpt_analysis=plan,
-                        strategy_details={"batch": batch_name},
+                        strategy_details={"batch": batch_name, "execution": "paper_db_only"},
+                        paper_db_only=True,
                     ))
                     logger.info(f"  -> [모의] {name}({ticker}) {quantity}주 @{order_price:,.0f}원 지정가 매수 실행. [{batch_name}]")
                     _notify_text(
@@ -5320,7 +5410,7 @@ class Trader:
                     logger.info(f"  -> 예산 부족으로 단일 지정가 주문 시도: {name}({ticker})")
             
             # 단일 지정가 주문 시도
-            if self.is_real_trading:
+            if self.kis_order_api_enabled:
                 logger.info(f"  -> 단일 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {order_price:,}원")
                 res = self._order_cash_retry(
                     ord_dv="02", pdno=ticker, ord_dvsn="00",
@@ -5401,8 +5491,9 @@ class Trader:
                 logger.info(f"  -> [모의] 단일 지정가 주문 성공: {name}({ticker})")
                 record_trade(self._build_trade_record(
                     order_id="", ticker=ticker, name=name, side="buy",
-                    qty=quantity, price=order_price, trade_status="completed",
-                    strategy_details={"batch": "NEW"},
+                    qty=quantity, price=order_price, trade_status="paper_executed",
+                    strategy_details={"batch": "NEW", "execution": "paper_db_only"},
+                    paper_db_only=True,
                 ))
                 
                 # 통계 업데이트
@@ -5999,11 +6090,14 @@ if __name__ == "__main__":
         trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
 
         # 종료 시점 간단 상태 로그(참고용)
-        if trader.is_real_trading:
+        if trader.kis_order_api_enabled:
             cash_end, holdings_end, _ = trader.get_account_info_from_files()
             logger.info(f"[END] 보유: {len(holdings_end)}개, 예수금: {cash_end:,}원")
         else:
-            logger.info("[END][MOCK] 실거래 아님 → 최종 보유/예수금은 실계좌 스냅샷과 다를 수 있음(모의 체결은 DB에만 기록).")
+            logger.info(
+                f"[END][{trader.env}] KIS 주문 API 비활성 → 최종 보유/예수금은 "
+                "실계좌 스냅샷과 다를 수 있음(paper_db_only는 DB에만 기록)."
+            )
 
     except Exception as e:
         logger.critical(f"트레이더 실행 중 심각한 오류 발생: {e}", exc_info=True)

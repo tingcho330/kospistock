@@ -16,6 +16,10 @@ class DomesticStock:
         self.cano = getattr(self, 'cano', '')
         self.acnt_prdt_cd = getattr(self, 'acnt_prdt_cd', '')
 
+    def _is_paper_api_env(self) -> bool:
+        """모의투자 API (vps 조회 / kis_paper 주문) — openapivts + VTTC TR."""
+        return getattr(self, 'env', 'prod') in ('vps', 'kis_paper')
+
     def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str):
         """
         주식현재가 시세
@@ -44,7 +48,7 @@ class DomesticStock:
         주식 잔고 조회
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-balance"
-        is_vps = getattr(self, 'env', 'prod') == 'vps'
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC8434R" if is_vps else "TTTC8434R"
         
         params = {
@@ -87,7 +91,7 @@ class DomesticStock:
         TR: TTTC8494R (실전) / VTTC8494R (모의)
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl"
-        is_vps = getattr(self, "env", "prod") == "vps"
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC8494R" if is_vps else "TTTC8494R"
 
         params = {
@@ -133,7 +137,7 @@ class DomesticStock:
         TR: TTTC8715R (실전) / VTTC8715R (모의)
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-period-trade-profit"
-        is_vps = getattr(self, "env", "prod") == "vps"
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC8715R" if is_vps else "TTTC8715R"
 
         detail_frames = []
@@ -197,7 +201,11 @@ class DomesticStock:
         ord_dv: "01": 매도, "02": 매수
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/order-cash"
-        tr_id = "TTTC0802U" if ord_dv == "02" else "TTTC0801U"
+        is_paper = self._is_paper_api_env()
+        if is_paper:
+            tr_id = "VTTC0802U" if ord_dv == "02" else "VTTC0801U"
+        else:
+            tr_id = "TTTC0802U" if ord_dv == "02" else "TTTC0801U"
         
         data = {
             "CANO": self.cano,
@@ -231,7 +239,7 @@ class DomesticStock:
         주식 주문 조회 (미체결 주문 포함)
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-orders"
-        is_vps = getattr(self, 'env', 'prod') == 'vps'
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC8001R" if is_vps else "TTTC8001R"
         
         params = {
@@ -298,7 +306,7 @@ class DomesticStock:
         - TR_ID: 실전 TTTC8001R / 모의 VTTC8001R (3개월 이내).
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        is_vps = getattr(self, 'env', 'prod') == 'vps'
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC8001R" if is_vps else "TTTC8001R"
 
         frames = []
@@ -413,7 +421,7 @@ class DomesticStock:
         주식 주문 취소
         """
         url = f"{self.url_base}/uapi/domestic-stock/v1/trading/order-cash"
-        is_vps = getattr(self, 'env', 'prod') == 'vps'
+        is_vps = self._is_paper_api_env()
         tr_id = "VTTC0803U" if is_vps else "TTTC0803U"
         
         data = {
