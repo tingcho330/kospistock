@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from settings import settings
-from utils import setup_logging, KST
+from utils import setup_logging, KST, get_account_snapshot_cached
 from api.kis_auth import KIS
 from recorder import get_recorder
 
@@ -207,6 +207,87 @@ def _row_target_qty(row: Dict[str, Any]) -> int:
     return _safe_int(row.get("quantity", 0))
 
 
+def _load_holdings_by_ticker() -> Dict[str, Dict[str, Any]]:
+    """최신 balance 스냅샷 → ticker → holding row."""
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        _, balance_list, _, _ = get_account_snapshot_cached()
+        for h in balance_list or []:
+            if not isinstance(h, dict):
+                continue
+            t = str(h.get("pdno", h.get("ticker", "")) or "").zfill(6)
+            if t and t != "000000":
+                out[t] = h
+    except Exception as e:
+        logger.warning("balance 스냅샷 로드 실패(holding fallback 비활성): %s", e)
+    return out
+
+
+def _holding_fill_price(holding: Dict[str, Any]) -> Optional[int]:
+    """평균매입가 또는 pchs_amt/hldg_qty."""
+    avg = _safe_int(holding.get("pchs_avg_pric", 0))
+    if avg > 0:
+        return avg
+    qty = _safe_int(holding.get("hldg_qty", 0))
+    amt = _safe_int(holding.get("pchs_amt", 0))
+    if qty > 0 and amt > 0:
+        return int(amt / qty)
+    prpr = _safe_int(holding.get("prpr", 0))
+    return prpr if prpr > 0 else None
+
+
+def _try_reconcile_buy_by_holding(
+    row: Dict[str, Any],
+    holdings_by_ticker: Dict[str, Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    KIS 주문조회 miss 시 BUY pending을 계좌 잔고로 executed 판정.
+    SELL은 별도 로직(미구현) — None 반환.
+    """
+    action = str(row.get("action") or row.get("side") or "").strip().upper()
+    if action not in ("BUY", "B"):
+        return None
+
+    ticker = str(row.get("ticker") or "").zfill(6)
+    requested_qty = _row_target_qty(row)
+    if not ticker or requested_qty <= 0:
+        return None
+
+    holding = holdings_by_ticker.get(ticker)
+    if not holding:
+        return None
+
+    hldg_qty = _safe_int(holding.get("hldg_qty", 0))
+    thdt_buyqty = _safe_int(holding.get("thdt_buyqty", 0))
+    if hldg_qty < requested_qty and thdt_buyqty < requested_qty:
+        return None
+
+    fill_price = _holding_fill_price(holding)
+    return {
+        "status": "executed",
+        "executed_qty": requested_qty,
+        "avg_price": fill_price or 0,
+        "holding_qty": hldg_qty,
+        "thdt_buyqty": thdt_buyqty,
+    }
+
+
+def _apply_reconcile_update(
+    recorder,
+    *,
+    order_id: str,
+    new_status: str,
+    executed_qty: int,
+    price: Optional[int],
+) -> int:
+    return recorder.update_order_status(
+        order_id=order_id,
+        order_status=new_status,
+        executed_qty=executed_qty,
+        price=price if price and price > 0 else None,
+    )
+
+
 def _match_kis_candidates(
     row: Dict[str, Any],
     daily_orders: Dict[str, Dict[str, Any]],
@@ -292,7 +373,7 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
         _db_dbg_skip(
             "reconciler.backfill.SKIP",
             reason="no orphan records",
-            step="backfill",
+            phase="backfill",
             since_hours=since_hours,
             limit=limit,
             orphan_count=0,
@@ -314,7 +395,7 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
         _db_dbg_skip(
             "reconciler.backfill.SKIP",
             reason="no daily orders found",
-            step="backfill",
+            phase="backfill",
             since_hours=since_hours,
             limit=limit,
             orphan_count=len(orphans),
@@ -457,6 +538,8 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         f"({start_ymd}~{end_ymd})"
     )
     daily_orders: Optional[Dict[str, Dict[str, Any]]] = None
+    holdings_by_ticker = _load_holdings_by_ticker()
+    logger.info("holding fallback용 잔고 종목: %d건", len(holdings_by_ticker))
 
     updated = 0
     to_executed = 0
@@ -465,8 +548,10 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     to_cancelled = 0
     skipped_no_order_id = 0
     skipped_kis_miss = 0
-    resolved_by_daily = 0
-    still_missing_after_daily = 0
+    updated_by_order_query = 0
+    updated_by_daily_query = 0
+    updated_by_holding_fallback = 0
+    still_missing_after_all = 0
 
     for r in open_rows:
         order_id = str(r.get("order_id") or "").strip()
@@ -480,10 +565,11 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             )
             continue
 
-        # 1) inquire_orders 결과로 먼저 매칭
+        reconcile_source = None
         kis_o = open_orders.get(order_id)
-        # 2) 누락이면 daily를 1회만 로드해서 보완
-        if not kis_o:
+        if kis_o:
+            reconcile_source = "order_query"
+        else:
             if daily_orders is None:
                 daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
                 logger.info(
@@ -491,52 +577,71 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
                     f"({start_ymd}~{end_ymd})"
                 )
             kis_o = (daily_orders or {}).get(order_id)
+            if kis_o:
+                reconcile_source = "daily_query"
 
+        holding_match: Optional[Dict[str, Any]] = None
         if not kis_o:
             skipped_kis_miss += 1
-            if daily_orders is None:
+            ticker = str(r.get("ticker") or "").zfill(6)
+            logger.warning(
+                "KIS 주문조회 miss: order_id=%s ticker=%s db_status=%s — holding fallback 시도",
+                order_id, ticker, r.get("order_status"),
+            )
+            holding_match = _try_reconcile_buy_by_holding(r, holdings_by_ticker)
+            if not holding_match:
+                still_missing_after_all += 1
                 _db_dbg_skip(
-                    "reconciler.loop.SKIP_KIS_MISS_OPEN_ONLY",
-                    reason="order_id not in inquire_orders (daily not fetched because no misses trigger?)",
-                    order_id=order_id,
-                    ticker=r.get("ticker"),
-                    db_status=r.get("order_status"),
-                )
-            else:
-                still_missing_after_daily += 1
-                _db_dbg_skip(
-                    "reconciler.loop.SKIP_KIS_MISS_AFTER_DAILY",
-                    reason="order_id not in inquire_orders nor inquire_daily_order",
+                    "reconciler.loop.SKIP_KIS_MISS_AFTER_ALL",
+                    reason="order_id not in KIS queries and holding fallback failed",
                     order_id=order_id,
                     ticker=r.get("ticker"),
                     db_status=r.get("order_status"),
                 )
                 _db_dbg_log(
-                    "reconciler.miss_after_daily.DIAG",
-                    hint="common causes: (1) wrong env(prod/vps) (2) different account/product (3) date boundary/KST vs server (4) order_id not saved correctly (5) KIS retention/filters",
+                    "reconciler.miss_after_all.DIAG",
+                    hint="KIS miss + holding fallback failed",
                     env=env,
-                    today=today,
-                    kis_cano=_mask_account(getattr(kis, "cano", None)),
-                    kis_acnt_prdt_cd=str(getattr(kis, "acnt_prdt_cd", "") or ""),
                     order_id=order_id,
                     db_row_id=r.get("id"),
-                    db_ts=r.get("timestamp"),
                     db_ticker=r.get("ticker"),
-                    db_side=r.get("side") or r.get("action"),
-                    db_status=r.get("order_status"),
                     db_requested_qty=r.get("requested_qty"),
-                    db_executed_qty=r.get("executed_qty"),
                 )
+                continue
+            reconcile_source = "holding_fallback"
+
+        if reconcile_source == "holding_fallback":
+            assert holding_match is not None
+            new_status = str(holding_match.get("status") or "executed")
+            kis_exe = _safe_int(holding_match.get("executed_qty", 0))
+            fill_price = _safe_int(holding_match.get("avg_price", 0))
+            logger.info(
+                "[RECONCILE_BY_HOLDING] order_id=%s ticker=%s requested_qty=%s "
+                "holding_qty=%s thdt_buyqty=%s status=%s",
+                order_id,
+                str(r.get("ticker") or "").zfill(6),
+                _row_target_qty(r),
+                holding_match.get("holding_qty"),
+                holding_match.get("thdt_buyqty"),
+                new_status,
+            )
+            n = _apply_reconcile_update(
+                recorder,
+                order_id=order_id,
+                new_status=new_status,
+                executed_qty=kis_exe,
+                price=fill_price if fill_price > 0 else None,
+            )
+            if n:
+                updated += n
+                updated_by_holding_fallback += n
+                if new_status == "executed":
+                    to_executed += n
             continue
-        else:
-            # daily에서 해결된 케이스 카운트(=open에 없고 daily에만 있었던 것)
-            if daily_orders is not None and order_id not in open_orders:
-                resolved_by_daily += 1
 
         requested_qty = _safe_int(r.get("requested_qty", 0))
         kis_qty = _safe_int(kis_o.get("quantity", 0))
         kis_exe = _safe_int(kis_o.get("executed_qty", 0))
-        # requested_qty가 0이면 KIS ord_qty로 보정
         if requested_qty <= 0 and kis_qty > 0:
             requested_qty = kis_qty
 
@@ -557,15 +662,21 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             new_status=new_status,
             requested_qty=requested_qty,
             kis_exe=kis_exe,
+            reconcile_source=reconcile_source,
         )
-        n = recorder.update_order_status(
+        n = _apply_reconcile_update(
+            recorder,
             order_id=order_id,
-            order_status=new_status,
+            new_status=new_status,
             executed_qty=kis_exe,
-            price=(kis_o.get("avg_price") or None) if int(kis_o.get("avg_price") or 0) > 0 else None,
+            price=_safe_int(kis_o.get("avg_price", 0)) or None,
         )
         if n:
             updated += n
+            if reconcile_source == "order_query":
+                updated_by_order_query += n
+            elif reconcile_source == "daily_query":
+                updated_by_daily_query += n
             if new_status == "executed":
                 to_executed += n
             elif new_status == "partial":
@@ -586,16 +697,22 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         "open_rows_with_order_id": len(open_rows),
         "kis_open_orders_inquire_orders": len(open_orders),
         "kis_daily_orders_fetched": 0 if daily_orders is None else len(daily_orders),
-        "resolved_by_daily": resolved_by_daily,
-        "still_missing_after_daily": still_missing_after_daily,
+        "holdings_loaded": len(holdings_by_ticker),
+        "updated_by_order_query": updated_by_order_query,
+        "updated_by_daily_query": updated_by_daily_query,
+        "updated_by_holding_fallback": updated_by_holding_fallback,
+        "still_missing_after_all": still_missing_after_all,
+        # legacy keys
+        "resolved_by_daily": updated_by_daily_query,
+        "still_missing_after_daily": still_missing_after_all,
     }
     logger.info(f"리컨실 결과: {summary}")
     _db_dbg_log("reconciler.done", **summary)
-    if still_missing_after_daily > 0:
+    if still_missing_after_all > 0:
         logger.warning(
-            "리컨실 미해결 주문이 있습니다(still_missing_after_daily=%s). "
+            "리컨실 미해결 주문이 있습니다(still_missing_after_all=%s). "
             "env/계좌/날짜경계/DB order_id 저장 여부를 점검하세요.",
-            still_missing_after_daily,
+            still_missing_after_all,
         )
     if _db_dbg_enabled() and skipped_kis_miss == 0 and updated == 0 and open_rows:
         _db_dbg_skip(
