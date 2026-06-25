@@ -50,6 +50,107 @@ def is_completed_sell(trade: Any) -> bool:
     return status == "executed" and qty > 0 and price > 0
 
 
+def _parse_structured_context_dict(trade: Any) -> Dict[str, Any]:
+    raw = getattr(trade, "structured_context", "") or ""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def classify_trade_record(
+    trade: Any,
+    *,
+    trading_environment: Optional[str] = None,
+) -> str:
+    """
+    trade_records 분류.
+    - paper_db_only: VPS paper_executed / order_id 없는 테스트성 기록
+    - kis_paper_order: kis_paper 환경에서 order_id 있는 실주문 기록
+    - kis_prod_order: prod 실계좌 주문
+    """
+    status = str(getattr(trade, "order_status", "") or "").lower()
+    order_id = str(getattr(trade, "order_id", "") or "").strip()
+    reason_code = str(getattr(trade, "reason_code", "") or "").strip().upper()
+    ctx = _parse_structured_context_dict(trade)
+
+    if reason_code in ("PAPER_DB_ONLY", "PAPER_DB_ONLY_TEST"):
+        return "paper_db_only"
+    if ctx.get("classification") == "paper_db_only" or ctx.get("paper_db_only"):
+        return "paper_db_only"
+    if ctx.get("execution") == "paper_db_only":
+        return "paper_db_only"
+    if status == "paper_executed":
+        return "paper_db_only"
+    if order_id and status in ("executed", "completed", "partial", "pending"):
+        env = (trading_environment or os.getenv("TRADING_ENVIRONMENT", "") or "").lower()
+        if env == "prod":
+            return "kis_prod_order"
+        if env == "kis_paper":
+            return "kis_paper_order"
+        if env == "vps":
+            return "paper_db_only"
+        return "kis_order"
+    return "unknown"
+
+
+def is_real_kis_trade_record(
+    trade: Any,
+    *,
+    trading_environment: Optional[str] = None,
+) -> bool:
+    """실제 KIS 주문 기록(모의/실계좌) 여부 — paper_db_only 테스트 기록 제외."""
+    return classify_trade_record(trade, trading_environment=trading_environment) in (
+        "kis_paper_order",
+        "kis_prod_order",
+        "kis_order",
+    )
+
+
+def log_trade_record_classify(
+    trade: Any,
+    *,
+    record_id: Any = None,
+    trading_environment: Optional[str] = None,
+) -> str:
+    classification = classify_trade_record(trade, trading_environment=trading_environment)
+    rid = record_id if record_id is not None else getattr(trade, "record_id", None) or getattr(trade, "id", "-")
+    oid = str(getattr(trade, "order_id", "") or "").strip() or "-"
+    logging.getLogger(__name__).info(
+        "[TRADE_RECORD_CLASSIFY] id=%s ticker=%s status=%s order_id=%s classification=%s",
+        rid,
+        getattr(trade, "ticker", ""),
+        getattr(trade, "order_status", ""),
+        oid,
+        classification,
+    )
+    return classification
+
+
+def merge_structured_context(
+    existing: Any,
+    updates: Dict[str, Any],
+) -> str:
+    """기존 structured_context JSON에 updates 병합."""
+    base: Dict[str, Any] = {}
+    if isinstance(existing, dict):
+        base = dict(existing)
+    elif isinstance(existing, str) and existing:
+        try:
+            parsed = json.loads(existing)
+            if isinstance(parsed, dict):
+                base = parsed
+        except Exception:
+            pass
+    base.update({k: v for k, v in updates.items() if v is not None})
+    return json.dumps(base, ensure_ascii=False)
+
+
 def is_countable_loss_sell(trade: Any) -> bool:
     """
     연속 손실·일일 손실 집계에 포함할 매도 거래인지 판별.
@@ -102,6 +203,7 @@ class TradeRecord:
     net_amount: float
     profit_loss: float = 0.0
     holding_period_days: int = 0
+    record_id: Optional[int] = None
     sector: str = ""
     market_regime: str = ""
     order_status: str = "executed"  # executed | pending | cancelled (당일 매도 방지용)
@@ -733,10 +835,12 @@ class DataRecorder:
         order_status: str,
         executed_qty: Optional[int] = None,
         price: Optional[float] = None,
+        amount: Optional[float] = None,
         profit_loss: Optional[float] = None,
         sell_reason: Optional[str] = None,
         reason_code: Optional[str] = None,
         structured_context: Optional[str] = None,
+        merge_context: bool = False,
     ) -> int:
         """order_id 기준 상태 갱신. 반환: 업데이트 행 수."""
         try:
@@ -762,6 +866,9 @@ class DataRecorder:
             if price is not None:
                 sets.append("price = ?")
                 params.append(float(price))
+            if amount is not None:
+                sets.append("amount = ?")
+                params.append(float(amount))
             if profit_loss is not None:
                 sets.append("profit_loss = ?")
                 params.append(float(profit_loss))
@@ -772,8 +879,25 @@ class DataRecorder:
                 sets.append("reason_code = ?")
                 params.append(str(reason_code))
             if structured_context:
+                ctx_value = str(structured_context)
+                if merge_context:
+                    with sqlite3.connect(self.db_path) as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT structured_context FROM trade_records WHERE order_id = ? LIMIT 1",
+                            (order_id,),
+                        )
+                        row = cur.fetchone()
+                    existing_ctx = row[0] if row else ""
+                    try:
+                        updates = json.loads(ctx_value) if ctx_value.startswith("{") else {}
+                    except Exception:
+                        updates = {}
+                    if not isinstance(updates, dict):
+                        updates = {}
+                    ctx_value = merge_structured_context(existing_ctx, updates)
                 sets.append("structured_context = ?")
-                params.append(str(structured_context))
+                params.append(ctx_value)
 
             params.append(order_id)
             with sqlite3.connect(self.db_path) as conn:
@@ -822,7 +946,8 @@ class DataRecorder:
                 where += " AND timestamp >= ?"
                 params.append(since_ts)
             q = f"""
-                SELECT id, timestamp, ticker, action, quantity, price, requested_qty, executed_qty, order_status, order_id
+                SELECT id, timestamp, ticker, action, quantity, price, amount, requested_qty,
+                       executed_qty, order_status, order_id, structured_context
                 FROM trade_records
                 {where}
                 ORDER BY timestamp DESC
@@ -843,10 +968,12 @@ class DataRecorder:
                         "action": r[3],
                         "quantity": r[4],
                         "price": r[5],
-                        "requested_qty": r[6],
-                        "executed_qty": r[7],
-                        "order_status": r[8],
-                        "order_id": r[9],
+                        "amount": r[6],
+                        "requested_qty": r[7],
+                        "executed_qty": r[8],
+                        "order_status": r[9],
+                        "order_id": r[10],
+                        "structured_context": r[11] if len(r) > 11 else "",
                     }
                 )
             orphan_pending = 0
@@ -1134,6 +1261,7 @@ class DataRecorder:
         """SQLite trade_records 행 → TradeRecord."""
         order_status = (row[15] or "executed") if len(row) > 15 else "executed"
         return TradeRecord(
+            record_id=int(row[0]) if row and row[0] is not None else None,
             timestamp=datetime.fromisoformat(row[1]),
             ticker=row[2],
             action=row[3],
@@ -1800,7 +1928,16 @@ def record_trade(trade_data: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
         # 매도 사유/코드(있으면 저장)
         sell_reason = trade_data.get("sell_reason") or trade_data.get("reason") or ""
         reason_code = trade_data.get("reason_code") or trade_data.get("strategy_details", {}).get("reason_code", "") or ""
+        if trade_data.get("paper_db_only") and not reason_code:
+            reason_code = "PAPER_DB_ONLY"
         structured_context = trade_data.get("structured_context") or trade_data.get("strategy_details", {})
+        if trade_data.get("paper_db_only") and isinstance(structured_context, dict):
+            structured_context = {
+                **structured_context,
+                "classification": "paper_db_only",
+                "execution": "paper_db_only",
+                "paper_db_only": True,
+            }
         try:
             if isinstance(structured_context, (dict, list)):
                 structured_context = json.dumps(structured_context, ensure_ascii=False)
@@ -1901,6 +2038,17 @@ def record_trade(trade_data: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
             profit_loss=profit_loss,
             record_id=record_id,
         )
+        if ok and record_id is not None:
+            try:
+                from settings import settings as _settings
+                env = _settings._config.get("trading_environment", "vps")
+            except Exception:
+                env = None
+            log_trade_record_classify(
+                trade_record,
+                record_id=record_id,
+                trading_environment=env,
+            )
         return ok, record_id
         
     except Exception as e:

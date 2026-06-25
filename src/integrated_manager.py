@@ -465,7 +465,7 @@ def _get_daily_trade_stats(date_yyyymmdd: str) -> Dict:
         "trade_count": 0,
     }
     try:
-        from recorder import DataRecorder, is_completed_sell
+        from recorder import DataRecorder, is_completed_sell, is_real_kis_trade_record
 
         db_path = str(OUTPUT_DIR / "trading_data.db")
         if not Path(db_path).exists():
@@ -482,13 +482,24 @@ def _get_daily_trade_stats(date_yyyymmdd: str) -> Dict:
             not in ("pending", "cancelled", "failed", "submitted")
             and (int(getattr(t, "executed_qty", 0) or 0) > 0 or int(getattr(t, "quantity", 0) or 0) > 0)
         ]
+        # paper_db_only 테스트 기록은 BUY 집계에서 제외 (실주문과 중복 카운트 방지)
+        try:
+            from settings import settings as _settings
+            _env = _settings._config.get("trading_environment", "vps")
+        except Exception:
+            _env = "vps"
+        countable = [
+            t for t in completed
+            if str(getattr(t, "action", "")).upper() == "SELL"
+            or is_real_kis_trade_record(t, trading_environment=_env)
+        ]
         sells = [t for t in completed if is_completed_sell(t)]
 
         out["realized_pnl"] = int(round(sum(float(t.profit_loss or 0) for t in sells)))
         out["fees_taxes"] = int(
-            round(sum(float(t.commission or 0) + float(t.tax or 0) for t in completed))
+            round(sum(float(t.commission or 0) + float(t.tax or 0) for t in countable))
         )
-        out["trade_count"] = len(completed)
+        out["trade_count"] = len(countable)
     except Exception as e:
         logger.warning(f"당일 거래 DB 집계 실패: {type(e).__name__}: {e}")
     return out

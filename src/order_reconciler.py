@@ -11,6 +11,7 @@ Order reconciler
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -18,7 +19,7 @@ from typing import Dict, Any, List, Optional
 from settings import settings
 from utils import setup_logging, KST, get_account_snapshot_cached
 from api.kis_auth import KIS
-from recorder import get_recorder
+from recorder import get_recorder, log_trade_record_classify
 
 try:
     from db_debug import log as _db_dbg_log, log_skip as _db_dbg_skip, is_enabled as _db_dbg_enabled
@@ -276,16 +277,62 @@ def _apply_reconcile_update(
     recorder,
     *,
     order_id: str,
+    row: Dict[str, Any],
     new_status: str,
     executed_qty: int,
     price: Optional[int],
+    reconciled_price_source: Optional[str] = None,
 ) -> int:
+    amount: Optional[int] = None
+    ctx_updates: Optional[Dict[str, Any]] = None
+    original_price = _safe_int(row.get("price", 0))
+    if price and executed_qty > 0:
+        amount = int(price) * int(executed_qty)
+        if reconciled_price_source and (
+            original_price != int(price)
+            or _safe_int(row.get("amount", 0)) != amount
+        ):
+            ctx_updates = {
+                "original_order_price": original_price if original_price > 0 else None,
+                "reconciled_price_source": reconciled_price_source,
+                "reconciled_price": int(price),
+                "reconciled_amount": amount,
+            }
     return recorder.update_order_status(
         order_id=order_id,
         order_status=new_status,
         executed_qty=executed_qty,
         price=price if price and price > 0 else None,
+        amount=float(amount) if amount is not None else None,
+        structured_context=json.dumps(ctx_updates, ensure_ascii=False) if ctx_updates else None,
+        merge_context=bool(ctx_updates),
     )
+
+
+def _is_already_reconciled(
+    row: Dict[str, Any],
+    *,
+    new_status: str,
+    executed_qty: int,
+    price: Optional[int],
+) -> bool:
+    """이미 executed이고 체결 수량·가격이 일치하면 재갱신 생략."""
+    db_status = str(row.get("order_status") or "").lower()
+    if db_status not in ("executed", "completed"):
+        return False
+    db_exe = _safe_int(row.get("executed_qty", 0))
+    req = _row_target_qty(row)
+    target_exe = executed_qty if executed_qty > 0 else req
+    if db_exe < target_exe:
+        return False
+    if price and price > 0:
+        db_price = _safe_int(row.get("price", 0))
+        db_amount = _safe_int(row.get("amount", 0))
+        expected_amount = int(price) * target_exe
+        if db_price == int(price) and (db_amount == expected_amount or db_amount == 0):
+            return True
+        return False
+    return db_exe >= target_exe
 
 
 def _match_kis_candidates(
@@ -530,6 +577,23 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             _db_dbg_log("reconciler.orphan_count.FAIL", error=str(e))
     open_rows = recorder.get_open_orders(statuses=("pending", "partial"), since_ts=since_ts, limit=limit)
     logger.info(f"리컨실 대상(open) {len(open_rows)}건 (since={since_ts})")
+    try:
+        recent_buys = recorder.get_trade_records(start_date=since_dt, action="BUY")
+        for t in recent_buys[:30]:
+            log_trade_record_classify(t, trading_environment=env)
+    except Exception as e:
+        logger.debug("최근 BUY 분류 로그 스킵: %s", e)
+    for row in open_rows[:20]:
+        _row_obj = type("_TradeRow", (), {
+            "ticker": row.get("ticker"),
+            "order_status": row.get("order_status"),
+            "order_id": row.get("order_id"),
+            "reason_code": "",
+            "structured_context": row.get("structured_context", ""),
+        })()
+        log_trade_record_classify(
+            _row_obj, record_id=row.get("id"), trading_environment=env,
+        )
 
     today = end_ymd
     open_orders = _fetch_open_orders_inquire_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
@@ -615,6 +679,16 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             new_status = str(holding_match.get("status") or "executed")
             kis_exe = _safe_int(holding_match.get("executed_qty", 0))
             fill_price = _safe_int(holding_match.get("avg_price", 0))
+            if _is_already_reconciled(
+                r, new_status=new_status, executed_qty=kis_exe, price=fill_price or None
+            ):
+                _db_dbg_skip(
+                    "reconciler.loop.SKIP_ALREADY_EXECUTED",
+                    reason="holding fallback but row already reconciled",
+                    order_id=order_id,
+                    ticker=r.get("ticker"),
+                )
+                continue
             logger.info(
                 "[RECONCILE_BY_HOLDING] order_id=%s ticker=%s requested_qty=%s "
                 "holding_qty=%s thdt_buyqty=%s status=%s",
@@ -628,9 +702,11 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             n = _apply_reconcile_update(
                 recorder,
                 order_id=order_id,
+                row=r,
                 new_status=new_status,
                 executed_qty=kis_exe,
                 price=fill_price if fill_price > 0 else None,
+                reconciled_price_source="holding_fallback_pchs_avg_pric",
             )
             if n:
                 updated += n
@@ -654,6 +730,18 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         else:
             new_status = "executed"
 
+        fill_price_kis = _safe_int(kis_o.get("avg_price", 0)) or None
+        if _is_already_reconciled(
+            r, new_status=new_status, executed_qty=kis_exe, price=fill_price_kis
+        ):
+            _db_dbg_skip(
+                "reconciler.loop.SKIP_ALREADY_EXECUTED",
+                reason="KIS match but row already reconciled",
+                order_id=order_id,
+                ticker=r.get("ticker"),
+            )
+            continue
+
         _db_dbg_log(
             "reconciler.loop.MATCH",
             order_id=order_id,
@@ -667,9 +755,11 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         n = _apply_reconcile_update(
             recorder,
             order_id=order_id,
+            row=r,
             new_status=new_status,
             executed_qty=kis_exe,
-            price=_safe_int(kis_o.get("avg_price", 0)) or None,
+            price=fill_price_kis,
+            reconciled_price_source=reconcile_source,
         )
         if n:
             updated += n

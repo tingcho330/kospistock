@@ -8,7 +8,7 @@
 > * 본 저장소는 **알고리즘 트레이딩 학습·연구 목적**의 예제 코드이며, **투자 조언·수익 보장이 아닙니다.**
 > * 실제 매매에 따른 **손익·세금·법적 책임은 전적으로 사용자**에게 있습니다.
 > * API 장애, 버그, 슬리피지, 급변하는 시장 등으로 **예상치 못한 손실**이 발생할 수 있습니다.
-> * 실전 계좌(`prod`) 투입 전 **`vps`(모의투자)로 충분히 검증**할 것을 권장합니다.
+> * 실전 계좌(`prod`) 투입 전 **`vps` → `kis_paper`(KIS 모의 API) 순으로 충분히 검증**할 것을 권장합니다.
 > * 상세 문구는 [9. 면책 조항](#9-면책-조항-disclaimer)을 참고하세요.
 
 ---
@@ -21,6 +21,7 @@
 4. [모듈 설명](#4-모듈-설명)
    - [4.1 회전 매매 (Rotation)](#41-회전-매매-rotation)
    - [4.2 자산 배분 (Asset Allocation)](#42-자산-배분-asset-allocation)
+   - [4.3 거래 환경 (trading_environment)](#43-거래-환경-trading_environment)
 5. [기술 스택](#5-기술-스택)
 6. [파이프라인 사전 준비](#6-파이프라인-사전-준비)
 7. [설치 및 실행](#7-설치-및-실행)
@@ -71,7 +72,10 @@
   - 레벨 갱신은 **유리한 방향으로만** 허용합니다: 손절가는 내려가지 않고(`max`), 목표가는 올라가지 않습니다(`min`).  
   - `direct_execute` 실패 시 같은 사이클에서 `trader.py --sell-only`로 **매도 fallback** (쿨다운 적용).
 - **KIS 토큰 공유** — 두 컨테이너가 `output/cache/kis_token.json`을 공유. 파일락·EGW00133 backoff·재인증 쿨다운으로 **1분 1회 발급 제한** 대응.
-- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + `order_id` 누락 orphan backfill. `inquire-daily-ccld`의 `avg_prvs`(체결가) 반영·체결 후 PnL 재계산
+- **KIS API 속도 제한** — `config.kis_limits` 환경별 RPS·동시성·EGW00201 백오프(`kis_rate_limit.py`). 스크리너 워커 자동 축소·시세/OHLCV 캐시
+- **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + orphan `order_id` backfill. KIS 주문조회 miss 시 **계좌 잔고 holding fallback**(`[RECONCILE_BY_HOLDING]`). 체결가 `pchs_avg_pric` 반영 시 `amount` 동기화·`structured_context`에 `original_order_price` 보존. 이미 `executed` 행은 idempotent skip
+- **거래 기록 분류** — `paper_executed`(order_id 없음) = `paper_db_only` 테스트 기록 vs `kis_paper` 실주문(`order_id` 있는 `executed`). `[TRADE_RECORD_CLASSIFY]` 로그. 일일 요약 BUY 집계에서 `paper_db_only` 제외
+- **매수 관측성** — `[STOCK_BUDGET_USAGE]`(예산·GPT 후보·실행 금액·미사용 사유), `[REBUY_GUARD]`(보유 종목 재매수 차단), `[BUY_SELECTION_SUMMARY]`(blocked_rebuy 포함)
 - **연속 손실 집계** — `is_countable_loss_sell()` / `count_consecutive_losses()`로 **체결 확정·order_id 있는 손실만** 카운트 (`stop_trading_on_consecutive_losses`, 기본 3회). pending/failed·중복 SELL row 제외
 - **중복 SELL 방지** — `risk_manager` direct_execute 후 `trader.run_sell_logic`이 동일 종목을 재매도·재기록하지 않도록 pending 주문 skip + `order_id` 없는 SELL 중복 INSERT 차단
 - **매수 오기록 방지** — `trader._check_delayed_execution`은 **ODNO·매수/매도 구분** 필수. `split_buy.enabled=false` 시 분할 분기 미진입. `order_id` 없는 체결 BUY/SELL은 `recorder`에서 INSERT 차단
@@ -149,7 +153,7 @@
 | 순자산 변화 · 일일 수익률 | 장시작/종료 **`nass_amt`**(순자산) 차이 — `tot_evlu_amt` 대신 KIS 앱과 동일 필드 우선 |
 | 금일 매수 / 매도 | KIS `thdt_buy_amt` / `thdt_sll_amt` |
 | 실현 손익 (KIS) | `inquire-balance-rlz-pl` → **`rlzt_pfls`** |
-| 실현 손익 (DB) | 당일 체결 매도 `trade_records.profit_loss` 합 — KIS와 ±3,000원 초과 시 ⚠️ |
+| 실현 손익 (DB) | 당일 체결 매도 `trade_records.profit_loss` 합 — KIS와 ±3,000원 초과 시 ⚠️. BUY `trade_count`는 **`kis_paper_order`/`kis_prod_order`만** 집계(`paper_db_only` 제외) |
 | 미실현 손익 | **장중 계속 보유** 종목만: 종료 평가액 − 시작 평가액 |
 | 금일 제비용 | KIS `thdt_tlex_amt` (없으면 DB `commission + tax`) |
 | D+1 / D+2 정산 | `nxdy_excc_amt` / `prvs_rcdl_excc_amt` |
@@ -157,7 +161,7 @@
 | 보유종목 | **장마감** 스냅샷 `holdings_count` |
 
 > 예수금(`dnca_tot_amt`)은 T+2 결제 환경에서 당일 매매 직후 변하지 않을 수 있어 **「현금 변화」 단독 표시는 하지 않습니다.**  
-> DB 실현손익이 KIS와 다르면 `order_reconciler` 실행·`avg_prvs` 체결가 반영·phantom BUY row( `order_id` 없음) 여부를 점검하세요.  
+> DB 실현손익이 KIS와 다르면 `order_reconciler` 실행·체결가(`avg_prvs` / holding `pchs_avg_pric`)·`amount` 정합성·phantom BUY row(`order_id` 없는 `paper_executed`) 여부를 점검하세요.  
 > `account.py`는 `balance_*.json`·`summary_*.json`·`summary_rlz_*.json` 저장용이며, 스케줄 스냅샷은 `daily_balances/`에 별도 저장됩니다.
 
 ### 3.3 스크리너 vs 매매 파이프라인
@@ -373,7 +377,8 @@ Git에는 `output/.gitkeep`만 추적합니다.
 | 매매 기록 | `record_trade()` → `upsert_trade_record_by_order_id()` — `order_id` 있으면 UPSERT. **`executed`/`partial` BUY·SELL은 `order_id` 필수**(모의 `completed` 제외) |
 | 손실 집계 | `is_countable_loss_sell()` — `executed` + `order_id` + `profit_loss < 0` 만 연속·일일 손실에 반영. `pending`/`failed`/중복 row 제외 |
 | 중복 SELL | `find_recent_sell_duplicate()` — 동일 ticker·qty, 10분 이내, 가격 1% 이내. 기존 `order_id` 행 있으면 `duplicate_sell_without_order_id_skipped` 로그 후 skip |
-| 리컨실 (15:22 · 장중 11:00/14:00) | `order_reconciler.py` — `pending`/`partial` + `order_id` 행을 KIS `inquire-orders` / `inquire-daily-ccld`로 동기화. 체결 시 `avg_prvs`→`price` 갱신 + `recompute_profit_loss_for_order_id` |
+| 리컨실 (15:22 · 장중 11:00/14:00) | `order_reconciler.py` — `pending`/`partial` + `order_id` 행을 KIS `inquire-orders` / `inquire-daily-ccld`로 동기화. miss 시 **잔고 holding fallback**(BUY: `hldg_qty`/`thdt_buyqty`). 체결 시 `price`·`amount` 갱신 + `structured_context.reconciled_*` + PnL 재계산. summary: `updated_by_order_query` / `updated_by_daily_query` / `updated_by_holding_fallback` / `still_missing_after_all` |
+| 거래 기록 분류 | `recorder.classify_trade_record()` — `paper_db_only` \| `kis_paper_order` \| `kis_prod_order`. `reason_code=PAPER_DB_ONLY` 또는 `paper_executed`+무`order_id` = 테스트 기록 |
 | orphan backfill | 리컨실 마지막에 자동 실행 — `order_id` 빈 행을 KIS 일별 주문과 **유일 매칭** 시 backfill |
 | 수동 backfill | `python /app/src/order_reconciler.py --since-hours 36 --backfill-only` |
 | subprocess 종료 | 성공 시 stdout JSON 1줄 (`{"ok": true, "updated": ...}`), 실패 시 exit≠0 |
@@ -407,7 +412,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `inquire-orders` | TTTC8001R | 미체결·부분체결 조회 |
 | `inquire-daily-ccld` | TTTC8001R | 일별 주문체결 (`avg_prvs`, `tot_ccld_qty`) |
 | `inquire-period-trade-profit` | TTTC8715R | 기간별 매매손익(종목별 검증용) |
-| `order-cash` | TTTC0801U/0802U | 현금 매수/매도 |
+| `order-cash` | TTTC0801U/0802U (prod) · **VTTC0801U/0802U** (`kis_paper`/`vps` 모의) | 현금 매수/매도 |
 
 - **인증:** `auth()` / `reauthenticate()` — 토큰 파일 캐시 + `request_get`/`request_post` 만료 시 1회 재시도
 - **설정:** `config/.env` + `config/kis_devlp.yaml` (`load_kis_config()`)
@@ -438,14 +443,15 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `health_check.py` | KIS 헬스체크(삼성전자 시세) |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT/휴리스틱 2단계 분석 → `gpt_trades_*.json` (`매수`/`보류`/`미진입`), 리밸런싱 GPT 헬퍼, 예산 가드 |
-| `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`asset_allocation` 주문 가드·459580 매수·`--batch-check-only`·`--sell-only` |
+| `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`asset_allocation` 주문 가드·459580 매수·`[STOCK_BUDGET_USAGE]`·`[REBUY_GUARD]`·`--batch-check-only`·`--sell-only` |
 
 ### 기록·정합성·분석
 
 | 파일 | 역할 |
 |------|------|
-| `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill, `is_countable_loss_sell`, 중복 SELL 방지 |
-| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + `avg_prvs` 체결가 + PnL 재계산 + orphan `order_id` backfill |
+| `recorder.py` | SQLite `trading_data.db` (`trade_records`, `positions`), upsert/backfill, `classify_trade_record`·`is_real_kis_trade_record`, `is_countable_loss_sell`, 중복 SELL 방지 |
+| `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + holding fallback + `amount`/`structured_context` 동기화 + orphan `order_id` backfill |
+| `kis_rate_limit.py` | 환경별 `kis_limits` RPS·동시성·EGW00201 백오프·인메모리 캐시 |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
 | `rotation_manager.py` | 현금 부족 시 회전 시도·시장 동적 임계값·실행 |
@@ -558,7 +564,7 @@ trader.run_buy_logic
 | 설정 | 설명 |
 |------|------|
 | `asset_allocation.enabled` | `false`: 기존 파이프라인 회귀 모드. `true`: 예산 가드 + 459580 자동 매수 |
-| `trading_environment` | `vps`: 모의 검증(로컬 paper 로그, KIS 모의 API 키). `prod`: 실계좌 주문 |
+| `trading_environment` | 아래 [4.3 거래 환경](#43-거래-환경-trading_environment) 참고 |
 
 #### 목표 비중 (enabled 시)
 
@@ -594,18 +600,13 @@ run_buy_logic(available_cash)
 
 #### prod fail-safe
 
-`trading_environment=prod` + `asset_allocation.enabled=true` + **`ASSET_ALLOCATION_ALLOW_PROD` 미설정** 시:
-
-- `run_buy_logic` 즉시 return (주식·459580 매수 차단)
-- 로그: `[ASSET_ALLOCATION] prod 실계좌 차단 → run_buy_logic 종료`
-
-모의 검증(`vps`)에서는 fail-safe가 **적용되지 않습니다**. 실계좌 전환 시에만 `ASSET_ALLOCATION_ALLOW_PROD=1`을 **의도적으로** 설정하세요.
+`trading_environment=prod` + `asset_allocation.enabled=true` + **`ASSET_ALLOCATION_ALLOW_PROD` 미설정** 시 주문 차단. **`kis_paper`/`vps`에서는 fail-safe 미적용.**
 
 #### 설정 예시 (`config/config.json`)
 
 ```json
 {
-  "trading_environment": "vps",
+  "trading_environment": "kis_paper",
   "trading_params": {
     "buy_enabled": true,
     "dynamic_cash_management": { "enabled": true }
@@ -627,7 +628,8 @@ run_buy_logic(available_cash)
 }
 ```
 
-> **vps 동작:** `is_real_trading = (env == "prod")` 이므로 `vps`에서는 KIS 실주문 대신 **`[모의]` paper 로그**로 체결됩니다. allocation 경로·예산·로그 검증용입니다.  
+> **`vps`:** KIS 주문 API 미사용 — DB `paper_executed`만 기록(`paper_db_only`). allocation·예산·로그 검증용.  
+> **`kis_paper`:** KIS 모의 API(`openapivts`)로 **실제 모의 주문** 접수·체결. `order_id` 있는 `executed` 기록. `order_reconciler` holding fallback 지원.  
 > **`portfolio_allocator.py`**는 `scripts/replay_screener_logic.py` 리플레이 전용이며 **`trader.py`는 import하지 않습니다.**
 
 #### 오프라인 검증
@@ -637,6 +639,42 @@ python3 scripts/replay_asset_allocation.py          # Case 1–7 (KIS 호출 없
 python3 scripts/dry_run_asset_allocation.py --scenario all   # [ASSET_ALLOCATION] 로그 포맷
 bash scripts/check_vps_deploy_ready.sh              # vps 배포 전 점검
 bash scripts/phase6_regression.sh                   # enabled=false 회귀 (config 백업 후)
+```
+
+### 4.3 거래 환경 (`trading_environment`)
+
+`config.json`의 `trading_environment`는 **주문 실행 경로**를 결정합니다. 스크리너·GPT·회전 전략은 동일합니다.
+
+| 모드 | KIS 엔드포인트 | 주문 API | DB 기록 | 용도 |
+|------|----------------|----------|---------|------|
+| `vps` | `openapivts` | **차단** (`paper_db_only`) | `paper_executed`, `order_id` 없음 | allocation·예산·파이프라인 오프라인 검증 |
+| `kis_paper` | `openapivts` | **활성** (VTTC0801U/0802U) | `pending` → 리컨실 → `executed` + `order_id` | **KIS 모의계좌 E2E** (권장 검증 단계) |
+| `prod` | `openapi` | **활성** (TTTC0801U/0802U) | 실계좌 주문·체결 | 실전 (fail-safe·`ASSET_ALLOCATION_ALLOW_PROD` 필수) |
+
+**권장 검증 순서:** `vps`(로직) → **`kis_paper`(모의 API E2E)** → `prod`(실계좌, 의도적 플래그 후)
+
+| 플래그 (`trader.py`) | `vps` | `kis_paper` | `prod` |
+|----------------------|-------|-------------|--------|
+| `kis_order_api_enabled` | false | true | true |
+| `is_paper_db_only` | true | false | false |
+| `is_prod_order_api` | false | false | true |
+
+**`kis_paper` 리컨실:** KIS `inquire-orders` / daily 조회가 0건이어도 계좌 `balance_*.json`의 `hldg_qty`·`thdt_buyqty`로 BUY pending을 `executed`로 보정할 수 있습니다 (`[RECONCILE_BY_HOLDING]`).
+
+**거래 기록 구분 (`[TRADE_RECORD_CLASSIFY]`):**
+
+```
+id=85  ticker=459580 status=paper_executed order_id=-  classification=paper_db_only   # vps 테스트
+id=87  ticker=459580 status=executed     order_id=... classification=kis_paper_order  # 실제 모의 주문
+```
+
+**매수 종료 시 관측 로그 (`kis_paper`/`prod`):**
+
+```
+[STOCK_BUDGET_USAGE] total_assets=... stock_buy_budget=... gpt_buy_count=... final_buy_count=...
+  executed_order_amount=... unused_stock_budget=... unused_reason=insufficient_gpt_buy_candidates_and_per_ticker_weight_limit
+[REBUY_GUARD] ticker=004170 ... decision=skip reason=rebuy_disabled
+[BUY_SELECTION_SUMMARY] candidates=... gpt_buy=... blocked_rebuy=... final_buy=... reason=...
 ```
 
 ---
@@ -667,7 +705,7 @@ bash scripts/phase6_regression.sh                   # enabled=false 회귀 (conf
 |------|------|------|
 | Docker & Compose | ✅ | 두 서비스 실행 |
 | `config/.env` | ✅ | `cp config/.env.example config/.env` |
-| `config/config.json` | ✅ | `trading_environment`: **`vps` 권장** (모의 검증) 또는 `prod` (실계좌) |
+| `config/config.json` | ✅ | `trading_environment`: **`vps` → `kis_paper` 권장 순 검증** 또는 `prod` (실계좌) |
 | `output/` | 자동 | 런타임 전용 (Git 제외) |
 
 ### 6.2 API별 설정 (`config/.env`)
@@ -676,9 +714,11 @@ bash scripts/phase6_regression.sh                   # enabled=false 회귀 (conf
 
 | 변수 | 설명 |
 |------|------|
-| `KIS_PAPER_APP`, `KIS_PAPER_SEC` | **모의** App Key / Secret (`trading_environment=vps` 시 사용) |
+| `KIS_PAPER_APP`, `KIS_PAPER_SEC` | **모의** App Key / Secret (`vps` / **`kis_paper`** 시 사용) |
 | `KIS_MY_PAPER_STOCK` | **모의** 계좌 (8자리) |
 | `KIS_MY_APP`, `KIS_MY_SEC`, `KIS_MY_ACCT_STOCK` | **실전** (`trading_environment=prod` 시 사용) |
+
+`kis_paper`와 `vps`는 동일한 모의 API 키·계좌를 쓰지만, **`kis_paper`만 KIS 주문 API를 호출**합니다.
 
 발급: [KIS Developers](https://apiportal.koreainvestment.com/)
 
@@ -714,10 +754,11 @@ bash scripts/phase6_regression.sh                   # enabled=false 회귀 (conf
 
 | 항목 | 모의 검증 시 |
 |------|-------------|
-| `trading_environment` | **`vps`** (필수) |
+| `trading_environment` | **`vps`**(로직만) 또는 **`kis_paper`**(모의 API E2E, **권장**) |
 | `asset_allocation.enabled` | `true`로 검증 시 설정 |
 | `ASSET_ALLOCATION_ALLOW_PROD` | **설정 금지** (prod 실계좌 주문 허용 플래그) |
 | `trading_params.buy_enabled` | **`true`** (매수·459580 경로 검증) |
+| `kis_limits` | `kis_paper` 기본 `max_rps=1`, `screener_workers=1` — EGW00201 완화 |
 
 ### 6.3 단계별 API 의존성
 
@@ -737,15 +778,16 @@ bash scripts/phase6_regression.sh                   # enabled=false 회귀 (conf
 ### 6.4 체크리스트
 
 - [ ] `config/.env` 생성 · Git에 올리지 않기
-- [ ] `KIS_PAPER_*` / `KIS_MY_PAPER_STOCK` 입력 (vps)
-- [ ] `trading_environment` = **`vps`** 로 먼저 검증
+- [ ] `KIS_PAPER_*` / `KIS_MY_PAPER_STOCK` 입력
+- [ ] `trading_environment` = **`vps`**(로직) → **`kis_paper`**(모의 API E2E) 순 검증
 - [ ] `bash scripts/check_vps_deploy_ready.sh` 통과
 - [ ] `python3 scripts/replay_asset_allocation.py` 7/7 PASS
 - [ ] Naver 키 입력
 - [ ] (선택) OpenAI · Discord 웹훅
 - [ ] `docker compose config`로 env 파싱 확인
-- [ ] 모의투자 1회 이상 E2E 확인 (`trader.py` + `[ASSET_ALLOCATION]` 로그)
-- [ ] prod 전환 전: vps 2주 모니터링 → `ASSET_ALLOCATION_ALLOW_PROD=1` (의도적) → `prod`
+- [ ] 모의투자 1회 이상 E2E 확인 (`kis_paper` + `trader.py` + `[STOCK_BUDGET_USAGE]` / `[ASSET_ALLOCATION]` 로그)
+- [ ] `order_reconciler.py` 실행 — `still_missing_after_all=0`, holding fallback 동작 확인
+- [ ] prod 전환 전: `kis_paper` 2주 모니터링 → `ASSET_ALLOCATION_ALLOW_PROD=1` (의도적) → `prod`
 
 ---
 
@@ -764,8 +806,8 @@ cp config/.env.example config/.env
 cp config/kis_devlp.yaml.example config/kis_devlp.yaml
 ```
 
-`config/config.json`에서 `trading_environment`를 확인하세요. 처음에는 **`vps`** 권장.  
-`asset_allocation` 검증 시 `enabled: true` + **`vps`** 조합을 사용하고, **`ASSET_ALLOCATION_ALLOW_PROD`는 설정하지 마세요.**
+`config/config.json`에서 `trading_environment`를 확인하세요. 처음에는 **`vps`**(로직) → **`kis_paper`**(모의 API) 순을 권장합니다.  
+`asset_allocation` 검증 시 `enabled: true` + **`kis_paper`**(또는 `vps`) 조합을 사용하고, **`ASSET_ALLOCATION_ALLOW_PROD`는 설정하지 마세요.**
 
 ```bash
 # 배포 전 점검 (호스트)
@@ -839,6 +881,12 @@ bash scripts/phase6_regression.sh
 docker compose exec integrated_manager python -u /app/src/trader.py 2>&1 | tee output/phase6_trader_vps.log
 grep -E 'ASSET_ALLOCATION|459580|dynamic_cash' output/phase6_trader_vps.log
 
+docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 6 --limit 20
+
+# 리컨실·분류·예산 로그 확인
+docker compose exec integrated_manager python -u /app/src/trader.py 2>&1 | tee output/trader_run.log
+grep -E 'STOCK_BUDGET_USAGE|REBUY_GUARD|BUY_SELECTION_SUMMARY|TRADE_RECORD_CLASSIFY|RECONCILE_BY_HOLDING' output/trader_run.log
+
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --limit 800
 
 # order_id 누락 행만 KIS 일별 주문으로 backfill
@@ -899,15 +947,25 @@ python run_integrated_manager.py --once
 | trader E2E | `docker compose exec … python -u /app/src/trader.py` | ✅ 09:10–14:20 | ❌ |
 | `--batch-check-only` | 15:20 KST | ✅ 15:20 | ❌ |
 
-**장중 trader 검증 시 기대 로그 (`vps` + `asset_allocation.enabled=true`):**
+**장중 trader 검증 시 기대 로그 (`kis_paper` + `asset_allocation.enabled=true`):**
 
 ```
-env=vps, real_trading=False
-[ASSET_ALLOCATION] enabled=true; skip dynamic_cash_management
+env=kis_paper, kis_order_api_enabled=True
 [ASSET_ALLOCATION] … stock_buy_budget: … initial_bond_buy_budget: …
+[STOCK_BUDGET_USAGE] … unused_reason=…
+[REBUY_GUARD] ticker=… decision=skip reason=rebuy_disabled
+[BUY_SELECTION_SUMMARY] … blocked_rebuy=… final_buy=…
 [ASSET_ALLOCATION_POST_STOCK_ORDER] … post_stock_cash … final_bond_buy_budget …
-[모의] … 459580 … 매수   (vps paper)
 ```
+
+**`kis_paper` E2E 후 리컨실:**
+
+```
+[RECONCILE_BY_HOLDING] order_id=… ticker=… status=executed
+리컨실 결과: {…, 'updated_by_holding_fallback': N, 'still_missing_after_all': 0}
+```
+
+**`vps` + enabled 시:** KIS 주문 없이 `[모의]` paper 로그만. `[STOCK_BUDGET_USAGE]`는 동일하게 출력.
 
 **enabled=false 회귀 시:** 위 `[ASSET_ALLOCATION]*` 로그 **없음**, `dynamic_cash_management` 적용 로그 **있음**.
 
@@ -933,6 +991,7 @@ kospistock/
 │   │   └── domestic_stock/
 │   │       └── domestic_stock_functions.py
 │   ├── asset_allocator.py         # 70:20:10 예산 계산 (trader 연동)
+│   ├── kis_rate_limit.py          # KIS RPS·EGW00201 백오프·캐시
 │   ├── portfolio_allocator.py     # 스크리너 리플레이 전용 (trader 미사용)
 │   ├── integrated_manager.py
 │   ├── risk_manager.py
@@ -970,7 +1029,7 @@ kospistock/
 * 본 코드를 다운로드·실행·수정·배포하여 발생하는 **모든 투자 손익, 세금, 법적 분쟁의 책임은 사용자 본인**에게 있습니다.
 * 자동매매 시스템은 **소프트웨어 버그**, **증권사·외부 API 장애·지연**, **네트워크 오류**, **시장 급변·유동성 부족·슬리피지** 등으로 인해 의도와 다른 주문·손실이 발생할 수 있습니다.
 * GPT·뉴스·기술적 지표 기반 판단은 **오류·편향·지연**을 포함할 수 있으며, 과거 성과가 미래 수익을 보장하지 않습니다.
-* 실전 계좌에 연결하기 전 **`vps`(모의투자) 환경에서 충분히 테스트**하고, 본인의 투자 성향·자금·리스크 허용 범위를 스스로 판단하시기 바랍니다.
+* 실전 계좌에 연결하기 전 **`vps` → `kis_paper`(KIS 모의 API) 순으로 충분히 테스트**하고, 본인의 투자 성향·자금·리스크 허용 범위를 스스로 판단하시기 바랍니다.
 * 제3자 API(KIS, Naver, OpenAI, Discord) 이용 시 각 서비스의 **이용약관·요금·호출 한도**를 준수해야 합니다.
 
 **본 코드를 사용함으로써, 위 내용을 이해하고 이에 동의한 것으로 간주합니다.**

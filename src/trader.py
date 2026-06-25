@@ -4309,6 +4309,107 @@ class Trader:
             cooldown=120,
         )
 
+    def _new_buy_session(self, stock_budget: int) -> Dict[str, Any]:
+        return {
+            "stock_buy_budget": int(stock_budget),
+            "gpt_plan_count": 0,
+            "gpt_buy_count": 0,
+            "final_buy_count": 0,
+            "blocked_rebuy": 0,
+            "planned_order_amount": 0,
+            "executed_order_amount": 0,
+            "unused_reasons": set(),
+        }
+
+    def _buy_session_add_reason(self, reason: str) -> None:
+        s = getattr(self, "_buy_session", None)
+        if s is not None and reason:
+            s["unused_reasons"].add(reason)
+
+    def _track_buy_order_planned(self, amount: int) -> None:
+        s = getattr(self, "_buy_session", None)
+        if s is not None and amount > 0:
+            s["planned_order_amount"] += int(amount)
+
+    def _track_buy_order_executed(self, amount: int, *, count: int = 1) -> None:
+        s = getattr(self, "_buy_session", None)
+        if s is not None and amount > 0:
+            s["executed_order_amount"] += int(amount)
+            s["final_buy_count"] += int(count)
+
+    def _emit_buy_session_summary(
+        self,
+        allocation: Optional[AllocationResult],
+        *,
+        holdings: Optional[List[Dict]] = None,
+    ) -> None:
+        s = getattr(self, "_buy_session", None)
+        if not s:
+            return
+
+        reasons = set(s.get("unused_reasons") or set())
+        if s["gpt_buy_count"] == 0:
+            reasons.add("no_gpt_buy_candidates")
+        elif s["gpt_buy_count"] < self.max_positions:
+            reasons.add("insufficient_gpt_buy_candidates")
+        if s["blocked_rebuy"] > 0:
+            reasons.add("already_holding_rebuy_blocked")
+        unused = max(0, int(s["stock_buy_budget"]) - int(s["executed_order_amount"]))
+        if unused > 0:
+            if s["final_buy_count"] >= self.max_positions:
+                reasons.add("max_positions_limit")
+            if s["executed_order_amount"] > 0 and s["final_buy_count"] < s["gpt_buy_count"]:
+                reasons.add("per_ticker_weight_limit")
+            if s["gpt_buy_count"] > 0 and s["final_buy_count"] == 0:
+                if "insufficient_gpt_buy_candidates" not in reasons:
+                    reasons.add("insufficient_gpt_buy_candidates")
+
+        if allocation and allocation.enabled:
+            total_assets = allocation.total_asset
+            current_stock_value = allocation.stock_value
+            stock_target_weight = (
+                allocation.target_stock_value / allocation.total_asset
+                if allocation.total_asset > 0 else 0.0
+            )
+        else:
+            total_assets = 0
+            current_stock_value = 0
+            stock_target_weight = 0.0
+            if holdings:
+                current_stock_value = sum(
+                    _to_int(h.get("evlu_amt", 0)) or (_to_int(h.get("prpr", 0)) * _to_int(h.get("hldg_qty", 0)))
+                    for h in holdings
+                    if _to_int(h.get("hldg_qty", 0)) > 0
+                )
+
+        unused_reason = "_and_".join(sorted(reasons)) if reasons else "budget_utilized"
+        logger.info(
+            "[STOCK_BUDGET_USAGE] total_assets=%s stock_target_weight=%.2f "
+            "current_stock_value=%s stock_buy_budget=%s gpt_plan_count=%s "
+            "gpt_buy_count=%s final_buy_count=%s planned_order_amount=%s "
+            "executed_order_amount=%s unused_stock_budget=%s unused_reason=%s",
+            total_assets,
+            stock_target_weight,
+            current_stock_value,
+            s["stock_buy_budget"],
+            s["gpt_plan_count"],
+            s["gpt_buy_count"],
+            s["final_buy_count"],
+            s["planned_order_amount"],
+            s["executed_order_amount"],
+            unused,
+            unused_reason,
+        )
+        logger.info(
+            "[BUY_SELECTION_SUMMARY] candidates=%s gpt_buy=%s blocked_rebuy=%s "
+            "final_buy=%s reason=%s",
+            s["gpt_plan_count"],
+            s["gpt_buy_count"],
+            s["blocked_rebuy"],
+            s["final_buy_count"],
+            unused_reason,
+        )
+
     def _buy_bond_etf_if_needed(self, allocation: AllocationResult) -> None:
         cfg = self.asset_allocation_cfg
         if not allocation.enabled or not cfg.get("bond_buy_enabled", True):
@@ -4544,6 +4645,7 @@ class Trader:
         self._rotation_pairs_done_this_run = 0
 
         stock_budget, allocation = self._resolve_stock_buy_budget(available_cash, holdings)
+        self._buy_session = self._new_buy_session(stock_budget)
         if allocation.enabled and not self._asset_allocation_prod_allowed():
             logger.error(
                 "[ASSET_ALLOCATION] prod 실계좌 차단 → run_buy_logic 종료 "
@@ -4554,6 +4656,7 @@ class Trader:
                 key=f"phase:asset_alloc_prod_block:{self.run_id}",
                 cooldown=300,
             )
+            self._emit_buy_session_summary(allocation, holdings=holdings)
             return
         if allocation.enabled:
             logger.info(f"주식 매수 예산(stock_buy_budget): {stock_budget:,}원 (raw cash: {available_cash:,}원)")
@@ -4566,6 +4669,8 @@ class Trader:
         if not daily_loss_ok:
             logger.warning(f"⚠️ {daily_loss_msg} → 매수 중단")
             _notify_text(f"⚠️ {daily_loss_msg} → 매수 중단", key=f"daily_loss_limit:{self.run_id}", cooldown=300)
+            self._buy_session_add_reason("risk_guard_blocked")
+            self._emit_buy_session_summary(allocation, holdings=holdings)
             return
         
         # Phase 2: 연속 손실 체크
@@ -4573,10 +4678,14 @@ class Trader:
         if not consecutive_ok:
             logger.warning(f"⚠️ {consecutive_msg} → 매수 중단")
             _notify_text(f"⚠️ {consecutive_msg} → 매수 중단", key=f"consecutive_loss:{self.run_id}", cooldown=300)
+            self._buy_session_add_reason("risk_guard_blocked")
+            self._emit_buy_session_summary(allocation, holdings=holdings)
             return
 
         # 통합된 시간대 체크
         if not self._check_trading_hours("buy"):
+            self._buy_session_add_reason("buy_time_window_closed")
+            self._emit_buy_session_summary(allocation, holdings=holdings)
             return
 
         # 기존 미체결 주문 확인 및 취소
@@ -4622,6 +4731,8 @@ class Trader:
                 trade_plans = []
             
             buy_plans = [p for p in trade_plans if p.get("결정") == "매수"]
+            self._buy_session["gpt_plan_count"] = len(trade_plans)
+            self._buy_session["gpt_buy_count"] = len(buy_plans)
             # 추천 집계
             self.recomm_stats["buy"] += len(buy_plans)
             # 안전 디폴트 주입
@@ -4691,7 +4802,17 @@ class Trader:
 
                 if ticker in holding_tickers:
                     if not self.allow_rebuy:
-                        logger.info(f"[{name}({ticker})] 이미 보유 → 추가매수 비활성이라 제외")
+                        h_row = next(
+                            (h for h in holdings if str(h.get("pdno", "")).zfill(6) == ticker),
+                            {},
+                        )
+                        existing_qty = _to_int(h_row.get("hldg_qty", 0))
+                        logger.info(
+                            "[REBUY_GUARD] ticker=%s name=%s already_holding=true allow_rebuy=false "
+                            "existing_executed_qty=%s decision=skip reason=rebuy_disabled",
+                            ticker, name, existing_qty,
+                        )
+                        self._buy_session["blocked_rebuy"] += 1
                         continue
                     if self._is_in_cooldown(ticker):
                         logger.info(f"[{name}({ticker})] 쿨다운 중 → 추가매수 제외")
@@ -4753,6 +4874,8 @@ class Trader:
                     # 3. 최대 제한과 균등 분배 중 작은 값 선택
                     slot_cash = min(equal_share, max_allowed_per_stock)
                     budget_for_this_stock = int(slot_cash * (1 - buffer))
+                if max_allowed_per_stock < equal_share:
+                    self._buy_session_add_reason("per_ticker_weight_limit")
                 
                 # 4. 리스크 가드 적용 (enforce_per_ticker_limit)
                 if self.trading_guards.get("enforce_per_ticker_limit", False):
@@ -4811,11 +4934,13 @@ class Trader:
 
                 pre_qty = 0  # 신규/리밸런스에서는 0 기준
                 logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,.0f}원 [{batch_name}]")
+                self._track_buy_order_planned(quantity * order_price)
 
                 # ① 분할 매수 먼저 시도
                 split_ok, spent_est = self._place_split_buy(name, ticker, quantity, order_price, batch_name)
                 if split_ok:
                     any_order_placed = True
+                    self._track_buy_order_executed(spent_est)
                     # 분할 경로는 내부에서 스냅샷/통계 반영. remaining_cash는 보수적으로 추정 차감
                     remaining_cash = max(0, remaining_cash - spent_est)
                     logger.info(f"  -> [SPLIT] 남은 예산(추정): {remaining_cash:,.0f}원")
@@ -4861,6 +4986,7 @@ class Trader:
                                 spent=executed_qty * order_price,
                             )
                             any_order_placed = True
+                            self._track_buy_order_executed(executed_qty * order_price)
                             
                             _notify_embed(create_trade_embed({
                                 "side": "BUY", "name": name, "ticker": ticker,
@@ -4945,6 +5071,8 @@ class Trader:
                             
                             if qty_delta > 0:
                                 self.stats["buy"] += 1
+                                spent_est = max(0, remaining_cash - new_cash) or (qty_delta * order_price)
+                                self._track_buy_order_executed(spent_est)
                                 record_trade(self._build_trade_record(
                                     res=market_result if isinstance(market_result, dict) else None,
                                     ticker=ticker, name=name, side="buy",
@@ -5024,6 +5152,8 @@ class Trader:
                             
                             if qty_delta > 0:
                                 self.stats["buy"] += 1
+                                spent_est = max(0, remaining_cash - new_cash) or (qty_delta * order_price)
+                                self._track_buy_order_executed(spent_est)
                                 record_trade(self._build_trade_record(
                                     res=market_result if isinstance(market_result, dict) else None,
                                     ticker=ticker, name=name, side="buy",
@@ -5071,6 +5201,7 @@ class Trader:
                     actual_spent = quantity * order_price
                     remaining_cash -= actual_spent
                     any_order_placed = True
+                    self._track_buy_order_executed(actual_spent)
                     # ✅ 매수 통계 반영(vps paper_db_only)
                     self.stats["buy"] += 1
                     record_trade(self._build_trade_record(
@@ -5102,15 +5233,19 @@ class Trader:
                 self._set_summary_reason("SKIPPED_NO_SLOT_ROTATION_DISABLED",
                                          f"effective_slots={effective_slots} current_slots_used={current_slots_used}")
                 logger.info("신규 슬롯 없음 & 회전매매 비활성화(rotation.enabled=false) → 신규 매수 생략")
+                self._buy_session_add_reason("max_positions_limit")
                 if allocation.enabled:
                     self._buy_bond_etf_if_needed(allocation)
+                self._emit_buy_session_summary(allocation, holdings=holdings)
                 return
 
             if self._rotation_quota_remaining() <= 0:
                 logger.info("이번 매수 사이클 회전 한도(%d페어) 소진 → 리밸런싱 스킵",
                             max_pairs_per_run(self.settings))
+                self._buy_session_add_reason("max_positions_limit")
                 if allocation.enabled:
                     self._buy_bond_etf_if_needed(allocation)
+                self._emit_buy_session_summary(allocation, holdings=holdings)
                 return
 
             logger.info("=== 회전 매매(리밸런싱) 시작 ===")
@@ -5266,6 +5401,8 @@ class Trader:
 
         if allocation.enabled:
             self._buy_bond_etf_if_needed(allocation)
+
+        self._emit_buy_session_summary(allocation, holdings=holdings)
 
     def _get_realtime_price_parallel(self, ticker: str) -> Optional[Dict]:
         """병렬 처리를 위한 가격 조회 래퍼 함수"""
@@ -5446,6 +5583,7 @@ class Trader:
                 return False
             
             logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,}원 [라운드{round_num}]")
+            self._track_buy_order_planned(quantity * order_price)
 
             split_cfg = self.trading_params.get("split_buy") or {}
             split_enabled = bool(split_cfg.get("enabled"))
@@ -5457,6 +5595,7 @@ class Trader:
 
                 if split_ok:
                     logger.info(f"  -> ✅ 분할 지정가 주문 성공: {name}({ticker})")
+                    self._track_buy_order_executed(spent_est)
                     return True
 
                 last_odno = getattr(self, "_last_order_odno", None)
@@ -5483,6 +5622,7 @@ class Trader:
                             strategy_details={"batch": "NEW", "order_type": "split", "delayed_confirmation": True},
                         ))
                         self.stats["buy"] += 1
+                        self._track_buy_order_executed(executed_qty * fill_price)
                         return True
                     logger.warning(f"  -> 분할 지정가 주문 실패 확인, 단일 지정가 주문 시도: {name}({ticker})")
             else:
@@ -5517,6 +5657,7 @@ class Trader:
                         
                         # 통계 업데이트
                         self.stats["buy"] += 1
+                        self._track_buy_order_executed(executed_qty * order_price)
                         
                         return True
                     else:
@@ -5558,6 +5699,7 @@ class Trader:
                                 strategy_details={"batch": "NEW", "order_type": "limit", "delayed_confirmation": True},
                             ))
                             self.stats["buy"] += 1
+                            self._track_buy_order_executed(executed_qty * fill_price)
                             return True
                         logger.warning(f"  -> 단일 지정가 주문 실패 확인: {res.get('msg1', 'Unknown error')}")
 
@@ -5580,6 +5722,7 @@ class Trader:
                 
                 # 통계 업데이트
                 self.stats["buy"] += 1
+                self._track_buy_order_executed(quantity * order_price)
                 
                 return True
             
