@@ -1115,82 +1115,9 @@ def run_pipeline(
 
     # ── Phase 1: 회전(리밸런스) 샌드박스 제안 생성 및 로깅 (집행 없음) ──
     try:
+        from rotation_sandbox import run_rotation_sandbox
         cfg = load_config() or {}
-        ia = (cfg or {}).get("integrated_analysis", {})
-        if ia.get("log_gpt_rotation_suggestions", True):
-            # 계좌 스냅샷에서 보유/총평가액 추출
-            cash, holdings, summary = get_account_snapshot_cached()
-            if not isinstance(holdings, list):
-                holdings = []
-            total_value = float((summary or {}).get("tot_evlu_amt", 0) or 0)
-            if total_value <= 0:
-                logger.info("[RotationSandbox] 총 평가액이 0이어서 제안 생성을 건너뜁니다.")
-            else:
-                tp = (cfg or {}).get("trading_params", {})
-                per_ticker_max = float(tp.get("per_ticker_max_weight", 0.15))
-                min_conf = float(ia.get("min_confidence_for_rotation", 0.7))
-
-                suggestions = []
-                for h in holdings:
-                    t = str(h.get("pdno", "")).zfill(6)
-                    try:
-                        from asset_allocator import is_bond_etf
-                        if is_bond_etf(t, cfg):
-                            continue
-                    except ImportError:
-                        pass
-                    n = h.get("prdt_name", "N/A")
-                    qty = int(h.get("hldg_qty", 0) or 0)
-                    px = float(h.get("prpr", 0) or 0)
-                    if qty <= 0 or px <= 0:
-                        continue
-                    cur_val = qty * px
-                    cur_w = cur_val / total_value if total_value > 0 else 0.0
-                    if cur_w > per_ticker_max:
-                        target_w = per_ticker_max
-                        overflow = min(0.5, max(0.0, cur_w - per_ticker_max))
-                        confidence = max(min_conf, min(1.0, 0.6 + overflow * 0.8))
-                        suggestions.append({
-                            "ticker": t,
-                            "name": n,
-                            "current_weight": round(cur_w, 6),
-                            "target_weight": round(target_w, 6),
-                            "decision": "SELL",
-                            "confidence": round(confidence, 3),
-                            "reasons": [
-                                "overweight_breach",
-                                f"current_weight={cur_w:.4f}",
-                                f"max_weight={per_ticker_max:.4f}"
-                            ],
-                            "priority": round(cur_w - per_ticker_max, 6)
-                        })
-
-                rot_path = OUTPUT_DIR / f"gpt_rotations_{fixed_date}_{market}.json"
-                json_payload = {
-                    "schema_version": "1.0",
-                    "generated_at": datetime.now(KST).isoformat(),
-                    "date": fixed_date,
-                    "market": market,
-                    "decision_source": "gpt_rotation_sandbox",
-                    "suggestions": suggestions,
-                }
-                # 경량 스키마 검증
-                try:
-                    assert isinstance(json_payload.get("suggestions"), list)
-                    for s in json_payload["suggestions"]:
-                        assert isinstance(s.get("ticker"), str)
-                        assert s.get("decision") in ("SELL", "KEEP")
-                except Exception:
-                    logger.warning("[Schema] gpt_rotations 구조 확인 경고(필드 누락/타입)")
-                with open(rot_path, "w", encoding="utf-8") as rf:
-                    json.dump(json_payload, rf, ensure_ascii=False, indent=2)
-                logger.info(f"[RotationSandbox] 제안 {len(suggestions)}건 저장 → {rot_path}")
-                if suggestions:
-                    top = sorted(suggestions, key=lambda s: s.get("priority", 0), reverse=True)[:3]
-                    for s in top:
-                        logger.info(
-                            f"[RotationSandbox] SELL 제안: {s['name']}({s['ticker']}) w={s['current_weight']:.3f}→{s['target_weight']:.3f} conf={s['confidence']:.2f}"
-                        )
+        run_rotation_sandbox(cfg, fixed_date=fixed_date, market=market)
     except Exception as e:
         logger.warning(f"[RotationSandbox] 제안 생성 중 오류: {e}")
 

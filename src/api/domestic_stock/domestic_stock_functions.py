@@ -24,6 +24,15 @@ class DomesticStock:
         """
         주식현재가 시세
         """
+        ticker = str(fid_input_iscd).zfill(6)
+        try:
+            from kis_rate_limit import cache_get, cache_put
+            cached = cache_get("price", ticker)
+            if cached is not None:
+                return cached
+        except Exception:
+            pass
+
         url = f"{self.url_base}/uapi/domestic-stock/v1/quotations/inquire-price"
         tr_id = "FHKST01010100"
         
@@ -34,12 +43,30 @@ class DomesticStock:
         
         res = self.request_get(url, headers={"tr_id": tr_id}, params=params)
         
-        # Check if the request was successful
         if res.status_code == 200:
-            return pd.DataFrame([res.json()['output']])
-        else:
-            logger.warning(f"현재가 조회 실패 (status={res.status_code}, ticker={fid_input_iscd}): {res.text[:200]}")
-            return pd.DataFrame()
+            try:
+                df = pd.DataFrame([res.json()['output']])
+                try:
+                    from kis_rate_limit import cache_put
+                    cache_put("price", ticker, df)
+                except Exception:
+                    pass
+                return df
+            except Exception:
+                pass
+        try:
+            from kis_rate_limit import parse_rate_limit_from_response
+            limited, msg_cd = parse_rate_limit_from_response(res)
+            if limited:
+                logger.warning(
+                    "현재가 조회 rate_limited (ticker=%s, msg_cd=%s): %s",
+                    ticker, msg_cd, (res.text or "")[:200],
+                )
+            else:
+                logger.warning(f"현재가 조회 실패 (status={res.status_code}, ticker={ticker}): {res.text[:200]}")
+        except Exception:
+            logger.warning(f"현재가 조회 실패 (status={res.status_code}, ticker={ticker}): {res.text[:200]}")
+        return pd.DataFrame()
 
     def inquire_balance(self, inqr_dvsn: str, afhr_flpr_yn: str, ofl_yn: str, 
                         unpr_dvsn: str, fund_sttl_icld_yn: str, fncg_amt_auto_rdpt_yn: str, 

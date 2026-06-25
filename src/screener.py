@@ -219,27 +219,55 @@ _LISTING_DATES_CACHE: Dict[str, Optional[datetime]] = {}
 _LISTING_PREFETCHED = False
 _LISTING_LOCK = threading.Lock()
 
-# ─────────── KIS 레이트 리미터 ───────────
-class RateLimiter:
-    def __init__(self, rps: float):
-        # rps가 0이면 비활성
-        self.min_interval = 1.0 / max(0.1, float(rps))
-        self._last = 0.0
-        self._lock = threading.Lock()
-    def wait(self):
-        with self._lock:
-            now = time.monotonic()
-            wait = self.min_interval - (now - self._last)
-            if wait > 0:
-                time.sleep(wait)
-            self._last = time.monotonic()
+# ─────────── KIS 레이트 리미터 (kis_rate_limit 모듈 위임) ───────────
+from kis_rate_limit import (
+    init_kis_rate_limits,
+    get_max_concurrency,
+    rate_limit_wait,
+    is_rate_limit_message,
+    cache_get,
+    cache_put,
+    log_cache_summary,
+    reset_cache_stats,
+)
 
-_KIS_RATE_LIMITER: Optional[RateLimiter] = None
-_KIS_MAX_CONCURRENCY: int = 2
+_KIS_RATE_LIMITER = None  # legacy compat: truthy when limits active
+
+
+def _kis_rate_limit_wait():
+    rate_limit_wait()
+
 
 def _is_kis_ratelimit_error(e: Exception) -> bool:
-    msg = str(e)
-    return ("EGW00201" in msg) or ("초당 거래건수" in msg)
+    return is_rate_limit_message(text=str(e))
+
+
+_KIS_MAX_CONCURRENCY: int = 1
+
+
+def _fail_row(
+    code: str,
+    reason: str,
+    *,
+    name: str = "",
+    failed_api: str = "",
+    msg_cd: str = "",
+    retry_count: int = 0,
+    final_reason: str = "",
+    **extra,
+) -> Dict[str, Any]:
+    row = {
+        "ticker": str(code).zfill(6),
+        "name": name,
+        "reason": reason,
+        "failed_api": failed_api,
+        "msg_cd": msg_cd,
+        "retry_count": retry_count,
+        "final_reason": final_reason or reason,
+    }
+    row.update(extra)
+    return row
+
 
 def _parse_listing_date_value(v: Any) -> Optional[datetime]:
     """KIS 응답의 다양한 상장일 필드를 datetime으로 변환"""
@@ -318,20 +346,15 @@ def _extract_listing_date_from_kis_df(df: pd.DataFrame) -> Optional[datetime]:
     return None
 
 def _kis_inquire_price_safe(kis: KIS, code: str, retries: int = 4) -> Optional[pd.DataFrame]:
-    """KIS API 호출(상장일/섹터) - 레이트 리미터 + 지수 백오프"""
+    """KIS API 호출(상장일/섹터) - 레이트 리미터 + 캐시 + HTTP 레벨 재시도(inquire_price)."""
     code = str(code).zfill(6)
-    for attempt in range(max(1, retries)):
-        try:
-            if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
-            return kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=code)
-        except Exception as e:
-            if _is_kis_ratelimit_error(e) and attempt < retries - 1:
-                backoff = min(1.0 * (attempt + 1), 3.0) + random.uniform(0, 0.25)
-                time.sleep(backoff)
-                continue
-            logger.debug("KIS inquire_price 실패(%s): %s", code, str(e))
-            return None
+    cached = cache_get("price", code)
+    if cached is not None and hasattr(cached, "empty") and not cached.empty:
+        return cached
+    df = kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=code)
+    if df is not None and not df.empty:
+        return df
+    return None
 
 
 def _kis_period_price_safe(
@@ -348,7 +371,7 @@ def _kis_period_price_safe(
     for attempt in range(max(1, retries)):
         try:
             if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
+                _kis_rate_limit_wait()
             return kis.inquire_period_price(
                 fid_cond_mrkt_div_code=market_div,
                 fid_input_iscd=code,
@@ -378,7 +401,7 @@ def _kis_financial_ratio_safe(
     for attempt in range(retries):
         try:
             if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
+                _kis_rate_limit_wait()
             return kis.inquire_financial_ratio(
                 fid_div_cls_code=div_cls_code,
                 fid_input_iscd=str(code).zfill(6),
@@ -485,7 +508,7 @@ def _kis_investor_trend_safe(
     for attempt in range(max(1, retries)):
         try:
             if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
+                _kis_rate_limit_wait()
             return kis.inquire_investor_trend(
                 fid_cond_mrkt_div_code=market_div,
                 fid_input_iscd=code,
@@ -515,7 +538,7 @@ def _kis_industry_price_safe(
     for attempt in range(max(1, retries)):
         try:
             if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
+                _kis_rate_limit_wait()
             return kis.inquire_industry_period_price(
                 fid_input_iscd=industry_code,
                 fid_input_date_1=start_date,
@@ -981,7 +1004,15 @@ def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
     return None
 
 # ─────────── KIS 호출 & 섹터 보강 ───────────
-def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
+def _get_kis_sector_map(
+    codes: List[str],
+    kis: KIS,
+    cache_key: Optional[str] = None,
+    workers: int = 4,
+    exclude_tickers: Optional[set] = None,
+) -> Dict[str, str]:
+    exclude_tickers = exclude_tickers or set()
+    codes = [str(c).zfill(6) for c in codes if str(c).zfill(6) not in exclude_tickers]
     if cache_key:
         cached = cache_load(CACHE_PREFIX_SECTOR_MAP, cache_key)
         if isinstance(cached, dict) and cached:
@@ -1013,7 +1044,13 @@ def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = N
         cache_save(CACHE_PREFIX_SECTOR_MAP, cache_key, sectors)
     return sectors
 
-def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
+def _enrich_sector_with_kis_api(
+    df_base: pd.DataFrame,
+    kis: KIS,
+    workers: int,
+    cache_key: Optional[str] = None,
+    exclude_tickers: Optional[set] = None,
+) -> pd.DataFrame:
     if df_base is None or df_base.empty:
         out = df_base.copy()
         out["Sector"] = out.get("Sector", "N/A")
@@ -1022,7 +1059,10 @@ def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, c
     if "Sector" not in out.columns:
         out["Sector"] = np.nan
     out["Sector"] = out["Sector"].astype("object")
+    exclude_tickers = exclude_tickers or set()
     target_idx = out.index[out["Sector"].isna() | out["Sector"].eq("N/A")]
+    if exclude_tickers:
+        target_idx = pd.Index([i for i in target_idx if str(i).zfill(6) not in exclude_tickers])
     if len(target_idx) == 0:
         logger.info("KIS 보강 대상 없음.")
         return out
@@ -1033,12 +1073,16 @@ def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, c
         logger.warning(f"입력 데이터에 중복 인덱스 {dup_count}개 발견, 첫 번째 값 유지")
         out = out[~out.index.duplicated(keep='first')]
         target_idx = out.index[out["Sector"].isna() | out["Sector"].eq("N/A")]
+        if exclude_tickers:
+            target_idx = pd.Index([i for i in target_idx if str(i).zfill(6) not in exclude_tickers])
     
     logger.info("KIS(inquire_price) 섹터 보강 시작 (대상 %d종목)", len(target_idx))
     ck = cache_key or datetime.now().strftime("%Y%m%d")
     
     try:
-        kis_map = _get_kis_sector_map([str(x).zfill(6) for x in target_idx.tolist()], kis, ck, workers)
+        kis_map = _get_kis_sector_map(
+            [str(x).zfill(6) for x in target_idx.tolist()], kis, ck, workers, exclude_tickers=exclude_tickers,
+        )
         
         # KIS 맵 결과 검증
         if kis_map and len(kis_map) > 0:
@@ -1236,6 +1280,7 @@ def _apply_sector_source_order(
     workers: int,
     date_str: str,
     market: str,
+    exclude_tickers: Optional[set] = None,
 ) -> pd.DataFrame:
     # 입력 데이터 무결성 검증
     df = _validate_dataframe_integrity(df_base.copy(), "섹터 보강 입력")
@@ -1262,7 +1307,9 @@ def _apply_sector_source_order(
     missing_idx = df.index[df["Sector"].isna() | df["Sector"].eq("N/A")]
     if len(missing_idx) > 0 and kis is not None:
         logger.info("섹터 보강(KIS) 대상: %d 종목", len(missing_idx))
-        kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), kis, workers, cache_key=date_str)
+        kis_df = _enrich_sector_with_kis_api(
+            df.loc[missing_idx].copy(), kis, workers, cache_key=date_str, exclude_tickers=exclude_tickers,
+        )
         if kis_df is not None and not kis_df.empty and "Sector" in kis_df.columns:
             common_idx = missing_idx.intersection(kis_df.index)
             if len(common_idx) > 0:
@@ -1895,7 +1942,7 @@ def _kis_daily_price_safe(
     for attempt in range(retries):
         try:
             if _KIS_RATE_LIMITER:
-                _KIS_RATE_LIMITER.wait()
+                _kis_rate_limit_wait()
             df = kis.inquire_daily_price(
                 fid_cond_mrkt_div_code=market_div,
                 fid_input_iscd=str(code).zfill(6),
@@ -2257,7 +2304,13 @@ def _calculate_scores_for_ticker(
         if df_price_raw is None or df_price_raw.empty:
             with _fail_lock:
                 _fail_stats["no_price_data"] += 1
-                _fail_rows.append({"Ticker": code, "reason": "no_price_data"})
+                _fail_rows.append(_fail_row(
+                    code,
+                    "no_price_data",
+                    name=str(fin_info.get("Name", "") or ""),
+                    failed_api="ohlcv",
+                    final_reason="ohlcv_empty_after_retry",
+                ))
             return None
 
         # 표준화
@@ -2762,15 +2815,32 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     _KIS_INSTANCE = kis
     set_kis_price_client(kis)
 
-    # KIS 레이트 리밋/동시성 설정(설정값/환경변수/기본값)
-    kis_limits = settings.get("kis_limits", {})
-    kis_rps = float(kis_limits.get("max_rps", os.getenv("KIS_MAX_RPS", 3)))
-    max_conc = int(kis_limits.get("max_concurrency", os.getenv("KIS_MAX_CONCURRENCY", 2)))
-    _KIS_RATE_LIMITER = RateLimiter(kis_rps) if kis_rps and kis_rps > 0 else None
-    _KIS_MAX_CONCURRENCY = max(1, min(max_conc, 4))  # 하드 안전상한 4
+    # KIS 레이트 리밋/동시성 설정 (env별 kis_limits)
+    reset_cache_stats()
+    limits = init_kis_rate_limits(settings, trading_env)
+    global _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY
+    _KIS_RATE_LIMITER = True
+    _KIS_MAX_CONCURRENCY = get_max_concurrency()
+    workers = max(1, min(int(limits.get("screener_workers", workers)), MAX_WORKERS_HARD_CAP))
+    logger.info(
+        "[SCREENER_RATE_LIMIT] env=%s workers=%d max_rps=%s max_concurrency=%d "
+        "request_min_interval_sec=%s",
+        trading_env,
+        workers,
+        limits.get("max_rps"),
+        _KIS_MAX_CONCURRENCY,
+        limits.get("request_min_interval_sec"),
+    )
 
     screener_params = settings.get("screener_params", {})
     risk_params = settings.get("risk_params", {})
+    _bond_exclude: set = set()
+    try:
+        for item in (settings.get("asset_allocation", {}) or {}).get("bond_etfs") or []:
+            t = item.get("ticker", item) if isinstance(item, dict) else item
+            _bond_exclude.add(str(t).zfill(6))
+    except Exception:
+        pass
 
     with stage("1차 필터링", notify_key="screener_stage1"):
         # 시장 상태를 고려한 스크리닝 파라미터 조정
@@ -2795,7 +2865,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     with stage("섹터 보강", notify_key="screener_sector"):
         # KIS only
         order = screener_params.get("sector_source_priority", ["kis"])
-        df_filtered = _apply_sector_source_order(df_filtered, order, kis, workers, fixed_date, market)
+        df_filtered = _apply_sector_source_order(
+            df_filtered, order, kis, workers, fixed_date, market, exclude_tickers=_bond_exclude,
+        )
 
     with stage("시장 레짐 계산", notify_key="screener_regime"):
         # 기존 시장 레짐 계산
@@ -2911,7 +2983,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         
         results = []
         total = len(df_filtered)
-        actual_workers = max(1, min(workers, MAX_WORKERS_HARD_CAP))
+        actual_workers = max(1, min(workers, _KIS_MAX_CONCURRENCY, MAX_WORKERS_HARD_CAP))
         
         logger.info("스코어링 시작: %d 종목, %d 워커", total, actual_workers)
         
@@ -2981,6 +3053,13 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     logger.info("스코어링 스킵 요약: %s", fail_sum)
                 else:
                     logger.warning("스코어링 실패 요약: %s", fail_sum)
+                rate_limited = int(_fail_stats.get("rate_limited", 0))
+                ohlcv_failed = int(_fail_stats.get("ohlcv_failed", 0))
+                no_price = int(_fail_stats.get("no_price_data", 0))
+                logger.info(
+                    "[SCREENER_FAIL_SUMMARY] no_price_data=%d rate_limited=%d ohlcv_failed=%d %s",
+                    no_price, rate_limited, ohlcv_failed, fail_sum,
+                )
                 dbg_dir = OUTPUT_DIR / "debug"
                 dbg_dir.mkdir(parents=True, exist_ok=True)
                 fail_csv = dbg_dir / f"scoring_fail_{fixed_date}_{market}.csv"
@@ -3352,6 +3431,11 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 _notify("✅ 스크리너 완료\n" + "\n".join(lines), key="screener_done", cooldown_sec=60)
         except Exception:
             _notify("✅ 스크리너 완료 (요약 구성 실패)", key="screener_done", cooldown_sec=60)
+
+        try:
+            log_cache_summary()
+        except Exception:
+            pass
 
 # ─────────── CLI ───────────
 def parse_args():

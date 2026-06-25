@@ -366,6 +366,8 @@ class Trader:
 
         # KIS 초기화
         try:
+            from kis_rate_limit import init_kis_rate_limits
+            init_kis_rate_limits(self.settings, self.env)
             self.kis = KIS(config={}, env=self.env)
             if not getattr(self, "kis", None) or not getattr(self.kis, "auth_token", None):
                 raise ConnectionError("KIS API 인증에 실패했습니다 (토큰 없음).")
@@ -4464,6 +4466,73 @@ class Trader:
             f"mode={self.env} execution={exec_mode} order_id={order_id_log or '-'}"
         )
 
+    def _log_gpt_trades_and_buy_selection(
+        self,
+        trade_plans: List[Dict],
+        buy_plans: List[Dict],
+        trade_plan_file: Optional[Any],
+        buy_cash: int,
+        candidates_all: List[Dict],
+    ) -> None:
+        """GPT trades 로드·후보별 판단·최종 매수 0건 사유 로그."""
+        counts = {"buy": 0, "hold": 0, "reject": 0, "other": 0}
+        for p in trade_plans:
+            d = str(p.get("결정", "") or "")
+            if d == "매수":
+                counts["buy"] += 1
+            elif d == "보류":
+                counts["hold"] += 1
+            elif d in ("미진입",):
+                counts["reject"] += 1
+            else:
+                counts["other"] += 1
+
+        if trade_plan_file:
+            fname = getattr(trade_plan_file, "name", str(trade_plan_file))
+            logger.info(
+                "[GPT_TRADES_LOAD] file=%s plans=%d buy=%d hold=%d reject=%d",
+                fname, len(trade_plans), counts["buy"], counts["hold"], counts["reject"],
+            )
+        else:
+            logger.info("[GPT_TRADES_LOAD] missing file=gpt_trades_*.json fallback=screener_only")
+
+        buffer = self._eff_buffer()
+        affordable_n = sum(
+            1 for c in candidates_all
+            if _to_int(c.get("Price", 0)) <= int(buy_cash * (1 - buffer))
+        )
+
+        for p in trade_plans:
+            info = p.get("stock_info", {}) or {}
+            ticker = str(info.get("Ticker", "")).zfill(6)
+            name = info.get("Name", ticker)
+            decision = str(p.get("결정", "") or "")
+            score = _to_float(info.get("Score", 0), 0.0)
+            if decision == "매수":
+                gpt_action, reason = "BUY", "GPT_BUY"
+            elif decision == "보류":
+                gpt_action, reason = "HOLD", "GPT_HOLD"
+            elif decision == "미진입":
+                gpt_action, reason = "REJECT", "GPT_REJECT"
+            else:
+                gpt_action = decision or "OTHER"
+                reason = f"GPT_{gpt_action}"
+            logger.info(
+                f"[BUY_CANDIDATE_DECISION] ticker={ticker} name={name} "
+                f"gpt_action={gpt_action} score={score:.3f} reason={reason}"
+            )
+
+        if counts["buy"] == 0 and trade_plans:
+            logger.info(
+                "[BUY_SELECTION_SUMMARY] candidates=%d gpt_buy=0 gpt_hold=%d gpt_reject=%d "
+                "affordability_pass=%d final_buy=0 reason=no_gpt_buy",
+                len(trade_plans), counts["hold"], counts["reject"], affordable_n,
+            )
+        elif not trade_plans and not trade_plan_file:
+            logger.info(
+                "[BUY_SELECTION_SUMMARY] candidates=0 gpt_buy=0 final_buy=0 reason=no_gpt_trades_file"
+            )
+
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):
         # [NEW] 매수 로직 활성화 여부 체크
         if not self.trading_params.get("buy_enabled", True):
@@ -4531,6 +4600,7 @@ class Trader:
         # GPT 추천 계획 로드
         trade_plan_file = find_latest_file("gpt_trades_*.json")
         buy_plans = []
+        trade_plans: List[Dict] = []
         if not trade_plan_file:
             logger.info("매수 계획 파일(gpt_trades_*.json)이 없어 매수를 건너뜁니다.")
             _notify_text("ℹ️ gpt_trades 파일 없음 → 매수 스킵",
@@ -4560,11 +4630,15 @@ class Trader:
                 for k, dv in SCHEMA_DEFAULTS.items():
                     p["stock_info"].setdefault(k, dv)
 
+        candidates_all = list(self.all_stock_data.values())
+        self._log_gpt_trades_and_buy_selection(
+            trade_plans, buy_plans, trade_plan_file, buy_cash, candidates_all,
+        )
+
         # 1차 후보(가성비) 판단: **주가 vs (현금×(1-버퍼))**만 적용
         buffer = self._eff_buffer()
         min_order = int(self.trading_params.get("min_order_cash", 0))
 
-        candidates_all = list(self.all_stock_data.values())
         affordable = [c for c in candidates_all if _to_int(c.get("Price", 0)) <= int(buy_cash * (1 - buffer))]
 
         # 통계 로그(참고용) — 필터에는 min_order_cash를 사용하지 않음
@@ -5173,6 +5247,14 @@ class Trader:
             targets_to_buy = new_targets[:slots_to_fill] if buy_plans else []
             if not targets_to_buy:
                 logger.info("신규로 매수할 최종 대상이 없습니다.")
+                if buy_plans:
+                    logger.info(
+                        "[BUY_SELECTION_SUMMARY] gpt_buy=%d but new_targets=0 "
+                        "(slots/cooldown/holding filter)",
+                        len(buy_plans),
+                    )
+                elif trade_plans:
+                    logger.info("[BUY_SELECTION_SUMMARY] final_buy=0 reason=no_gpt_buy")
                 _notify_text("ℹ️ 신규 매수 대상 없음",
                              key=f"phase:no_targets:{self.run_id}", cooldown=300)
             else:

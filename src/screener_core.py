@@ -170,6 +170,17 @@ def get_historical_prices(
         logger.debug("get_historical_prices: empty symbol, skipping")
         return None
 
+    symbol = str(symbol).zfill(6)
+    cache_key = f"{start_date}_{end_date}"
+    try:
+        from kis_rate_limit import cache_get, cache_put, rate_limit_wait
+        cached = cache_get("ohlcv", symbol, cache_key)
+        if cached is not None and hasattr(cached, "empty") and not cached.empty:
+            return cached
+    except Exception:
+        rate_limit_wait = lambda: None  # type: ignore
+        cache_put = None  # type: ignore
+
     client = kis or _KIS_PRICE_CLIENT
     if client is None:
         logger.warning("get_historical_prices: KIS client not set for %s", symbol)
@@ -181,6 +192,10 @@ def get_historical_prices(
 
     for attempt in range(retries):
         try:
+            try:
+                rate_limit_wait()
+            except Exception:
+                pass
             df = get_kis_ohlcv(
                 symbol,
                 start_date,
@@ -191,6 +206,11 @@ def get_historical_prices(
             )
             if df is not None and not df.empty:
                 logger.debug("KIS OHLCV success for %s: %d rows", symbol, len(df))
+                try:
+                    if cache_put:
+                        cache_put("ohlcv", symbol, df, cache_key)
+                except Exception:
+                    pass
                 return df
         except Exception as e:
             logger.debug("KIS OHLCV attempt %d failed for %s: %s", attempt + 1, symbol, e)

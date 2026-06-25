@@ -169,10 +169,21 @@ def inquire_balance_with_retry(kis: KIS, *, max_tries: int = 3) -> Tuple[pd.Data
     return None, None, True, (str(last_err)[:400] if last_err else "unknown")
 
 
-def inquire_balance_rlz_pl_with_retry(kis: KIS, *, max_tries: int = 3):
+def inquire_balance_rlz_pl_with_retry(kis: KIS, *, max_tries: int = 3, pre_sleep_sec: float = 0.8):
     """KIS 실현손익 잔고 조회 (inquire-balance-rlz-pl)."""
+    import time
+    try:
+        from kis_rate_limit import parse_rate_limit_from_response, is_rate_limit_message
+    except ImportError:
+        parse_rate_limit_from_response = None  # type: ignore
+        is_rate_limit_message = lambda **kw: False  # type: ignore
+
+    if pre_sleep_sec > 0:
+        time.sleep(pre_sleep_sec)
+
     last_err = None
-    for _ in range(max_tries):
+    delays = [1.0, 2.0, 4.0]
+    for attempt in range(max_tries):
         try:
             if not hasattr(kis, "inquire_balance_rlz_pl"):
                 return None, None, True, "inquire_balance_rlz_pl not implemented"
@@ -182,8 +193,27 @@ def inquire_balance_rlz_pl_with_retry(kis: KIS, *, max_tries: int = 3):
             last_err = RuntimeError("실현손익 요약 데이터 비어있음")
         except Exception as e:
             last_err = e
-    logger.warning("inquire_balance_rlz_pl 재시도 종료: %s", last_err)
-    return None, None, True, (str(last_err)[:400] if last_err else "unknown")
+            msg = str(e)
+            if is_rate_limit_message(text=msg) and attempt < max_tries - 1:
+                wait = delays[min(attempt, len(delays) - 1)]
+                logger.info(
+                    "[KIS_RATE_LIMIT] api=inquire_balance_rlz_pl retry=%d/%d sleep=%.1fs",
+                    attempt + 1, max_tries - 1, wait,
+                )
+                time.sleep(wait)
+                continue
+        if attempt < max_tries - 1:
+            time.sleep(0.5 * (attempt + 1))
+
+    err_msg = str(last_err)[:400] if last_err else "unknown"
+    if is_rate_limit_message(text=err_msg):
+        logger.warning(
+            "[ACCOUNT_RLZ_PL_SKIP] reason=rate_limited fallback=balance_summary detail=%s",
+            err_msg,
+        )
+    else:
+        logger.warning("inquire_balance_rlz_pl 재시도 종료: %s", last_err)
+    return None, None, True, err_msg
 
 def _make_empty_balance_df() -> pd.DataFrame:
     cols = list(build_balance_comments().keys())
@@ -202,6 +232,12 @@ if __name__ == "__main__":
         trading_env = settings._config.get("trading_environment", "prod")
         # kis_broker 설정이 없으면 빈 딕셔너리로 전달하여 yaml 파일 사용
         kis_cfg = settings._config.get("kis_broker", {})
+
+        try:
+            from kis_rate_limit import init_kis_rate_limits
+            init_kis_rate_limits(settings._config, trading_env)
+        except Exception as _rl_err:
+            logger.debug("kis_rate_limit init skipped: %s", _rl_err)
         
         print(f"[DEBUG] 설정된 trading_environment: {trading_env}")
         print(f"[DEBUG] kis_cfg: {kis_cfg}")

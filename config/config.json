@@ -1,8 +1,32 @@
 {
   "trading_environment": "kis_paper",
   "kis_limits": {
-    "max_rps": 3,
-    "max_concurrency": 2
+    "default": {
+      "max_rps": 2,
+      "max_concurrency": 1,
+      "retry_on_rate_limit": true,
+      "rate_limit_max_retries": 3,
+      "rate_limit_retry_delays_sec": [1.0, 2.0, 4.0],
+      "jitter_sec": 0.2
+    },
+    "kis_paper": {
+      "max_rps": 1,
+      "max_concurrency": 1,
+      "screener_workers": 1,
+      "request_min_interval_sec": 0.6
+    },
+    "prod": {
+      "max_rps": 2,
+      "max_concurrency": 1,
+      "screener_workers": 2,
+      "request_min_interval_sec": 0.5
+    },
+    "vps": {
+      "max_rps": 1,
+      "max_concurrency": 1,
+      "screener_workers": 2,
+      "request_min_interval_sec": 0.5
+    }
   },
   "screener_params": {
     "data_source": "kis_only",

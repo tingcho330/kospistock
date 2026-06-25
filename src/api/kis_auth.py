@@ -455,6 +455,7 @@ class KIS(DomesticStock):
     def request_get(self, url: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, timeout: int = 10) -> requests.Response:
         """
         KIS GET 호출용 안전 래퍼. 만료 감지 시 1회 재인증 후 재시도.
+        EGW00201(초당 거래건수) 시 kis_rate_limit 백오프 재시도.
         """
         def _do():
             return requests.get(
@@ -464,15 +465,29 @@ class KIS(DomesticStock):
                 timeout=timeout,
             )
 
-        resp = _do()
-        if self.is_token_expired_error_from_resp(resp):
-            self.reauthenticate()
+        def _with_token() -> requests.Response:
             resp = _do()
-        return resp
+            if self.is_token_expired_error_from_resp(resp):
+                self.reauthenticate()
+                resp = _do()
+            return resp
+
+        ticker = ""
+        if params:
+            ticker = str(params.get("FID_INPUT_ISCD") or params.get("PDNO") or "")
+        api = url.rsplit("/", 1)[-1][:48] if url else "GET"
+        try:
+            from kis_rate_limit import get_kis_limits, retry_http_get
+            if get_kis_limits():
+                return retry_http_get(_with_token, api=api, ticker=ticker)
+        except Exception:
+            pass
+        return _with_token()
 
     def request_post(self, url: str, *, headers: Optional[Dict[str, str]] = None, data: Any = None, json_body: Any = None, timeout: int = 10) -> requests.Response:
         """
         KIS POST 호출용 안전 래퍼. 만료 감지 시 1회 재인증 후 재시도.
+        order-cash는 trader 측 재시도와 병행; HTTP 레벨 rate limit 재시도도 적용.
         """
         def _do():
             merged_headers = self._merge_request_headers(headers)
@@ -481,11 +496,24 @@ class KIS(DomesticStock):
             payload = data if isinstance(data, (str, bytes)) else json.dumps(data) if data is not None else None
             return requests.post(url, headers=merged_headers, data=payload, timeout=timeout)
 
-        resp = _do()
-        if self.is_token_expired_error_from_resp(resp):
-            self.reauthenticate()
+        def _with_token() -> requests.Response:
             resp = _do()
-        return resp
+            if self.is_token_expired_error_from_resp(resp):
+                self.reauthenticate()
+                resp = _do()
+            return resp
+
+        is_order = "order-cash" in (url or "")
+        api = "order_cash" if is_order else (url.rsplit("/", 1)[-1][:48] if url else "POST")
+        try:
+            from kis_rate_limit import get_kis_limits, retry_http_get
+            limits = get_kis_limits()
+            if limits:
+                max_r = 2 if is_order else int(limits.get("rate_limit_max_retries", 3))
+                return retry_http_get(_with_token, api=api, ticker="", max_retries=max_r)
+        except Exception:
+            pass
+        return _with_token()
 
     # =========================
     # 기존(예시) 기능 메서드들
