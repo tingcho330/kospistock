@@ -348,7 +348,7 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 
 - 발급 전 파일락 → 다른 프로세스가 갱신한 토큰 재사용
 - `EGW00133` 시 65초 backoff 후 최대 3회 재시도
-- **`EGW00123`(서버 토큰 만료) 시 캐시 삭제(`[KIS_TOKEN_INVALIDATED]`) → OAuth 재발급 → 1회 재시도**
+- **`EGW00121`/`EGW00123`(서버 토큰 무효·만료) 시 캐시 삭제(`[KIS_TOKEN_INVALIDATED]`) → OAuth 재발급 → 1회 재시도**
 - 재인증 쿨다운(60초) 내 API 재발급 대신 파일 토큰 재로드 (**`force_new` 재인증 시 쿨다운 우회**)
 - env·app_key 불일치 시 캐시 무효 처리
 - 네트워크 오류·EGW00133 시 기존 토큰 파일 **선삭제하지 않음** (성공 시에만 덮어쓰기)
@@ -357,7 +357,7 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 
 **헬스체크 실패 트러블슈팅**
 
-1. 로그에 `EGW00123` → 자동 재발급 실패 시: `rm -f output/cache/kis_token.json output/cache/kis_token.lock` 후 컨테이너 **순차** 재시작 (1분 간격, EGW00133 방지)
+1. 로그에 `EGW00121`/`EGW00123` → 자동 재발급 실패 시: `rm -f output/cache/kis_token.json output/cache/kis_token.lock` 후 컨테이너 **순차** 재시작 (1분 간격, EGW00133 방지)
 2. `EGW00133` → 65초 대기 후 재시도
 3. env/키 불일치 → `config/.env`의 `KIS_MY_*`(prod) / `KIS_PAPER_*`(vps) 확인
 4. 수동 확인: `docker compose exec integrated_manager python /app/src/health_check.py`

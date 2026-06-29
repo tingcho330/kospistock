@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, Tuple
 
 from env_loader import load_project_env
 from .domestic_stock.domestic_stock_functions import DomesticStock
-from .kis_errors import KISAPIError, parse_kis_api_error
+from .kis_errors import KISAPIError, is_kis_token_auth_error_from_response, parse_kis_api_error
 
 # 토큰을 저장할 파일 경로 설정
 TOKEN_FILE = Path(os.getenv("KIS_TOKEN_FILE", "/app/output/cache/kis_token.json"))
@@ -193,12 +193,12 @@ class KIS(DomesticStock):
     """
     개선 사항
     1) 토큰 캐시: /app/output/cache/kis_token.json
-    2) 토큰 만료 자동 감지(EGW00123/401/invalid token 등) → reauthenticate() → 1회 재시도
+    2) 토큰 만료·무효 자동 감지(EGW00121/EGW00123/401 등) → reauthenticate() → 1회 재시도
     3) 안전 요청 래퍼: request_get()/request_post()/safe_call()
        - 앞으로 KIS API 호출은 가능한 한 이 래퍼들로 감싸서 호출
     4) Python 3.9 호환: Optional[dict] 사용
     5) EGW00133(1분 1회) backoff · 파일락 · 재인증 쿨다운
-    6) EGW00123(서버 토큰 만료) 시 캐시 무효화 후 force_new 재발급
+    6) EGW00121/EGW00123(서버 토큰 무효·만료) 시 캐시 무효화 후 force_new 재발급
     """
 
     def __init__(self, config: dict = {}, env: str = 'prod'):
@@ -468,21 +468,15 @@ class KIS(DomesticStock):
     # =========================
     @staticmethod
     def is_token_expired_error_from_resp(resp: requests.Response) -> bool:
-        """HTTP 응답 기반 만료 감지"""
-        try:
-            if resp.status_code == 401:
-                return True
-            data = resp.json()
-            msg = f"{data}".upper()
-        except Exception:
-            msg = (resp.text or "").upper()
-
-        return ("EGW00123" in msg) or ("TOKEN" in msg and ("EXPIRE" in msg or "INVALID" in msg))
+        """HTTP 응답 기반 토큰 무효·만료 감지."""
+        return is_kis_token_auth_error_from_response(resp)
 
     @staticmethod
     def is_token_expired_error_from_exc(e: Exception) -> bool:
         m = str(e).upper()
-        return ("EGW00123" in m) or ("TOKEN" in m and ("EXPIRE" in m or "INVALID" in m)) or (" 401" in m)
+        if " 401" in m:
+            return True
+        return is_kis_token_auth_error(text=str(e))
 
     def safe_call(self, fn, *args, **kwargs):
         """
@@ -498,7 +492,7 @@ class KIS(DomesticStock):
             raise
 
     def _request_with_token_retry(self, do_request) -> requests.Response:
-        """토큰 만료(EGW00123) 시 캐시 무효화·재발급 후 1회 재시도."""
+        """토큰 무효·만료(EGW00121/EGW00123) 시 캐시 무효화·재발급 후 1회 재시도."""
         resp = do_request()
         if not self.is_token_expired_error_from_resp(resp):
             return resp

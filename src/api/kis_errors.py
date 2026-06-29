@@ -2,7 +2,51 @@
 """KIS API 공통 예외·응답 파싱 (kis_auth ↔ domestic_stock 순환 import 방지)."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional
+
+# KIS OAuth·API 토큰 무효/만료 코드 (EGW00133=발급 rate limit 은 제외)
+_KIS_TOKEN_AUTH_MSG_CDS = frozenset({"EGW00121", "EGW00123"})
+
+
+def is_kis_token_auth_error(
+    *,
+    msg_cd: Optional[str] = None,
+    msg1: Optional[str] = None,
+    text: str = "",
+) -> bool:
+    """서버가 토큰 무효·만료를 알릴 때 True (EGW00121/EGW00123 등)."""
+    code = str(msg_cd or "").strip()
+    if code in _KIS_TOKEN_AUTH_MSG_CDS:
+        return True
+
+    blob = f"{msg1 or ''} {text or ''}"
+    upper = blob.upper()
+    if not ("TOKEN" in upper or "토큰" in blob):
+        return False
+
+    if any(marker in upper for marker in ("EGW00121", "EGW00123", "INVALID", "EXPIRE")):
+        return True
+    if any(marker in blob for marker in ("유효하지", "만료")):
+        return True
+    return False
+
+
+def is_kis_token_auth_error_from_response(resp: Any) -> bool:
+    """requests.Response 기반 토큰 무효·만료 감지."""
+    status_code = getattr(resp, "status_code", None)
+    if status_code == 401:
+        return True
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            return is_kis_token_auth_error(
+                msg_cd=data.get("msg_cd") or data.get("error_code"),
+                msg1=data.get("msg1") or data.get("error_description"),
+                text=str(data),
+            )
+    except Exception:
+        pass
+    return is_kis_token_auth_error(text=getattr(resp, "text", None) or str(resp))
 
 
 class KISAPIError(Exception):
@@ -53,8 +97,10 @@ def parse_kis_api_error(resp: Any, context: str = "") -> KISAPIError:
         body_snippet = (getattr(resp, "text", None) or str(resp))[:200]
 
     prefix = f"{context}: " if context else ""
-    if msg_cd == "EGW00123" or (msg1 and "만료" in msg1 and "token" in msg1.lower()):
+    if msg_cd == "EGW00123" or (msg1 and "만료" in msg1 and "token" in (msg1 or "").lower()):
         message = f"{prefix}KIS 토큰 만료 (EGW00123)"
+    elif msg_cd == "EGW00121" or (msg1 and "유효하지" in msg1 and "token" in (msg1 or "").lower()):
+        message = f"{prefix}KIS 토큰 무효 (EGW00121)"
     elif msg_cd == "EGW00133" or (msg1 and "1분당 1회" in msg1):
         message = f"{prefix}KIS 토큰 발급 rate limit (EGW00133)"
     elif msg_cd or msg1:
