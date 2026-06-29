@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, Tuple
 
 from env_loader import load_project_env
 from .domestic_stock.domestic_stock_functions import DomesticStock
+from .kis_errors import KISAPIError, parse_kis_api_error
 
 # 토큰을 저장할 파일 경로 설정
 TOKEN_FILE = Path(os.getenv("KIS_TOKEN_FILE", "/app/output/cache/kis_token.json"))
@@ -196,7 +197,8 @@ class KIS(DomesticStock):
     3) 안전 요청 래퍼: request_get()/request_post()/safe_call()
        - 앞으로 KIS API 호출은 가능한 한 이 래퍼들로 감싸서 호출
     4) Python 3.9 호환: Optional[dict] 사용
-    5) EGW00133(1분 1회) backoff · 파일락 · 재인증 쿨다운 · 토큰 선삭제 방지
+    5) EGW00133(1분 1회) backoff · 파일락 · 재인증 쿨다운
+    6) EGW00123(서버 토큰 만료) 시 캐시 무효화 후 force_new 재발급
     """
 
     def __init__(self, config: dict = {}, env: str = 'prod'):
@@ -251,24 +253,62 @@ class KIS(DomesticStock):
     # =========================
     # 토큰 저장/로드/발급/재인증
     # =========================
+    def _app_key_hash(self) -> str:
+        """토큰 캐시 env/키 불일치 감지용 (앞 4자)."""
+        key = str(getattr(self, "app_key", "") or "")
+        return key[:4] if len(key) >= 4 else key
+
     def _save_token(self, token_data: dict):
-        """발급받은 토큰과 만료 시간을 파일에 저장 (KIS는 통상 24h 유효)"""
-        expires_at = datetime.utcnow() + timedelta(hours=24)
-        token_data['expires_at'] = expires_at.isoformat() + "Z"
+        """발급받은 토큰과 만료 시간을 파일에 저장."""
+        issued_at = datetime.utcnow()
+        expires_in = token_data.get("expires_in")
+        try:
+            expires_at = issued_at + timedelta(seconds=int(expires_in)) if expires_in is not None else issued_at + timedelta(hours=24)
+        except (TypeError, ValueError):
+            expires_at = issued_at + timedelta(hours=24)
+
+        token_data["expires_at"] = expires_at.isoformat() + "Z"
+        token_data["issued_at"] = issued_at.isoformat() + "Z"
+        token_data["env"] = getattr(self, "env", "prod")
+        token_data["app_key_hash"] = self._app_key_hash()
 
         TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump(token_data, f)
         print("[KIS] 새로운 토큰을 파일에 저장했습니다.")
 
+    def _invalidate_token_cache(self):
+        """서버가 무효화한 토큰 캐시 삭제 (파일락 보유 중 호출)."""
+        try:
+            if TOKEN_FILE.exists():
+                TOKEN_FILE.unlink()
+                print("[KIS_TOKEN_INVALIDATED] 토큰 캐시 삭제")
+        except OSError as e:
+            print(f"[KIS_TOKEN_INVALIDATED] 토큰 캐시 삭제 실패: {e}")
+
     def _load_token(self, *, quiet: bool = False) -> Optional[dict]:
-        """파일에서 유효한 토큰을 로드 (만료 5분 전이면 무효 처리)"""
+        """파일에서 유효한 토큰을 로드 (만료 5분 전·env/키 불일치 시 무효 처리)"""
         if not TOKEN_FILE.exists():
             return None
         try:
-            with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            expiry = self._parse_iso_utc(data.get('expires_at'))
+
+            cached_env = data.get("env")
+            current_env = getattr(self, "env", None)
+            if cached_env and current_env and cached_env != current_env:
+                if not quiet:
+                    print(f"[KIS_TOKEN_INVALIDATED] env 불일치 (cached={cached_env}, current={current_env})")
+                return None
+
+            cached_hash = data.get("app_key_hash")
+            current_hash = self._app_key_hash()
+            if cached_hash and current_hash and cached_hash != current_hash:
+                if not quiet:
+                    print("[KIS_TOKEN_INVALIDATED] app_key 불일치 → 새 발급 필요")
+                return None
+
+            expiry = self._parse_iso_utc(data.get("expires_at"))
             if (expiry is None) or (expiry - timedelta(minutes=5) < datetime.utcnow()):
                 if not quiet:
                     print("[KIS] 기존 토큰 만료 또는 임박 → 새 발급 필요")
@@ -317,12 +357,15 @@ class KIS(DomesticStock):
         print("[KIS] Authentication failed:", res_data)
         return None, self._is_rate_limit_error(res_data)
 
-    def _create_new_token(self, *, max_retries: int = 3) -> Optional[str]:
+    def _create_new_token(self, *, max_retries: int = 3, skip_cache: bool = False) -> Optional[str]:
         """KIS API 서버로부터 새 토큰 발급 (파일락 + EGW00133 backoff)."""
         with _token_file_lock():
-            existing = self._load_token(quiet=True)
-            if existing and existing.get("access_token"):
-                return existing["access_token"]
+            if skip_cache:
+                self._invalidate_token_cache()
+            else:
+                existing = self._load_token(quiet=True)
+                if existing and existing.get("access_token"):
+                    return existing["access_token"]
 
             rate_limited = False
             for attempt in range(max_retries):
@@ -365,27 +408,32 @@ class KIS(DomesticStock):
             return True
         return False
 
-    def reauthenticate(self):
+    def reauthenticate(self, *, force_new: bool = False):
         """만료/무효 토큰일 때 강제 재인증. 성공 시에만 파일을 덮어씀."""
         global _last_reauth_attempt
 
         now = time.time()
-        if now - _last_reauth_attempt < REAUTH_COOLDOWN_SEC:
-            if self._reload_token_from_file():
-                print("[KIS] 재인증 쿨다운 중 → 파일 토큰 재로드")
-                return
+        if force_new:
+            _last_reauth_attempt = now
+            print("[KIS_TOKEN_REAUTH] 서버 토큰 만료 감지 → 캐시 무효화 후 재발급")
+            new_token = self._create_new_token(skip_cache=True)
+        else:
+            if now - _last_reauth_attempt < REAUTH_COOLDOWN_SEC:
+                if self._reload_token_from_file():
+                    print("[KIS] 재인증 쿨다운 중 → 파일 토큰 재로드")
+                    return
 
-        _last_reauth_attempt = now
-        print("[KIS] 토큰 재인증(re-auth) 수행")
+            _last_reauth_attempt = now
+            print("[KIS] 토큰 재인증(re-auth) 수행")
+            new_token = self._create_new_token()
 
-        new_token = self._create_new_token()
         if new_token:
             self._bind_headers(new_token)
             self.auth_token = new_token
             print("[KIS] 토큰 재인증 완료")
             return
 
-        if self._reload_token_from_file():
+        if not force_new and self._reload_token_from_file():
             print("[KIS] 재인증 API 실패 → 파일 토큰 폴백 성공")
             return
 
@@ -445,9 +493,28 @@ class KIS(DomesticStock):
             return fn(*args, **kwargs)
         except Exception as e:
             if self.is_token_expired_error_from_exc(e):
-                self.reauthenticate()
+                self.reauthenticate(force_new=True)
                 return fn(*args, **kwargs)
             raise
+
+    def _request_with_token_retry(self, do_request) -> requests.Response:
+        """토큰 만료(EGW00123) 시 캐시 무효화·재발급 후 1회 재시도."""
+        resp = do_request()
+        if not self.is_token_expired_error_from_resp(resp):
+            return resp
+
+        self.reauthenticate(force_new=True)
+        resp = do_request()
+        if self.is_token_expired_error_from_resp(resp):
+            err = parse_kis_api_error(resp, context="KIS API")
+            raise KISAPIError(
+                f"재인증 후에도 토큰 만료 — {err.summary()}",
+                msg_cd=err.msg_cd,
+                msg1=err.msg1,
+                rt_cd=err.rt_cd,
+                status_code=err.status_code,
+            )
+        return resp
 
     # -------------------------
     # 요청 래퍼: GET / POST
@@ -466,11 +533,7 @@ class KIS(DomesticStock):
             )
 
         def _with_token() -> requests.Response:
-            resp = _do()
-            if self.is_token_expired_error_from_resp(resp):
-                self.reauthenticate()
-                resp = _do()
-            return resp
+            return self._request_with_token_retry(_do)
 
         ticker = ""
         if params:
@@ -497,11 +560,7 @@ class KIS(DomesticStock):
             return requests.post(url, headers=merged_headers, data=payload, timeout=timeout)
 
         def _with_token() -> requests.Response:
-            resp = _do()
-            if self.is_token_expired_error_from_resp(resp):
-                self.reauthenticate()
-                resp = _do()
-            return resp
+            return self._request_with_token_retry(_do)
 
         is_order = "order-cash" in (url or "")
         api = "order_cash" if is_order else (url.rsplit("/", 1)[-1][:48] if url else "POST")

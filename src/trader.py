@@ -3328,7 +3328,7 @@ class Trader:
         if "토큰" in error or "인증" in error:
             logger.warning("토큰 관련 에러 감지, 재인증 시도")
             try:
-                self.kis.reauthenticate()
+                self.kis.reauthenticate(force_new=True)
             except Exception as e:
                 logger.error(f"재인증 실패: {e}")
         elif "가격" in error or "호가" in error:

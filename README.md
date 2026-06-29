@@ -339,17 +339,28 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 
 | 파일 | 역할 |
 |------|------|
-| `kis_token.json` | 접근 토큰 캐시 (24h, 만료 5분 전 갱신) |
+| `kis_token.json` | 접근 토큰 캐시 (`expires_in` 기반, 만료 5분 전 갱신) |
 | `kis_token.lock` | 컨테이너 간 발급 경합 방지 (fcntl) |
+
+`kis_token.json` 메타: `issued_at`, `expires_at`, `env`, `app_key_hash`(앞 4자)
 
 `api/kis_auth.py` 동작:
 
 - 발급 전 파일락 → 다른 프로세스가 갱신한 토큰 재사용
 - `EGW00133` 시 65초 backoff 후 최대 3회 재시도
-- 재인증 쿨다운(60초) 내 API 재발급 대신 파일 토큰 재로드
-- 재인증 실패 시 기존 토큰 파일을 **선삭제하지 않음** (성공 시에만 덮어쓰기)
+- **`EGW00123`(서버 토큰 만료) 시 캐시 삭제(`[KIS_TOKEN_INVALIDATED]`) → OAuth 재발급 → 1회 재시도**
+- 재인증 쿨다운(60초) 내 API 재발급 대신 파일 토큰 재로드 (**`force_new` 재인증 시 쿨다운 우회**)
+- env·app_key 불일치 시 캐시 무효 처리
+- 네트워크 오류·EGW00133 시 기존 토큰 파일 **선삭제하지 않음** (성공 시에만 덮어쓰기)
 
-환경 변수: `KIS_TOKEN_BACKOFF_SEC`, `KIS_REAUTH_COOLDOWN_SEC`, `KIS_TOKEN_LOCK_TIMEOUT_SEC`, `KIS_TOKEN_FILE`
+환경 변수: `KIS_TOKEN_BACKOFF_SEC`, `KIS_REAUTH_COOLDOWN_SEC`, `KIS_TOKEN_LOCK_TIMEOUT_SEC`, `KIS_TOKEN_FILE`, `KIS_HEALTHCHECK_ENV`
+
+**헬스체크 실패 트러블슈팅**
+
+1. 로그에 `EGW00123` → 자동 재발급 실패 시: `rm -f output/cache/kis_token.json output/cache/kis_token.lock` 후 컨테이너 **순차** 재시작 (1분 간격, EGW00133 방지)
+2. `EGW00133` → 65초 대기 후 재시도
+3. env/키 불일치 → `config/.env`의 `KIS_MY_*`(prod) / `KIS_PAPER_*`(vps) 확인
+4. 수동 확인: `docker compose exec integrated_manager python /app/src/health_check.py`
 
 ### 3.5 주요 산출물 (`output/`)
 
@@ -932,6 +943,7 @@ python run_integrated_manager.py --once
 | `KIS_TOKEN_BACKOFF_SEC` | EGW00133 재시도 대기(초, 기본 65) |
 | `KIS_REAUTH_COOLDOWN_SEC` | 재인증 API 호출 쿨다운(초, 기본 60) |
 | `KIS_TOKEN_LOCK_TIMEOUT_SEC` | 토큰 파일락 대기(초, 기본 120) |
+| `KIS_HEALTHCHECK_ENV` | 헬스체크 KIS env (기본 `prod`) |
 | `DISCORD_WEBHOOK_URL_RISK` | 리스크 매니저 전용 Discord 웹훅 |
 | `ASSET_ALLOCATION_ALLOW_PROD` | **`1`/`true`일 때만** prod + `asset_allocation.enabled` 주문 허용. 모의 검증 중 **설정 금지** |
 

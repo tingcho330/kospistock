@@ -20,9 +20,10 @@ class DomesticStock:
         """모의투자 API (vps 조회 / kis_paper 주문) — openapivts + VTTC TR."""
         return getattr(self, 'env', 'prod') in ('vps', 'kis_paper')
 
-    def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str):
+    def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str, *, raise_on_error: bool = False):
         """
         주식현재가 시세
+        raise_on_error=True 시 실패 시 KISAPIError 발생 (health_check 등).
         """
         ticker = str(fid_input_iscd).zfill(6)
         try:
@@ -41,7 +42,16 @@ class DomesticStock:
             "FID_INPUT_ISCD": fid_input_iscd,
         }
         
-        res = self.request_get(url, headers={"tr_id": tr_id}, params=params)
+        try:
+            res = self.request_get(url, headers={"tr_id": tr_id}, params=params)
+        except Exception as e:
+            if raise_on_error:
+                from api.kis_errors import KISAPIError
+                if isinstance(e, KISAPIError):
+                    raise
+                raise KISAPIError(f"현재가 조회 실패 (ticker={ticker}): {e}") from e
+            logger.warning("현재가 조회 실패 (ticker=%s): %s", ticker, e)
+            return pd.DataFrame()
         
         if res.status_code == 200:
             try:
@@ -52,8 +62,16 @@ class DomesticStock:
                 except Exception:
                     pass
                 return df
-            except Exception:
-                pass
+            except Exception as parse_err:
+                if raise_on_error:
+                    from api.kis_errors import KISAPIError
+                    raise KISAPIError(
+                        f"현재가 응답 파싱 실패 (ticker={ticker}): {parse_err}",
+                        status_code=res.status_code,
+                    ) from parse_err
+
+        from api.kis_errors import KISAPIError, parse_kis_api_error
+        api_err = parse_kis_api_error(res, context=f"현재가 조회 (ticker={ticker})")
         try:
             from kis_rate_limit import parse_rate_limit_from_response
             limited, msg_cd = parse_rate_limit_from_response(res)
@@ -63,9 +81,17 @@ class DomesticStock:
                     ticker, msg_cd, (res.text or "")[:200],
                 )
             else:
-                logger.warning(f"현재가 조회 실패 (status={res.status_code}, ticker={ticker}): {res.text[:200]}")
+                logger.warning(
+                    "현재가 조회 실패 (status=%s, ticker=%s, msg_cd=%s): %s",
+                    res.status_code, ticker, api_err.msg_cd, (res.text or "")[:200],
+                )
         except Exception:
-            logger.warning(f"현재가 조회 실패 (status={res.status_code}, ticker={ticker}): {res.text[:200]}")
+            logger.warning(
+                "현재가 조회 실패 (status=%s, ticker=%s): %s",
+                res.status_code, ticker, (res.text or "")[:200],
+            )
+        if raise_on_error:
+            raise api_err
         return pd.DataFrame()
 
     def inquire_balance(self, inqr_dvsn: str, afhr_flpr_yn: str, ofl_yn: str, 
