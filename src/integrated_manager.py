@@ -1075,6 +1075,14 @@ def run_trading_pipeline():
                 if pipeline_ok:
                     state_manager.clear_state()
                     logger.info(f"[{run_id}] 파이프라인 완료, 상태 초기화")
+                    try:
+                        from performance_review import build_performance_review, write_outputs
+                        review_date = datetime.now(KST).strftime("%Y%m%d")
+                        report = build_performance_review(review_date, MARKET)
+                        write_outputs(report)
+                        logger.info(f"[{run_id}] performance_review 생성 완료")
+                    except Exception as perf_err:
+                        logger.warning(f"[{run_id}] performance_review 생성 실패: {perf_err}")
                 break
 
             except Exception as e:

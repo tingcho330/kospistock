@@ -45,7 +45,7 @@
 | 분석 | OpenAI GPT 또는 휴리스틱(키 없을 때) |
 | 매매 | KIS Open API 매수/매도 (`target_weight` 기반 사이징). 선택: **70:20:10 자산 배분** 가드(`asset_allocation`) |
 | 리스크 | 장중 별도 프로세스에서 손절·익절·전략 매도 (459580 등 bond ETF 제외 가능) |
-| 사후 처리 | SQLite 기록, 주문 정합성, 월간 성과 리뷰·산출물 정리 |
+| 사후 처리 | SQLite 기록, 주문 정합성, **일별 성능 리뷰**, 월간 GPT 회고·산출물 정리 |
 
 - **운용 시장:** KOSPI (`MARKET=KOSPI`, `screener_params.portfolio.rebalance_frequency: weekly`)
 - **주간 스케줄:** 금요일 15:45 스크리너 → 월요일 09:30 매매 파이프라인
@@ -83,6 +83,7 @@
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화. **459580(bond ETF)은 회전·GPT 리밸런싱 대상에서 제외**
 - **자산 배분 (선택)** — `asset_allocation.enabled` 시 주문 실행 단계에서만 70% 주식 / 20% 459580 / 10% 현금(최소 5%) 가드. 스크리너·GPT 전략은 변경 없음. 주식 매수 후 잔여 현금으로 459580 자동 매수(국내주식 현금주문 경로)
 - **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 + KIS 공식 수치(`nass_amt`, `rlzt_pfls`, `thdt_*`) 기반 Discord 전송. DB `profit_loss`는 보조·불일치 시 ⚠️ 표시
+- **일별 성능 리뷰** — `performance_review.py`가 스크리너 퍼널·GPT BUY/HOLD/REJECT·예산 사용률·체결 품질·파이프라인 runtime을 **JSON/CSV/Markdown**으로 자동 생성. `candidate_tracking_*.json`으로 미매수 후보 사후 추적(1D/3D/5D/10D)
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
 ---
@@ -125,7 +126,7 @@
 |------|------|------|------|
 | 09:00 | 평일 | 장시작 잔액 스냅샷 | `capture_balance_snapshot("open")` |
 | **15:45** | **금요** | **스크리너** | `screener.py` → 후보·`target_weight` 산출 |
-| **09:30** | **월요** | **주간 매매 파이프라인** | `health_check` → `news` → `gpt` → `trader` |
+| **09:30** | **월요** | **주간 매매 파이프라인** | `health_check` → `news` → `gpt` → `trader` → `performance_review` |
 | 11:00 · 14:00 | 평일 | 장중 경량 리컨실 | `order_reconciler` |
 | 15:20 | 평일 | 일괄 체결 확인 | `trader.py --batch-check-only` |
 | 15:22 | 평일 | 주문 정합성 | `order_reconciler.py` |
@@ -162,7 +163,8 @@
 
 > 예수금(`dnca_tot_amt`)은 T+2 결제 환경에서 당일 매매 직후 변하지 않을 수 있어 **「현금 변화」 단독 표시는 하지 않습니다.**  
 > DB 실현손익이 KIS와 다르면 `order_reconciler` 실행·체결가(`avg_prvs` / holding `pchs_avg_pric`)·`amount` 정합성·phantom BUY row(`order_id` 없는 `paper_executed`) 여부를 점검하세요.  
-> `account.py`는 `balance_*.json`·`summary_*.json`·`summary_rlz_*.json` 저장용이며, 스케줄 스냅샷은 `daily_balances/`에 별도 저장됩니다.
+> `account.py`는 `balance_*.json`·`summary_*.json`·`summary_rlz_*.json` 저장용이며, 스케줄 스냅샷은 `daily_balances/`에 별도 저장됩니다.  
+> **상세 전략·시스템 분석**은 Discord 요약과 별도로 `performance_review_*.json` / `.md` / `.csv`를 참고하세요 ([3.4.2](#342-일별-성능-리뷰-performance_reviewpy)).
 
 ### 3.3 스크리너 vs 매매 파이프라인
 
@@ -179,7 +181,8 @@ screener.py                            health_check.py
                                                 ├─ [asset_allocation] stock_buy_budget
                                                 ├─ 주식 매수 (REBUY / 신규 / 리밸런스)
                                                 ├─ [POST_STOCK] 459580 매수 (enabled 시)
-                                                └─ recorder → trading_data.db
+                                                ├─ recorder → trading_data.db
+                                                └─ performance_review.py (성공 시 자동)
          └──────────────────────────────────────────┘
                               (장중, 별도 컨테이너) risk_manager.py
 ```
@@ -262,6 +265,7 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 2. `news_collector.py` ← 스크리너 JSON
 3. `gpt_analyzer.py`
 4. `trader.py` ← `gpt_trades_*.json` (`plans` 중 `결정 == "매수"`만 매수)
+5. `performance_review.py` ← 파이프라인 **성공 시 자동** (수동 실행 가능)
 
 실패 시 `output/pipeline_state.json`에 저장 후 `STEP_DEPENDENCIES` 기준 **실패 단계부터 재시도** (`MAX_ATTEMPTS`).
 
@@ -362,6 +366,58 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 3. env/키 불일치 → `config/.env`의 `KIS_MY_*`(prod) / `KIS_PAPER_*`(vps) 확인
 4. 수동 확인: `docker compose exec integrated_manager python /app/src/health_check.py`
 
+### 3.4.2 일별 성능 리뷰 (`performance_review.py`)
+
+**일일 Discord 요약**(`daily_summary`)과 별도로, 전략·시스템 성능을 분석하는 **상세 리포트**를 생성합니다. 월간 `reviewer.py`와 달리 **매매일마다** 파이프라인 성공 후 자동 실행됩니다.
+
+| 구분 | `daily_summary` | `performance_review` | `reviewer.py` |
+|------|-----------------|--------------------|---------------|
+| 주기 | 평일 장마감 후 | 파이프라인 성공 직후 | 월 1회 |
+| 목적 | Discord 한 줄 요약 | 전략·체결·시스템 상세 분석 | config 튜닝 |
+| 출력 | Discord embed | JSON / CSV / Markdown | `review_log.json` |
+
+**입력 (당일 `output/`):**
+
+| 파일 | 용도 |
+|------|------|
+| `screener_candidates_*`, `screener_scores_*` | 후보·퍼널 |
+| `gpt_trades_*` | GPT `매수`/`보류`/`미진입` |
+| `balance_*`, `summary_*` | 잔고·예산 |
+| `trading_data.db` | 체결·리컨실 |
+| `pipeline_state.json`, `*.log` | 단계별 runtime·EGW00201 |
+
+**출력:**
+
+| 파일 | 내용 |
+|------|------|
+| `performance_review_YYYYMMDD_MARKET.json` | `summary`, `screener_funnel`, `gpt_decision`, `budget_usage`, `execution_performance`, `system_performance`, `warnings` |
+| `performance_review_YYYYMMDD_MARKET.csv` | 종목 단위 행 |
+| `performance_review_YYYYMMDD_MARKET.md` | Markdown 리포트 |
+| `candidate_tracking_YYYYMMDD_MARKET.json` | 후보·GPT·체결 스냅샷 (1D/3D/5D/10D 수익률 추적용) |
+
+**주요 로그 태그:**
+
+```
+[PERF_SCREENER_FUNNEL]  — 유니버스·Marcap·Amount5D·GPT·체결 BUY 집계
+[PERF_GPT_DECISION]     — BUY/HOLD/REJECT 분포·평균 점수
+[STOCK_BUDGET_USAGE]    — 70% 주식 목표 대비 예산 사용률·미사용 사유
+[PERF_EXECUTION]        — 체결률·holding fallback·pending
+[PERF_SYSTEM]           — 단계별 runtime·rate limit·error count
+[PERF_TRACKING_SNAPSHOT]— candidate_tracking 저장
+```
+
+```bash
+# 수동 생성 (날짜·시장 지정)
+docker compose exec integrated_manager python /app/src/performance_review.py --date 20260625 --market KOSPI
+
+# 오늘 (KST) · KIS 시세 조회 없이 (오프라인)
+docker compose exec integrated_manager python /app/src/performance_review.py --no-fetch-prices
+
+ls -lh output/performance_review_20260625_KOSPI.*
+```
+
+> `candidate_tracking_*.json`은 이후 실행 시 기준일로부터 1/3/5/10거래일 경과 시 `return_*d`를 KIS 현재가로 자동 갱신합니다 (`--no-fetch-prices` 시 생략).
+
 ### 3.5 주요 산출물 (`output/`)
 
 | 패턴 | 모듈 |
@@ -374,6 +430,7 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
+| `performance_review_*`, `candidate_tracking_*` | `performance_review.py` (일별 전략·시스템 성능 리포트) |
 | `cache/kis_token.json`, `cache/kis_token.lock` | KIS OAuth 토큰·발급 락 |
 | `cache/` (`.mst`, `.pkl` 등) | KIS·스크리너 |
 
@@ -398,6 +455,8 @@ Git에는 `output/.gitkeep`만 추적합니다.
 > 컨테이너 이미지에 `sqlite3` CLI가 없습니다. DB 확인은 아래 [7.3](#73-수동--단발-실행) Python 예시를 사용하세요.
 
 ### 3.8 GPT 월간 회고 (`reviewer.py`)
+
+> **일별** 전략·체결·시스템 분석은 [3.4.2 `performance_review.py`](#342-일별-성능-리뷰-performance_reviewpy)를 사용하세요. `reviewer.py`는 **월간** config 튜닝 전용입니다.
 
 | 항목 | 내용 |
 |------|------|
@@ -425,7 +484,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `inquire-period-trade-profit` | TTTC8715R | 기간별 매매손익(종목별 검증용) |
 | `order-cash` | TTTC0801U/0802U (prod) · **VTTC0801U/0802U** (`kis_paper`/`vps` 모의) | 현금 매수/매도 |
 
-- **인증:** `auth()` / `reauthenticate()` — 토큰 파일 캐시 + `request_get`/`request_post` 만료 시 1회 재시도
+- **인증:** `auth()` / `reauthenticate(force_new=True)` — EGW00121/EGW00123 시 캐시 무효화 후 재발급, `request_get`/`request_post` 1회 재시도
 - **설정:** `config/.env` + `config/kis_devlp.yaml` (`load_kis_config()`)
 - **주의:** `integrated_manager`(스크리너·account)와 `background_risk_manager`(장중 매도)가 동시에 KIS를 호출하므로 토큰 파일 공유·락이 필요합니다.
 
@@ -437,7 +496,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 
 | 파일 | 역할 |
 |------|------|
-| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, `daily_balances` 스냅샷·일일 Discord 요약·리컨실, 파이프라인 상태 복구 |
+| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, `daily_balances` 스냅샷·일일 Discord 요약·리컨실, 파이프라인 상태 복구, **성공 시 `performance_review` 자동 호출** |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 (`--once`, `--capture-open` 등) |
 | `risk_manager.py` | 장중 리스크 사이클, 매도·파이프라인 재기동 |
 | `run_background_risk_manager.py` | 리스크 전용 컨테이너 진입점 (`BackgroundRiskManager`) |
@@ -451,7 +510,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `portfolio_allocator.py` | `conviction` / `rank_tier` / equal / score_proportional 목표 비중 (**스크리너·리플레이 전용**, `trader.py`는 import하지 않음) |
 | `asset_allocator.py` | 70:20:10 예산 계산 (`compute_allocation`, `stock_buy_budget`, `initial_bond_buy_budget`, `is_bond_etf`) — **주문 실행 없음** |
 | `kis_master.py` | KIS `.mst` 마스터 다운로드·캐시 |
-| `health_check.py` | KIS 헬스체크(삼성전자 시세) |
+| `health_check.py` | KIS 헬스체크 — `chk-server` + 삼성전자 시세, `EGW00121`/`EGW00123` 자동 재인증 |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT/휴리스틱 2단계 분석 → `gpt_trades_*.json` (`매수`/`보류`/`미진입`), 리밸런싱 GPT 헬퍼, 예산 가드 |
 | `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`asset_allocation` 주문 가드·459580 매수·`[STOCK_BUDGET_USAGE]`·`[REBUY_GUARD]`·`--batch-check-only`·`--sell-only` |
@@ -464,6 +523,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + holding fallback + `amount`/`structured_context` 동기화 + orphan `order_id` backfill |
 | `kis_rate_limit.py` | 환경별 `kis_limits` RPS·동시성·EGW00201 백오프·인메모리 캐시 |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
+| `performance_review.py` | **일별** 스크리너 퍼널·GPT 판단·예산·체결·시스템 성능 리포트 (JSON/CSV/MD) + `candidate_tracking` |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
 | `rotation_manager.py` | 현금 부족 시 회전 시도·시장 동적 임계값·실행 |
 | `trader.py` | 슬롯 꽉 참 시 리밸런싱·`run_buy_logic` 회전 한도 관리 |
@@ -480,7 +540,8 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `notifier.py` | Discord 웹훅 |
 | `strategies.py` | 매도 전략 클래스 |
 | `db_debug.py` | DB 디버그 로그 (`DB_RECORD_DEBUG=1`) |
-| `api/kis_auth.py` | KIS 인증·토큰 캐시·파일락·EGW00133 backoff |
+| `api/kis_auth.py` | KIS 인증·토큰 캐시·파일락·EGW00133 backoff·**EGW00121/EGW00123 force_new 재인증** |
+| `api/kis_errors.py` | KIS API 공통 예외·토큰 무효/만료 감지 (`KISAPIError`) |
 | `api/domestic_stock/domestic_stock_functions.py` | 시세·잔고·실현손익·주문 REST 래퍼 |
 
 ### 4.1 회전 매매 (Rotation)
@@ -871,6 +932,18 @@ docker compose exec integrated_manager python -u /app/src/trader.py
 # 체결 확인·리컨실 (pending/partial 갱신 + orphan order_id backfill)
 docker compose exec integrated_manager python -u /app/src/trader.py --batch-check-only
 
+# 일별 성능 리뷰 (JSON / CSV / Markdown) — 파이프라인 산출물·DB·로그 기반
+docker compose exec integrated_manager python /app/src/performance_review.py --date 20260625 --market KOSPI
+docker compose exec integrated_manager python /app/src/performance_review.py --market KOSPI
+ls -lh output/performance_review_* output/candidate_tracking_*
+
+# 파이프라인만 강제 (휴장일·요일 조건 적용됨)
+docker compose exec integrated_manager python -c "
+import sys; sys.path.insert(0, '/app/src')
+import integrated_manager
+integrated_manager.run_trading_pipeline()
+"
+
 # 매도만 (risk_manager direct_execute fallback과 동일)
 docker compose exec background_risk_manager python -u /app/src/trader.py --sell-only
 
@@ -995,11 +1068,14 @@ kospistock/
 │   └── kis_devlp.yaml           # 로컬 KIS 기본값 (Git 제외, 선택)
 ├── output/
 │   ├── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
+│   ├── performance_review_*     # 일별 성능 리포트 (json/csv/md, 런타임)
+│   ├── candidate_tracking_*     # 후보 사후 추적 스냅샷 (런타임)
 │   ├── summary_rlz_*.json       # KIS 실현손익 스냅샷 (account.py, 런타임)
 │   └── daily_balances/          # balance_open_*.json, balance_close_*.json (런타임)
 ├── src/
 │   ├── api/
 │   │   ├── kis_auth.py
+│   │   ├── kis_errors.py
 │   │   └── domestic_stock/
 │   │       └── domestic_stock_functions.py
 │   ├── asset_allocator.py         # 70:20:10 예산 계산 (trader 연동)
@@ -1009,6 +1085,7 @@ kospistock/
 │   ├── risk_manager.py
 │   ├── screener.py / screener_core.py / kis_master.py
 │   ├── health_check.py / news_collector.py / gpt_analyzer.py / trader.py
+│   ├── performance_review.py      # 일별 전략·시스템 성능 리포트
 │   ├── recorder.py / order_reconciler.py / reviewer.py
 │   ├── rotation_policy.py / rotation_manager.py
 │   ├── account.py / strategies.py
