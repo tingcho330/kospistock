@@ -55,6 +55,7 @@ _RECONCILE_HOLDING_RE = re.compile(
     r"\[RECONCILE_BY_HOLDING\]\s+order_id=(\S+)\s+ticker=(\d+)",
     re.I,
 )
+_RUN_ID_IN_LINE_RE = re.compile(r"\[(\d{8}-\d{6})\]")
 
 
 def _norm_date(s: Optional[str]) -> str:
@@ -315,53 +316,135 @@ def _parse_reconcile_holding_map(log_text: str) -> Dict[str, str]:
     return out
 
 
-def _parse_log_warnings(date_str: str, log_files: List[Path]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Traceback/EGW00201를 파일별로 수집, historical vs current 분류."""
-    details: List[Dict[str, Any]] = []
-    egw_count = 0
-    run_id = ""
+def _nearest_run_id(lines: List[str], idx: int, lookback: int = 80) -> Optional[str]:
+    for j in range(idx, max(-1, idx - lookback), -1):
+        m = _RUN_ID_IN_LINE_RE.search(lines[j])
+        if m:
+            return m.group(1)
+    return None
+
+
+def _resolve_log_scope(
+    line: str,
+    lines: List[str],
+    idx: int,
+    latest_run_id: str,
+    path: Path,
+) -> Tuple[str, str]:
+    """로그 라인 scope/severity 분류."""
+    low_path = str(path).lower()
+    if "performance_review" in low_path or "PerformanceReview" in line:
+        return "current_run", "current_warning"
+    if "performance_review.py" in line:
+        return "current_run", "current_warning"
+    ctx_run = _nearest_run_id(lines, idx)
+    if latest_run_id and (ctx_run == latest_run_id or f"[{latest_run_id}]" in line):
+        return "latest_pipeline", "current_warning"
+    return "historical_log", "historical_warning"
+
+
+def _empty_scoped_counts() -> Dict[str, int]:
+    return {
+        "current_run_egw00201_count": 0,
+        "current_pipeline_egw00201_count": 0,
+        "latest_pipeline_egw00201_count": 0,
+        "all_related_logs_egw00201_count": 0,
+        "historical_egw00201_count": 0,
+        "current_run_error_count": 0,
+        "latest_pipeline_error_count": 0,
+        "historical_error_count": 0,
+        "all_related_logs_error_count": 0,
+        "current_run_traceback_count": 0,
+        "latest_pipeline_traceback_count": 0,
+        "historical_traceback_count": 0,
+        "traceback_count": 0,
+        "performance_review_traceback": 0,
+    }
+
+
+def _parse_scoped_log_events(
+    date_str: str,
+    log_files: List[Path],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """EGW00201/ERROR/Traceback를 scope별로 집계."""
     state = _load_pipeline_state(date_str)
-    if state.get("run_id"):
-        run_id = str(state["run_id"])
+    latest_run_id = str(state.get("run_id") or "")
+    counts = _empty_scoped_counts()
+    details: List[Dict[str, Any]] = []
 
     for path in log_files:
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
-        lines = text.splitlines()
         for i, line in enumerate(lines):
-            if "Traceback (most recent call last)" in line:
-                sample = line
-                if i + 1 < len(lines):
-                    sample = f"{line} | next: {lines[i + 1][:120]}"
-                context = "\n".join(lines[max(0, i - 2): min(len(lines), i + 12)])
-                is_current = bool(run_id and run_id in context)
-                severity = "current_warning" if is_current else "historical_warning"
-                details.append({
-                    "type": "traceback",
-                    "severity": severity,
-                    "source_file": str(path),
-                    "line_no": i + 1,
-                    "sample": sample[:300],
-                })
+            scope, severity = _resolve_log_scope(line, lines, i, latest_run_id, path)
+
             if "EGW00201" in line:
-                egw_count += 1
+                counts["all_related_logs_egw00201_count"] += 1
+                if scope == "current_run":
+                    counts["current_run_egw00201_count"] += 1
+                elif scope == "latest_pipeline":
+                    counts["current_pipeline_egw00201_count"] += 1
+                    counts["latest_pipeline_egw00201_count"] += 1
+                else:
+                    counts["historical_egw00201_count"] += 1
                 details.append({
                     "type": "egw00201",
-                    "severity": "historical_warning" if run_id and run_id not in line else "current_warning",
+                    "scope": scope,
+                    "severity": severity,
                     "source_file": str(path),
                     "line_no": i + 1,
                     "sample": line[:300],
                 })
 
-    perf = {
-        "kis_rate_limit_count": egw_count,
-        "egw00201_count": egw_count,
-        "traceback_count": sum(1 for d in details if d["type"] == "traceback"),
-        "performance_review_traceback": 0,
+            if " - ERROR - " in line:
+                counts["all_related_logs_error_count"] += 1
+                if scope == "current_run":
+                    counts["current_run_error_count"] += 1
+                elif scope == "latest_pipeline":
+                    counts["latest_pipeline_error_count"] += 1
+                else:
+                    counts["historical_error_count"] += 1
+                details.append({
+                    "type": "error",
+                    "scope": scope,
+                    "severity": severity,
+                    "source_file": str(path),
+                    "line_no": i + 1,
+                    "sample": line[:300],
+                })
+
+            if "Traceback (most recent call last)" in line:
+                counts["traceback_count"] += 1
+                sample = line
+                if i + 1 < len(lines):
+                    sample = f"{line} | next: {lines[i + 1][:120]}"
+                if scope == "current_run":
+                    counts["current_run_traceback_count"] += 1
+                elif scope == "latest_pipeline":
+                    counts["latest_pipeline_traceback_count"] += 1
+                else:
+                    counts["historical_traceback_count"] += 1
+                details.append({
+                    "type": "traceback",
+                    "scope": scope,
+                    "severity": severity,
+                    "source_file": str(path),
+                    "line_no": i + 1,
+                    "sample": sample[:300],
+                })
+
+    counts["performance_review_traceback"] = counts["current_run_traceback_count"]
+    result: Dict[str, Any] = {
+        **counts,
+        "latest_pipeline_run_id": latest_run_id or None,
+        # 하위 호환: Summary/기존 필드는 최신 파이프라인 기준
+        "egw00201_count": counts["latest_pipeline_egw00201_count"],
+        "kis_rate_limit_count": counts["latest_pipeline_egw00201_count"],
+        "error_count": counts["latest_pipeline_error_count"],
     }
-    return perf, details
+    return result, details
 
 
 def _gpt_action(plan: Dict[str, Any]) -> str:
@@ -555,11 +638,7 @@ def _parse_system_from_logs(log_text: str) -> Dict[str, Any]:
         "screener.py": "screener_runtime_sec",
     }
     perf: Dict[str, Any] = {
-        "kis_rate_limit_count": len(re.findall(r"EGW00201|rate_limited", log_text, re.I)),
-        "egw00201_count": len(re.findall(r"EGW00201", log_text)),
         "kis_retry_count": len(re.findall(r"재시도|retry", log_text, re.I)),
-        "traceback_count": len(re.findall(r"Traceback \(most recent call last\)", log_text)),
-        "error_count": len(re.findall(r" - ERROR - ", log_text)),
         "warning_count": len(re.findall(r" - WARNING - ", log_text)),
     }
     for script, key in script_map.items():
@@ -984,8 +1063,14 @@ def _build_execution_performance(
     return perf
 
 
-def _build_system_performance(date_str: str, log_text: str) -> Dict[str, Any]:
+def _build_system_performance(
+    date_str: str,
+    log_text: str,
+    scoped_counts: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     perf = _parse_system_from_logs(log_text)
+    if scoped_counts:
+        perf.update(scoped_counts)
     state = _load_pipeline_state(date_str)
     durations = state.get("step_durations") or {}
     if isinstance(durations, dict):
@@ -1005,16 +1090,13 @@ def _build_system_performance(date_str: str, log_text: str) -> Dict[str, Any]:
         except Exception:
             pass
     logger.info(
-        "[PERF_SYSTEM] total_runtime_sec=%s screener_sec=%s news_sec=%s gpt_sec=%s "
-        "trader_sec=%s kis_rate_limit=%s egw00201=%s errors=%s",
+        "[PERF_SYSTEM] current_run_errors=%s latest_pipeline_egw00201=%s "
+        "historical_egw00201=%s performance_review_traceback=%s total_runtime_sec=%s",
+        perf.get("current_run_error_count", 0),
+        perf.get("latest_pipeline_egw00201_count", 0),
+        perf.get("historical_egw00201_count", 0),
+        perf.get("performance_review_traceback", 0),
         perf.get("total_runtime_sec"),
-        perf.get("screener_runtime_sec"),
-        perf.get("news_collector_runtime_sec"),
-        perf.get("gpt_analyzer_runtime_sec"),
-        perf.get("trader_runtime_sec"),
-        perf.get("kis_rate_limit_count"),
-        perf.get("egw00201_count"),
-        perf.get("error_count"),
     )
     return perf
 
@@ -1225,31 +1307,49 @@ def _build_warnings(
     budget: Dict[str, Any],
     account_warnings: Optional[List[str]] = None,
     warnings_detail: Optional[List[Dict[str, Any]]] = None,
-) -> List[str]:
-    warnings: List[str] = list(account_warnings or [])
-    if system.get("egw00201_count", 0) > 0:
-        warnings.append(f"EGW00201 rate limit {system['egw00201_count']}회 발생")
+) -> Tuple[List[str], List[str]]:
+    """(current_warnings, historical_warnings) 반환."""
+    current: List[str] = list(account_warnings or [])
+    historical: List[str] = []
+
+    cre = system.get("current_run_error_count", 0)
+    current.append("현재 실행 오류: 없음" if cre == 0 else f"현재 실행 오류: {cre}건")
+
     perf_tb = system.get("performance_review_traceback", 0)
-    if perf_tb > 0:
-        warnings.append(f"performance_review Traceback {perf_tb}건 (현재 실행)")
-    else:
-        warnings.append("performance_review_traceback=0")
-    for detail in warnings_detail or []:
-        if detail.get("type") != "traceback":
-            continue
-        if detail.get("severity") == "historical_warning":
-            src = Path(str(detail.get("source_file", ""))).name
-            line_no = detail.get("line_no", "?")
-            sample = str(detail.get("sample", ""))[:120]
-            warnings.append(f"과거 로그 Traceback: {src}:{line_no} — {sample}")
+    current.append(f"performance_review_traceback={perf_tb}")
+
+    lp_egw = system.get("latest_pipeline_egw00201_count", 0)
+    current.append(f"최신 파이프라인 EGW00201: {lp_egw}회")
+
+    hist_tb = system.get("historical_traceback_count", 0)
+    if hist_tb == 0 and warnings_detail:
+        hist_tb = sum(
+            1 for d in warnings_detail
+            if d.get("type") == "traceback" and d.get("scope") == "historical_log"
+        )
+    current.append(f"과거 로그 Traceback: {hist_tb}건")
+
+    hist_egw = system.get("historical_egw00201_count", 0)
+    current.append(f"과거 로그 EGW00201: {hist_egw}회")
+
     if execution.get("pending_order_count", 0) > 0:
-        warnings.append(f"미해결 pending 주문 {execution['pending_order_count']}건")
+        current.append(f"미해결 pending 주문 {execution['pending_order_count']}건")
     if execution.get("unreconciled_count", 0) > 0:
-        warnings.append(f"미리컨실 주문 {execution['unreconciled_count']}건")
+        current.append(f"미리컨실 주문 {execution['unreconciled_count']}건")
     unused = budget.get("unused_reason")
     if unused and unused not in ("budget_utilized", "derived_from_db"):
-        warnings.append(f"주식 예산 미사용: {unused}")
-    return warnings
+        current.append(f"주식 예산 미사용: {unused}")
+
+    for detail in warnings_detail or []:
+        if detail.get("scope") != "historical_log":
+            continue
+        src = Path(str(detail.get("source_file", ""))).name
+        line_no = detail.get("line_no", "?")
+        sample = str(detail.get("sample", ""))[:120]
+        typ = detail.get("type", "event")
+        historical.append(f"{typ}: {src}:{line_no} — {sample}")
+
+    return current, historical
 
 
 def _csv_rows(
@@ -1367,6 +1467,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     system = report.get("system_performance") or {}
     tracking = report.get("candidate_tracking") or []
     warnings = report.get("warnings") or []
+    historical_warnings = report.get("historical_warnings") or []
     aggregates = gpt.get("aggregates") or {}
     trade_rows = report.get("_kis_trade_rows") or report.get("_trade_rows") or []
     reconcile_map = report.get("_reconcile_map") or {}
@@ -1385,12 +1486,17 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- pending 주문 수: {summary.get('pending_orders', 0)}",
         f"- 총평가금액: {summary.get('tot_evlu_amt', 0):,}원",
         f"- D+2 출금가능금액: {summary.get('prvs_rcdl_excc_amt', 0):,}원",
+    ]
+    lp_egw = system.get("latest_pipeline_egw00201_count", system.get("egw00201_count", 0))
+    if lp_egw > 0:
+        lines.append(f"- EGW00201 rate limit: {lp_egw}회 발생 (최신 파이프라인)")
+    lines.extend([
         "",
         "## 2. Screener Funnel",
         "",
         "| 단계 | 종목 수 |",
         "|------|--------:|",
-    ]
+    ])
 
     funnel_stages = [
         ("전체 유니버스", funnel.get("total_universe_count")),
@@ -1499,6 +1605,18 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             lines.append(f"- {w}")
     else:
         lines.append("- 없음")
+    lines.extend([
+        "",
+        "## 10. Historical Warnings",
+        "",
+    ])
+    if historical_warnings:
+        for w in historical_warnings[:30]:
+            lines.append(f"- {w}")
+        if len(historical_warnings) > 30:
+            lines.append(f"- ... 외 {len(historical_warnings) - 30}건 (JSON warnings_detail 참조)")
+    else:
+        lines.append("- 없음")
     lines.append("")
     return "\n".join(lines)
 
@@ -1526,7 +1644,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
             pass
 
     reconcile_map = _parse_reconcile_holding_map(log_text)
-    log_warn_perf, warnings_detail = _parse_log_warnings(date_str, log_files)
+    scoped_counts, warnings_detail = _parse_scoped_log_events(date_str, log_files)
 
     rank_map, score_map = _build_screener_maps(candidates, scores)
     screener_funnel = _build_screener_funnel(
@@ -1539,20 +1657,12 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     execution_performance = _build_execution_performance(
         kis_trade_rows, reconcile_map, paper_db_only_rows
     )
-    system_performance = _build_system_performance(date_str, log_text)
-    system_performance.update({
-        "traceback_count": log_warn_perf.get("traceback_count", 0),
-        "performance_review_traceback": log_warn_perf.get("performance_review_traceback", 0),
-        "egw00201_count": max(
-            system_performance.get("egw00201_count", 0),
-            log_warn_perf.get("egw00201_count", 0),
-        ),
-    })
+    system_performance = _build_system_performance(date_str, log_text, scoped_counts)
     candidate_tracking = _build_candidate_tracking_snapshot(
         date_str, market, candidates, gpt_plans, kis_trade_rows, balance_rows
     )
     summary = _build_summary(date_str, account_summary, balance_rows, kis_trade_rows, execution_performance)
-    warnings = _build_warnings(
+    warnings, historical_warnings = _build_warnings(
         system_performance, execution_performance, budget_usage, account_warnings, warnings_detail
     )
 
@@ -1584,6 +1694,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "system_performance": system_performance,
         "candidate_tracking": candidate_tracking,
         "warnings": warnings,
+        "historical_warnings": historical_warnings,
         "warnings_detail": warnings_detail,
         "paper_db_only_records": [
             {
@@ -1736,6 +1847,44 @@ def _smoke_test_accuracy_fixes() -> None:
     assert budget["executed_stock_buy_count"] == 2
     assert budget["executed_bond_buy_count"] == 1
     assert budget["stock_buy_budget"] > 0
+
+    # scoped warning 집계
+    import tempfile
+    sample_log = (
+        "[20260625-100000] - ERROR - old pipeline error\n"
+        "[20260625-100000] KIS API EGW00201 rate limit\n"
+        "[20260625-100000] KIS API EGW00201 rate limit\n"
+        "[20260625-143022] STEP START trader\n"
+        "[20260625-143022] KIS API EGW00201 rate limit\n"
+        "[20260625-143022] KIS API EGW00201 rate limit\n"
+        "[20260625-143022] KIS API EGW00201 rate limit\n"
+        "[20260625-143022] KIS API EGW00201 rate limit\n"
+        "Traceback (most recent call last)\n"
+        "[20260625-143022] - ERROR - latest pipeline error\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as tf:
+        tf.write(sample_log)
+        tmp_path = Path(tf.name)
+    try:
+        # pipeline_state mock via monkeypatching _load_pipeline_state
+        orig_loader = _load_pipeline_state
+        def _mock_state(_date: str) -> Dict[str, Any]:
+            return {"run_id": "20260625-143022"}
+        globals()["_load_pipeline_state"] = _mock_state
+        scoped, details = _parse_scoped_log_events("20260625", [tmp_path])
+        globals()["_load_pipeline_state"] = orig_loader
+        assert scoped["latest_pipeline_egw00201_count"] == 4
+        assert scoped["all_related_logs_egw00201_count"] == 6
+        assert scoped["historical_egw00201_count"] == 2
+        assert scoped["current_run_error_count"] == 0
+        assert scoped["latest_pipeline_error_count"] == 1
+        assert scoped["historical_error_count"] == 1
+        assert scoped["performance_review_traceback"] == 0
+        assert any(d.get("scope") == "latest_pipeline" for d in details)
+        assert any(d.get("scope") == "historical_log" for d in details)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
     print("smoke_test_accuracy_fixes: OK")
 
 
