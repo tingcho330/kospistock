@@ -27,6 +27,7 @@ from utils import (
     setup_logging,
 )
 from settings import settings
+from recorder import classify_trade_record, is_real_kis_trade_record
 
 logger = logging.getLogger("PerformanceReview")
 
@@ -36,6 +37,24 @@ GPT_ACTION_MAP = {
     "미진입": "REJECT",
 }
 TRACK_HORIZONS = (1, 3, 5, 10)
+
+_SUMMARY_KEY_MAP = {
+    "total_assets": [
+        "nass_amt", "total_assets", "total_value", "net_assets", "tot_asst_amt",
+    ],
+    "tot_evlu_amt": [
+        "tot_evlu_amt", "total_eval_amt", "tot_evlu", "tot_eval", "total_value",
+    ],
+    "dnca_tot_amt": ["dnca_tot_amt", "cash_amt", "dnca_avl_amt"],
+    "prvs_rcdl_excc_amt": ["prvs_rcdl_excc_amt", "d2_excc_amt", "rcdl_excc_amt_d2"],
+    "nxdy_excc_amt": ["nxdy_excc_amt", "d1_excc_amt", "rcdl_excc_amt_d1"],
+    "rlzt_pfls": ["rlzt_pfls", "realized_pnl"],
+}
+
+_RECONCILE_HOLDING_RE = re.compile(
+    r"\[RECONCILE_BY_HOLDING\]\s+order_id=(\S+)\s+ticker=(\d+)",
+    re.I,
+)
 
 
 def _norm_date(s: Optional[str]) -> str:
@@ -95,12 +114,254 @@ def _parse_balance_rows(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _parse_summary_row(data: Any) -> Dict[str, Any]:
-    if isinstance(data, dict):
-        rows = data.get("data") or []
-        if rows and isinstance(rows[0], dict):
-            return rows[0]
+def _denest_first_record(data_list: Any) -> Dict[str, Any]:
+    """payload['data'][0]가 {\"0\": {...}} 형태일 수 있어 전개."""
+    if not data_list or not isinstance(data_list, list):
+        return {}
+    rec = data_list[0]
+    if isinstance(rec, dict):
+        if 0 in rec and isinstance(rec[0], dict):
+            return rec[0]
+        if "0" in rec and isinstance(rec["0"], dict):
+            return rec["0"]
+        return rec
     return {}
+
+
+def _pick_int_from_dict(d: Dict[str, Any], candidates: List[str]) -> Optional[int]:
+    for key in candidates:
+        if key in d and d[key] not in (None, ""):
+            val = _safe_int(d[key])
+            if val != 0 or str(d[key]).strip() in ("0", "0.0"):
+                return val
+    return None
+
+
+def _collect_summary_sources(payload: Any) -> List[Dict[str, Any]]:
+    """summary/balance JSON에서 계좌 요약 dict 후보 수집."""
+    sources: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return sources
+    nested_keys = (
+        "summary", "account_summary", "raw_summary", "account", "output2", "output",
+    )
+    for key in nested_keys:
+        val = payload.get(key)
+        if isinstance(val, dict):
+            sources.append(val)
+        elif isinstance(val, list) and val:
+            row = _denest_first_record(val)
+            if row:
+                sources.append(row)
+    data = payload.get("data")
+    if isinstance(data, list) and data:
+        row = _denest_first_record(data)
+        if row:
+            sources.append(row)
+    top = {
+        k: v for k, v in payload.items()
+        if k not in ("comments", "data", "status") and not isinstance(v, (list, dict))
+    }
+    if top:
+        sources.append(top)
+    return sources
+
+
+def _extract_account_summary(
+    summary_data: Any,
+    balance_data: Any = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """balance/summary JSON에서 계좌 요약 필드 추출. missing keys → warnings."""
+    warnings: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    sources.extend(_collect_summary_sources(summary_data))
+    sources.extend(_collect_summary_sources(balance_data))
+
+    out: Dict[str, Any] = {}
+    for field, keys in _SUMMARY_KEY_MAP.items():
+        found = None
+        for src in sources:
+            val = _pick_int_from_dict(src, keys)
+            if val is not None:
+                found = val
+                break
+        if found is not None:
+            out[field] = found
+
+    if not out.get("total_assets"):
+        # tot_evlu_amt 또는 balance 평가합으로 폴백
+        if out.get("tot_evlu_amt"):
+            out["total_assets"] = out["tot_evlu_amt"]
+        else:
+            bal_rows = _parse_balance_rows(balance_data)
+            evlu_sum = sum(_safe_int(r.get("evlu_amt")) for r in bal_rows)
+            if evlu_sum > 0:
+                out["total_assets"] = evlu_sum
+                out["tot_evlu_amt"] = evlu_sum
+
+    if not out.get("tot_evlu_amt") and out.get("total_assets"):
+        out["tot_evlu_amt"] = out["total_assets"]
+
+    official = extract_kis_official_summary(
+        next((s for s in sources if s), {}),
+    )
+    if not out.get("total_assets") and official.get("net_assets"):
+        out["total_assets"] = official["net_assets"]
+    if not out.get("tot_evlu_amt") and official.get("tot_evlu_amt"):
+        out["tot_evlu_amt"] = official["tot_evlu_amt"]
+    if not out.get("dnca_tot_amt") and official.get("dnca_tot_amt"):
+        out["dnca_tot_amt"] = official["dnca_tot_amt"]
+    if not out.get("prvs_rcdl_excc_amt") and official.get("prvs_rcdl_excc_amt"):
+        out["prvs_rcdl_excc_amt"] = official["prvs_rcdl_excc_amt"]
+    if not out.get("nxdy_excc_amt") and official.get("nxdy_excc_amt"):
+        out["nxdy_excc_amt"] = official["nxdy_excc_amt"]
+
+    if not out.get("total_assets"):
+        warnings.append("total_assets_not_found")
+
+    return out, list(dict.fromkeys(warnings))
+
+
+class _TradeRecordAdapter:
+    """sqlite dict row → recorder.classify_trade_record 호환."""
+
+    def __init__(self, data: Dict[str, Any]):
+        self._data = data
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._data.get(name)
+
+
+def _trading_env() -> str:
+    try:
+        return str(getattr(settings, "_config", {}).get("trading_environment", "") or "").lower()
+    except Exception:
+        return str(__import__("os").getenv("TRADING_ENVIRONMENT", "") or "").lower()
+
+
+def _is_paper_db_only_row(row: Dict[str, Any]) -> bool:
+    return classify_trade_record(
+        _TradeRecordAdapter(row), trading_environment=_trading_env()
+    ) == "paper_db_only"
+
+
+def _is_actual_kis_order_row(row: Dict[str, Any]) -> bool:
+    return is_real_kis_trade_record(
+        _TradeRecordAdapter(row), trading_environment=_trading_env()
+    )
+
+
+def _trade_row_score(row: Dict[str, Any]) -> Tuple[int, int]:
+    status = str(row.get("order_status") or "").lower()
+    oid = str(row.get("order_id") or "").strip()
+    score = 0
+    if oid:
+        score += 100
+    if status in ("executed", "completed"):
+        score += 50
+    elif status == "partial":
+        score += 30
+    elif status == "pending":
+        score += 10
+    return score, _safe_int(row.get("id"))
+
+
+def _normalize_trade_rows(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """KIS 실주문만 dedupe, paper_db_only는 별도 반환."""
+    paper_db_only: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+
+    for row in rows:
+        if _is_paper_db_only_row(row):
+            paper_db_only.append(row)
+            continue
+        key = (_norm_ticker(row.get("ticker")), str(row.get("action") or "").upper())
+        if not key[0] or not key[1]:
+            continue
+        groups[key].append(row)
+
+    kis_rows: List[Dict[str, Any]] = []
+    for group in groups.values():
+        kis_rows.append(max(group, key=_trade_row_score))
+    kis_rows.sort(key=lambda r: (r.get("timestamp") or "", _safe_int(r.get("id"))))
+    return kis_rows, paper_db_only
+
+
+def _bond_etf_tickers() -> set:
+    aa = settings.asset_allocation if hasattr(settings, "asset_allocation") else {}
+    tickers: set = set()
+    if isinstance(aa, dict):
+        for item in aa.get("bond_etfs") or []:
+            if isinstance(item, dict) and item.get("ticker"):
+                tickers.add(_norm_ticker(item["ticker"]))
+            elif item:
+                tickers.add(_norm_ticker(item))
+    return tickers
+
+
+def _asset_class(ticker: str, bond_tickers: set) -> str:
+    return "bond_etf" if _norm_ticker(ticker) in bond_tickers else "stock"
+
+
+def _parse_reconcile_holding_map(log_text: str) -> Dict[str, str]:
+    """order_id → holding_fallback."""
+    out: Dict[str, str] = {}
+    for m in _RECONCILE_HOLDING_RE.finditer(log_text):
+        out[str(m.group(1)).strip()] = "holding_fallback"
+    return out
+
+
+def _parse_log_warnings(date_str: str, log_files: List[Path]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Traceback/EGW00201를 파일별로 수집, historical vs current 분류."""
+    details: List[Dict[str, Any]] = []
+    egw_count = 0
+    run_id = ""
+    state = _load_pipeline_state(date_str)
+    if state.get("run_id"):
+        run_id = str(state["run_id"])
+
+    for path in log_files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "Traceback (most recent call last)" in line:
+                sample = line
+                if i + 1 < len(lines):
+                    sample = f"{line} | next: {lines[i + 1][:120]}"
+                context = "\n".join(lines[max(0, i - 2): min(len(lines), i + 12)])
+                is_current = bool(run_id and run_id in context)
+                severity = "current_warning" if is_current else "historical_warning"
+                details.append({
+                    "type": "traceback",
+                    "severity": severity,
+                    "source_file": str(path),
+                    "line_no": i + 1,
+                    "sample": sample[:300],
+                })
+            if "EGW00201" in line:
+                egw_count += 1
+                details.append({
+                    "type": "egw00201",
+                    "severity": "historical_warning" if run_id and run_id not in line else "current_warning",
+                    "source_file": str(path),
+                    "line_no": i + 1,
+                    "sample": line[:300],
+                })
+
+    perf = {
+        "kis_rate_limit_count": egw_count,
+        "egw00201_count": egw_count,
+        "traceback_count": sum(1 for d in details if d["type"] == "traceback"),
+        "performance_review_traceback": 0,
+    }
+    return perf, details
 
 
 def _gpt_action(plan: Dict[str, Any]) -> str:
@@ -144,22 +405,48 @@ def _parse_structured_context(raw: Any) -> Dict[str, Any]:
         return {}
 
 
-def _infer_reconcile_method(row: Dict[str, Any]) -> str:
+def _infer_reconcile_method(
+    row: Dict[str, Any],
+    reconcile_map: Optional[Dict[str, str]] = None,
+) -> str:
+    order_id = str(row.get("order_id") or "").strip()
+    if reconcile_map and order_id and order_id in reconcile_map:
+        return reconcile_map[order_id]
+
     ctx = _parse_structured_context(row.get("structured_context"))
     src = str(ctx.get("reconciled_price_source") or ctx.get("reconcile_source") or "").lower()
     if "holding" in src:
         return "holding_fallback"
-    if src in ("order_query", "daily_query", "manual"):
-        return src
+    if src in ("order_query", "daily_query", "manual", "kis_order_query"):
+        return "order_query" if src == "order_query" else src
     if ctx.get("reconcile_method"):
         return str(ctx["reconcile_method"])
-    order_id = str(row.get("order_id") or "").strip()
+
     status = str(row.get("order_status") or "").lower()
-    if order_id and status in ("executed", "partial", "pending"):
+    if order_id and status in ("executed", "partial", "pending", "completed"):
         return "order_query"
     if status == "executed" and not order_id:
         return "manual"
     return "unknown"
+
+
+def _lookup_name(
+    ticker: str,
+    candidates: List[Dict[str, Any]],
+    balance_rows: List[Dict[str, Any]],
+    bond_cfg: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    t = _norm_ticker(ticker)
+    for row in candidates or []:
+        if _norm_ticker(row.get("Ticker") or row.get("ticker")) == t:
+            return str(row.get("Name") or row.get("name") or "")
+    for row in balance_rows or []:
+        if _norm_ticker(row.get("pdno")) == t:
+            return str(row.get("prdt_name") or row.get("name") or "")
+    for item in bond_cfg or []:
+        if isinstance(item, dict) and _norm_ticker(item.get("ticker")) == t:
+            return str(item.get("name") or "")
+    return ""
 
 
 def _find_log_files(date_str: str) -> List[Path]:
@@ -410,6 +697,7 @@ def _build_gpt_decision(
     rank_map: Dict[str, int],
     score_map: Dict[str, float],
     trade_rows: List[Dict[str, Any]],
+    reconcile_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     trade_by_ticker: Dict[str, Dict[str, Any]] = {}
     for r in trade_rows:
@@ -440,7 +728,7 @@ def _build_gpt_decision(
             "executed_qty": exe_qty if status in ("executed", "partial", "completed") else 0,
             "executed_amount": exe_amount if status in ("executed", "partial", "completed") else 0,
             "order_status": status or None,
-            "reconcile_method": _infer_reconcile_method(trade) if trade else None,
+            "reconcile_method": _infer_reconcile_method(trade, reconcile_map) if trade else None,
         })
 
     aggregates: Dict[str, Dict[str, Any]] = {}
@@ -472,9 +760,9 @@ def _build_gpt_decision(
 def _build_budget_usage(
     date_str: str,
     log_text: str,
-    summary_row: Dict[str, Any],
+    account_summary: Dict[str, Any],
     balance_rows: List[Dict[str, Any]],
-    trade_rows: List[Dict[str, Any]],
+    kis_trade_rows: List[Dict[str, Any]],
     gpt_plans: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     budget = _parse_budget_usage_from_logs(log_text)
@@ -486,14 +774,11 @@ def _build_budget_usage(
     bond_target = _safe_float(aa.get("bond_target_weight")) or 0.20
     cash_target = _safe_float(aa.get("cash_target_weight")) or 0.10
 
-    total_assets = _safe_int(summary_row.get("nass_amt") or summary_row.get("tot_evlu_amt"))
+    total_assets = _safe_int(account_summary.get("total_assets"))
     if not total_assets and budget:
         total_assets = _safe_int(budget.get("total_assets"))
 
-    bond_tickers = set()
-    for item in aa.get("bond_etfs") or []:
-        if isinstance(item, dict) and item.get("ticker"):
-            bond_tickers.add(_norm_ticker(item["ticker"]))
+    bond_tickers = _bond_etf_tickers()
 
     current_stock_value = 0
     current_bond_value = 0
@@ -505,53 +790,79 @@ def _build_budget_usage(
         else:
             current_stock_value += val
 
-    current_cash = _safe_int(summary_row.get("prvs_rcdl_excc_amt") or summary_row.get("dnca_tot_amt"))
+    current_cash = _safe_int(
+        account_summary.get("prvs_rcdl_excc_amt") or account_summary.get("dnca_tot_amt")
+    )
     target_stock_value = int(total_assets * stock_target) if total_assets else 0
     target_bond_value = int(total_assets * bond_target) if total_assets else 0
     target_cash_value = int(total_assets * cash_target) if total_assets else 0
 
-    if not budget:
-        gpt_buy_count = sum(1 for p in gpt_plans if _gpt_action(p) == "BUY")
-        executed_amount = sum(
-            _safe_int(r.get("amount"))
-            for r in trade_rows
-            if str(r.get("action", "")).upper() == "BUY"
-            and str(r.get("order_status", "")).lower() in ("executed", "partial", "completed")
-        )
-        stock_buy_budget = max(0, target_stock_value - current_stock_value) if aa.get("enabled") else 0
-        unused = max(0, stock_buy_budget - executed_amount)
-        budget = {
-            "total_assets": total_assets,
-            "stock_target_weight": stock_target,
-            "current_stock_value": current_stock_value,
-            "stock_buy_budget": stock_buy_budget,
-            "gpt_buy_count": gpt_buy_count,
-            "final_buy_count": len({
-                _norm_ticker(r.get("ticker"))
-                for r in trade_rows
-                if str(r.get("action", "")).upper() == "BUY"
-            }),
-            "actual_stock_buy_amount": executed_amount,
-            "unused_stock_budget": unused,
-            "stock_budget_usage_rate": round(executed_amount / stock_buy_budget, 4) if stock_buy_budget > 0 else None,
-            "unused_reason": "derived_from_db",
-            "source": "computed",
-        }
+    buy_statuses = ("executed", "partial", "completed")
+    actual_stock_buy_amount = 0
+    actual_bond_buy_amount = 0
+    executed_stock_buy_count = 0
+    executed_bond_buy_count = 0
+    for r in kis_trade_rows:
+        if str(r.get("action", "")).upper() != "BUY":
+            continue
+        if str(r.get("order_status", "")).lower() not in buy_statuses:
+            continue
+        amt = _safe_int(r.get("amount"))
+        if not amt:
+            qty = _safe_int(r.get("executed_qty") or r.get("quantity"))
+            price = _safe_int(r.get("price"))
+            amt = qty * price if qty and price else 0
+        if _norm_ticker(r.get("ticker")) in bond_tickers:
+            actual_bond_buy_amount += amt
+            executed_bond_buy_count += 1
+        else:
+            actual_stock_buy_amount += amt
+            executed_stock_buy_count += 1
+
+    total_executed_buy_amount = actual_stock_buy_amount + actual_bond_buy_amount
+    executed_total_buy_count = executed_stock_buy_count + executed_bond_buy_count
+    gpt_buy_count = sum(1 for p in gpt_plans if _gpt_action(p) == "BUY")
+    final_buy_count = len({
+        _norm_ticker(r.get("ticker"))
+        for r in kis_trade_rows
+        if str(r.get("action", "")).upper() == "BUY"
+    })
+    stock_buy_budget = max(0, target_stock_value - current_stock_value) if aa.get("enabled", True) else 0
+    unused_stock_budget = max(0, stock_buy_budget - actual_stock_buy_amount)
+    stock_budget_usage_rate = (
+        round(actual_stock_buy_amount / stock_buy_budget, 4) if stock_buy_budget > 0 else None
+    )
+    unused_reason = (budget or {}).get("unused_reason") or "derived_from_db"
 
     out = {
-        **budget,
+        "total_assets": total_assets,
+        "stock_target_weight": stock_target,
         "bond_target_weight": bond_target,
         "cash_target_weight": cash_target,
+        "current_stock_value": current_stock_value,
         "current_bond_value": current_bond_value,
         "current_cash": current_cash,
         "target_stock_value": target_stock_value,
         "target_bond_value": target_bond_value,
         "target_cash_value": target_cash_value,
+        "stock_buy_budget": stock_buy_budget,
+        "gpt_buy_count": gpt_buy_count,
+        "final_buy_count": final_buy_count,
+        "actual_stock_buy_amount": actual_stock_buy_amount,
+        "actual_bond_buy_amount": actual_bond_buy_amount,
+        "total_executed_buy_amount": total_executed_buy_amount,
+        "executed_stock_buy_count": executed_stock_buy_count,
+        "executed_bond_buy_count": executed_bond_buy_count,
+        "executed_total_buy_count": executed_total_buy_count,
+        "unused_stock_budget": unused_stock_budget,
+        "stock_budget_usage_rate": stock_budget_usage_rate,
+        "unused_reason": unused_reason,
+        "source": (budget or {}).get("source") or "computed",
     }
     logger.info(
         "[STOCK_BUDGET_USAGE] total_assets=%s stock_target_weight=%.2f current_stock_value=%s "
-        "stock_buy_budget=%s gpt_buy_count=%s final_buy_count=%s executed_order_amount=%s "
-        "unused_stock_budget=%s usage_rate=%s unused_reason=%s",
+        "stock_buy_budget=%s gpt_buy_count=%s final_buy_count=%s actual_stock_buy=%s actual_bond_buy=%s "
+        "total_executed_buy=%s unused_stock_budget=%s usage_rate=%s unused_reason=%s",
         out.get("total_assets"),
         out.get("stock_target_weight", 0.0),
         out.get("current_stock_value"),
@@ -559,6 +870,8 @@ def _build_budget_usage(
         out.get("gpt_buy_count"),
         out.get("final_buy_count"),
         out.get("actual_stock_buy_amount"),
+        out.get("actual_bond_buy_amount"),
+        out.get("total_executed_buy_amount"),
         out.get("unused_stock_budget"),
         out.get("stock_budget_usage_rate"),
         out.get("unused_reason"),
@@ -566,16 +879,26 @@ def _build_budget_usage(
     return out
 
 
-def _build_execution_performance(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+_SUBMITTED_STATUSES = frozenset({
+    "executed", "completed", "partial", "pending", "cancelled", "failed",
+})
+
+
+def _build_execution_performance(
+    kis_trade_rows: List[Dict[str, Any]],
+    reconcile_map: Optional[Dict[str, str]] = None,
+    paper_db_only_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     submitted = executed = pending = cancelled = failed = 0
     reconciled = holding_fb = unreconciled = 0
     slippages: List[float] = []
     pending_durations: List[float] = []
 
     order_details: List[Dict[str, Any]] = []
-    for r in trade_rows:
+    for r in kis_trade_rows:
         status = str(r.get("order_status") or "").lower()
-        if status in ("pending", "partial", "submitted"):
+        order_id = str(r.get("order_id") or "").strip()
+        if order_id or status in _SUBMITTED_STATUSES:
             submitted += 1
         if status in ("executed", "completed"):
             executed += 1
@@ -586,12 +909,12 @@ def _build_execution_performance(trade_rows: List[Dict[str, Any]]) -> Dict[str, 
         if status == "failed":
             failed += 1
 
-        method = _infer_reconcile_method(r)
+        method = _infer_reconcile_method(r, reconcile_map)
         if status in ("executed", "partial", "completed"):
             reconciled += 1
             if method == "holding_fallback":
                 holding_fb += 1
-        elif status in ("pending", "failed") and r.get("order_id"):
+        elif status in ("pending", "failed") and order_id:
             unreconciled += 1
 
         ctx = _parse_structured_context(r.get("structured_context"))
@@ -611,7 +934,8 @@ def _build_execution_performance(trade_rows: List[Dict[str, Any]]) -> Dict[str, 
             "executed_price": fill,
             "slippage_amount": fill - orig if orig and fill else None,
             "slippage_pct": slip_pct,
-            "reconcile_method": _infer_reconcile_method(r),
+            "reconcile_method": method,
+            "is_actual_kis_order": _is_actual_kis_order_row(r),
         })
 
         ts = str(r.get("timestamp") or "")
@@ -624,8 +948,12 @@ def _build_execution_performance(trade_rows: List[Dict[str, Any]]) -> Dict[str, 
             except Exception:
                 pass
 
-    order_count = len(trade_rows)
-    execution_rate = round(executed / submitted, 4) if submitted else (1.0 if executed else 0.0)
+    paper_db_only_submitted = sum(
+        1 for r in (paper_db_only_rows or [])
+        if str(r.get("action", "")).upper() == "BUY"
+    )
+    order_count = len(kis_trade_rows)
+    execution_rate = round(executed / submitted, 4) if submitted > 0 else (1.0 if executed else 0.0)
     perf = {
         "order_count": order_count,
         "submitted_order_count": submitted,
@@ -639,17 +967,19 @@ def _build_execution_performance(trade_rows: List[Dict[str, Any]]) -> Dict[str, 
         "reconciled_count": reconciled,
         "reconciled_by_holding_count": holding_fb,
         "unreconciled_count": unreconciled,
+        "paper_db_only_submitted": paper_db_only_submitted,
         "orders": order_details,
     }
     logger.info(
         "[PERF_EXECUTION] submitted=%s executed=%s pending=%s execution_rate=%s "
-        "reconciled_by_holding=%s unreconciled=%s",
+        "reconciled_by_holding=%s unreconciled=%s paper_db_only=%s",
         perf["submitted_order_count"],
         perf["executed_order_count"],
         perf["pending_order_count"],
         perf["execution_rate"],
         perf["reconciled_by_holding_count"],
         perf["unreconciled_count"],
+        perf["paper_db_only_submitted"],
     )
     return perf
 
@@ -864,29 +1194,28 @@ def _update_tracking_returns(review_date_str: str, market: str, fetch_prices: bo
 
 def _build_summary(
     date_str: str,
-    summary_row: Dict[str, Any],
+    account_summary: Dict[str, Any],
     balance_rows: List[Dict[str, Any]],
-    trade_rows: List[Dict[str, Any]],
+    kis_trade_rows: List[Dict[str, Any]],
     execution: Dict[str, Any],
 ) -> Dict[str, Any]:
-    official = extract_kis_official_summary(summary_row)
     buy_trades = [
-        r for r in trade_rows
+        r for r in kis_trade_rows
         if str(r.get("action", "")).upper() == "BUY"
         and str(r.get("order_status", "")).lower() in ("executed", "partial", "completed")
     ]
     holdings = [r for r in balance_rows if _safe_int(r.get("hldg_qty")) > 0]
     return {
         "date": date_str,
-        "total_assets": _safe_int(summary_row.get("nass_amt") or official.get("net_assets")),
-        "tot_evlu_amt": _safe_int(summary_row.get("tot_evlu_amt") or official.get("tot_evlu_amt")),
+        "total_assets": _safe_int(account_summary.get("total_assets")),
+        "tot_evlu_amt": _safe_int(account_summary.get("tot_evlu_amt")),
         "holdings_count": len(holdings),
         "new_buy_count": len(buy_trades),
         "pending_orders": execution.get("pending_order_count", 0),
-        "dnca_tot_amt": _safe_int(summary_row.get("dnca_tot_amt")),
-        "prvs_rcdl_excc_amt": _safe_int(summary_row.get("prvs_rcdl_excc_amt")),
-        "nxdy_excc_amt": _safe_int(summary_row.get("nxdy_excc_amt")),
-        "rlzt_pfls": _safe_int(summary_row.get("rlzt_pfls")),
+        "dnca_tot_amt": _safe_int(account_summary.get("dnca_tot_amt")),
+        "prvs_rcdl_excc_amt": _safe_int(account_summary.get("prvs_rcdl_excc_amt")),
+        "nxdy_excc_amt": _safe_int(account_summary.get("nxdy_excc_amt")),
+        "rlzt_pfls": _safe_int(account_summary.get("rlzt_pfls")),
     }
 
 
@@ -894,12 +1223,25 @@ def _build_warnings(
     system: Dict[str, Any],
     execution: Dict[str, Any],
     budget: Dict[str, Any],
+    account_warnings: Optional[List[str]] = None,
+    warnings_detail: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
-    warnings: List[str] = []
+    warnings: List[str] = list(account_warnings or [])
     if system.get("egw00201_count", 0) > 0:
         warnings.append(f"EGW00201 rate limit {system['egw00201_count']}회 발생")
-    if system.get("traceback_count", 0) > 0:
-        warnings.append(f"Traceback {system['traceback_count']}건 감지")
+    perf_tb = system.get("performance_review_traceback", 0)
+    if perf_tb > 0:
+        warnings.append(f"performance_review Traceback {perf_tb}건 (현재 실행)")
+    else:
+        warnings.append("performance_review_traceback=0")
+    for detail in warnings_detail or []:
+        if detail.get("type") != "traceback":
+            continue
+        if detail.get("severity") == "historical_warning":
+            src = Path(str(detail.get("source_file", ""))).name
+            line_no = detail.get("line_no", "?")
+            sample = str(detail.get("sample", ""))[:120]
+            warnings.append(f"과거 로그 Traceback: {src}:{line_no} — {sample}")
     if execution.get("pending_order_count", 0) > 0:
         warnings.append(f"미해결 pending 주문 {execution['pending_order_count']}건")
     if execution.get("unreconciled_count", 0) > 0:
@@ -915,75 +1257,101 @@ def _csv_rows(
     market: str,
     gpt_rows: List[Dict[str, Any]],
     tracking_rows: List[Dict[str, Any]],
-    trade_rows: List[Dict[str, Any]],
+    kis_trade_rows: List[Dict[str, Any]],
+    reconcile_map: Optional[Dict[str, str]] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    balance_rows: Optional[List[Dict[str, Any]]] = None,
+    bond_cfg: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
+    bond_tickers = _bond_etf_tickers()
     track_by_ticker = {r["ticker"]: r for r in tracking_rows}
     trade_by_ticker = {
         _norm_ticker(r.get("ticker")): r
-        for r in trade_rows
+        for r in kis_trade_rows
         if str(r.get("action", "")).upper() == "BUY"
     }
     out: List[Dict[str, Any]] = []
     seen = set()
-    for row in gpt_rows:
-        t = row.get("ticker")
-        seen.add(t)
+
+    def _csv_trade_fields(trade: Dict[str, Any], name: str) -> Dict[str, Any]:
+        t = _norm_ticker(trade.get("ticker"))
+        status = str(trade.get("order_status") or "").lower()
+        exe_qty = _safe_int(trade.get("executed_qty") or trade.get("quantity"))
         tr = track_by_ticker.get(t, {})
-        trade = trade_by_ticker.get(t, {})
-        out.append({
-            "date": date_str,
-            "market": market,
-            "ticker": t,
-            "name": row.get("name"),
-            "screener_rank": row.get("screener_rank"),
-            "screener_score": row.get("screener_score"),
-            "gpt_action": row.get("gpt_action"),
-            "gpt_score": row.get("gpt_score"),
-            "final_decision": row.get("final_decision"),
-            "executed": _safe_int(row.get("executed_qty")) > 0,
-            "executed_qty": row.get("executed_qty"),
-            "executed_price": _safe_int(trade.get("price")) or tr.get("executed_price"),
-            "executed_amount": row.get("executed_amount"),
-            "order_status": row.get("order_status"),
-            "reconcile_method": row.get("reconcile_method") or _infer_reconcile_method(trade),
+        return {
+            "asset_class": _asset_class(t, bond_tickers),
+            "is_paper_db_only": False,
+            "is_actual_kis_order": _is_actual_kis_order_row(trade),
+            "order_id": trade.get("order_id"),
+            "executed": exe_qty > 0 and status in ("executed", "partial", "completed"),
+            "executed_qty": exe_qty,
+            "executed_price": _safe_int(trade.get("price")),
+            "executed_amount": _safe_int(trade.get("amount")),
+            "order_status": status,
+            "reconcile_method": _infer_reconcile_method(trade, reconcile_map),
+            "name": name or _lookup_name(t, candidates or [], balance_rows or [], bond_cfg),
             "base_price": tr.get("base_price"),
             "return_1d": tr.get("return_1d"),
             "return_3d": tr.get("return_3d"),
             "return_5d": tr.get("return_5d"),
             "return_10d": tr.get("return_10d"),
+        }
+
+    for row in gpt_rows:
+        t = row.get("ticker")
+        seen.add(t)
+        tr = track_by_ticker.get(t, {})
+        trade = trade_by_ticker.get(t, {})
+        fields = _csv_trade_fields(trade, row.get("name") or "") if trade else {
+            "asset_class": _asset_class(t, bond_tickers),
+            "is_paper_db_only": False,
+            "is_actual_kis_order": False,
+            "order_id": None,
+            "executed": _safe_int(row.get("executed_qty")) > 0,
+            "executed_qty": row.get("executed_qty"),
+            "executed_price": tr.get("executed_price"),
+            "executed_amount": row.get("executed_amount"),
+            "order_status": row.get("order_status"),
+            "reconcile_method": row.get("reconcile_method"),
+            "name": row.get("name"),
+            "base_price": tr.get("base_price"),
+            "return_1d": tr.get("return_1d"),
+            "return_3d": tr.get("return_3d"),
+            "return_5d": tr.get("return_5d"),
+            "return_10d": tr.get("return_10d"),
+        }
+        out.append({
+            "date": date_str,
+            "market": market,
+            "ticker": t,
+            "screener_rank": row.get("screener_rank"),
+            "screener_score": row.get("screener_score"),
+            "gpt_action": row.get("gpt_action"),
+            "gpt_score": row.get("gpt_score"),
+            "final_decision": row.get("final_decision"),
             "reason": (row.get("gpt_reason") or "")[:200],
+            **fields,
         })
-    for trade in trade_rows:
+
+    for trade in kis_trade_rows:
         if str(trade.get("action", "")).upper() != "BUY":
             continue
         t = _norm_ticker(trade.get("ticker"))
         if t in seen:
             continue
         tr = track_by_ticker.get(t, {})
-        status = str(trade.get("order_status") or "").lower()
-        exe_qty = _safe_int(trade.get("executed_qty") or trade.get("quantity"))
+        fields = _csv_trade_fields(trade, tr.get("name", ""))
         out.append({
             "date": date_str,
             "market": market,
             "ticker": t,
-            "name": "",
             "screener_rank": tr.get("screener_rank"),
             "screener_score": tr.get("screener_score"),
             "gpt_action": None,
             "gpt_score": None,
             "final_decision": "EXECUTED",
-            "executed": exe_qty > 0 and status in ("executed", "partial", "completed"),
-            "executed_qty": exe_qty,
-            "executed_price": _safe_int(trade.get("price")),
-            "executed_amount": _safe_int(trade.get("amount")),
-            "order_status": status,
-            "reconcile_method": _infer_reconcile_method(trade),
-            "base_price": tr.get("base_price"),
-            "return_1d": tr.get("return_1d"),
-            "return_3d": tr.get("return_3d"),
-            "return_5d": tr.get("return_5d"),
-            "return_10d": tr.get("return_10d"),
             "reason": "",
+            **fields,
         })
     return out
 
@@ -1000,7 +1368,11 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     tracking = report.get("candidate_tracking") or []
     warnings = report.get("warnings") or []
     aggregates = gpt.get("aggregates") or {}
-    trade_rows = report.get("_trade_rows") or []
+    trade_rows = report.get("_kis_trade_rows") or report.get("_trade_rows") or []
+    reconcile_map = report.get("_reconcile_map") or {}
+    candidates = report.get("_candidates") or []
+    balance_rows = report.get("_balance_rows") or []
+    bond_cfg = report.get("_bond_cfg") or []
 
     lines = [
         f"# Performance Review - {date_str} {market}",
@@ -1060,9 +1432,10 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         qty = _safe_int(row.get("executed_qty") or row.get("quantity"))
         price = _safe_int(row.get("price"))
         amount = _safe_int(row.get("amount")) or qty * price
-        method = _infer_reconcile_method(row)
+        method = _infer_reconcile_method(row, reconcile_map)
+        name = _lookup_name(_norm_ticker(row.get("ticker")), candidates, balance_rows, bond_cfg)
         lines.append(
-            f"| {_norm_ticker(row.get('ticker'))} | | BUY | {qty} | {price:,} | {amount:,} | {status} | {method} |"
+            f"| {_norm_ticker(row.get('ticker'))} | {name} | BUY | {qty} | {price:,} | {amount:,} | {status} | {method} |"
         )
 
     lines.extend([
@@ -1071,14 +1444,29 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         "| 항목 | 값 |",
         "|------|-----|",
+        f"| Total Assets | {budget.get('total_assets', summary.get('total_assets', 0)):,} |",
         f"| Target Stock | {budget.get('target_stock_value', 0):,} ({(budget.get('stock_target_weight', 0) or 0)*100:.0f}%) |",
         f"| Current Stock | {budget.get('current_stock_value', 0):,} |",
         f"| Stock Buy Budget | {budget.get('stock_buy_budget', 0):,} |",
-        f"| Executed | {budget.get('actual_stock_buy_amount', 0):,} |",
-        f"| Usage Rate | {budget.get('stock_budget_usage_rate', '-')} |",
+        f"| Actual Stock Buy | {budget.get('actual_stock_buy_amount', 0):,} |",
+        f"| Actual Bond Buy | {budget.get('actual_bond_buy_amount', 0):,} |",
+        f"| Total Executed Buy | {budget.get('total_executed_buy_amount', 0):,} |",
+        f"| Stock Budget Usage Rate | {budget.get('stock_budget_usage_rate', '-')} |",
+        f"| Unused Stock Budget | {budget.get('unused_stock_budget', 0):,} |",
         f"| Unused Reason | {budget.get('unused_reason', '-')} |",
         "",
-        "## 6. Candidate Tracking",
+        "## 6. Execution Performance",
+        "",
+        "| 항목 | 값 |",
+        "|------|-----|",
+        f"| Submitted | {execution.get('submitted_order_count', 0)} |",
+        f"| Executed | {execution.get('executed_order_count', 0)} |",
+        f"| Pending | {execution.get('pending_order_count', 0)} |",
+        f"| Execution Rate | {execution.get('execution_rate', '-')} |",
+        f"| Holding Fallback Reconciled | {execution.get('reconciled_by_holding_count', 0)} |",
+        f"| Unreconciled | {execution.get('unreconciled_count', 0)} |",
+        "",
+        "## 7. Candidate Tracking",
         "",
         "| Ticker | Name | Rank | GPT | Base | 1D | 3D | 5D |",
         "|--------|------|-----:|-----|-----:|---:|---:|---:|",
@@ -1092,7 +1480,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 7. System Performance",
+        "## 8. System Performance",
         "",
         "| Stage | Runtime (s) |",
         "|-------|------------:|",
@@ -1103,7 +1491,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"| Trader | {system.get('trader_runtime_sec', '-')} |",
         f"| Reconciler | {system.get('order_reconciler_runtime_sec', '-')} |",
         "",
-        "## 8. Warnings",
+        "## 9. Warnings",
         "",
     ])
     if warnings:
@@ -1125,9 +1513,10 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     balance_data = _load_json(_artifact_path("balance", date_str, market))
     summary_data = _load_json(_artifact_path("summary", date_str, market))
     balance_rows = _parse_balance_rows(balance_data)
-    summary_row = _parse_summary_row(summary_data)
+    account_summary, account_warnings = _extract_account_summary(summary_data, balance_data)
 
-    trade_rows = _load_trade_rows(date_str)
+    raw_trade_rows = _load_trade_rows(date_str)
+    kis_trade_rows, paper_db_only_rows = _normalize_trade_rows(raw_trade_rows)
     log_files = _find_log_files(date_str)
     log_text = ""
     for p in log_files[:5]:
@@ -1136,21 +1525,36 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         except Exception:
             pass
 
+    reconcile_map = _parse_reconcile_holding_map(log_text)
+    log_warn_perf, warnings_detail = _parse_log_warnings(date_str, log_files)
+
     rank_map, score_map = _build_screener_maps(candidates, scores)
     screener_funnel = _build_screener_funnel(
-        date_str, market, candidates, scores, gpt_plans, trade_rows, log_text
+        date_str, market, candidates, scores, gpt_plans, kis_trade_rows, log_text
     )
-    gpt_decision = _build_gpt_decision(gpt_plans, rank_map, score_map, trade_rows)
+    gpt_decision = _build_gpt_decision(gpt_plans, rank_map, score_map, kis_trade_rows, reconcile_map)
     budget_usage = _build_budget_usage(
-        date_str, log_text, summary_row, balance_rows, trade_rows, gpt_plans
+        date_str, log_text, account_summary, balance_rows, kis_trade_rows, gpt_plans
     )
-    execution_performance = _build_execution_performance(trade_rows)
+    execution_performance = _build_execution_performance(
+        kis_trade_rows, reconcile_map, paper_db_only_rows
+    )
     system_performance = _build_system_performance(date_str, log_text)
+    system_performance.update({
+        "traceback_count": log_warn_perf.get("traceback_count", 0),
+        "performance_review_traceback": log_warn_perf.get("performance_review_traceback", 0),
+        "egw00201_count": max(
+            system_performance.get("egw00201_count", 0),
+            log_warn_perf.get("egw00201_count", 0),
+        ),
+    })
     candidate_tracking = _build_candidate_tracking_snapshot(
-        date_str, market, candidates, gpt_plans, trade_rows, balance_rows
+        date_str, market, candidates, gpt_plans, kis_trade_rows, balance_rows
     )
-    summary = _build_summary(date_str, summary_row, balance_rows, trade_rows, execution_performance)
-    warnings = _build_warnings(system_performance, execution_performance, budget_usage)
+    summary = _build_summary(date_str, account_summary, balance_rows, kis_trade_rows, execution_performance)
+    warnings = _build_warnings(
+        system_performance, execution_performance, budget_usage, account_warnings, warnings_detail
+    )
 
     if fetch_tracking_prices:
         _update_tracking_returns(date_str, market, fetch_prices=True)
@@ -1165,6 +1569,9 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     with open(tracking_path, "w", encoding="utf-8") as f:
         json.dump(tracking_doc, f, ensure_ascii=False, indent=2)
 
+    aa = settings.asset_allocation if hasattr(settings, "asset_allocation") else {}
+    bond_cfg = aa.get("bond_etfs") if isinstance(aa, dict) else []
+
     return {
         "date": date_str,
         "market": market,
@@ -1177,7 +1584,25 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "system_performance": system_performance,
         "candidate_tracking": candidate_tracking,
         "warnings": warnings,
-        "_trade_rows": trade_rows,
+        "warnings_detail": warnings_detail,
+        "paper_db_only_records": [
+            {
+                "id": r.get("id"),
+                "ticker": _norm_ticker(r.get("ticker")),
+                "action": r.get("action"),
+                "order_status": r.get("order_status"),
+                "order_id": r.get("order_id"),
+                "amount": r.get("amount"),
+                "is_paper_db_only": True,
+            }
+            for r in paper_db_only_rows
+        ],
+        "_kis_trade_rows": kis_trade_rows,
+        "_trade_rows": kis_trade_rows,
+        "_reconcile_map": reconcile_map,
+        "_candidates": candidates,
+        "_balance_rows": balance_rows,
+        "_bond_cfg": bond_cfg,
         "sources": {
             "log_files": [str(p) for p in log_files[:5]],
             "balance": str(_artifact_path("balance", date_str, market)),
@@ -1202,10 +1627,19 @@ def write_outputs(report: Dict[str, Any]) -> Tuple[Path, Path, Path]:
 
     gpt_rows = (report.get("gpt_decision") or {}).get("rows") or []
     tracking_rows = report.get("candidate_tracking") or []
-    trade_rows = report.get("_trade_rows") or []
-    csv_rows = _csv_rows(date_str, market, gpt_rows, tracking_rows, trade_rows)
+    kis_trade_rows = report.get("_kis_trade_rows") or report.get("_trade_rows") or []
+    reconcile_map = report.get("_reconcile_map") or {}
+    candidates = report.get("_candidates") or []
+    balance_rows = report.get("_balance_rows") or []
+    bond_cfg = report.get("_bond_cfg") or []
+    csv_rows = _csv_rows(
+        date_str, market, gpt_rows, tracking_rows, kis_trade_rows,
+        reconcile_map, candidates, balance_rows, bond_cfg,
+    )
     fieldnames = [
-        "date", "market", "ticker", "name", "screener_rank", "screener_score",
+        "date", "market", "ticker", "name", "asset_class",
+        "is_paper_db_only", "is_actual_kis_order", "order_id",
+        "screener_rank", "screener_score",
         "gpt_action", "gpt_score", "final_decision", "executed", "executed_qty",
         "executed_price", "executed_amount", "order_status", "reconcile_method",
         "base_price", "return_1d", "return_3d", "return_5d", "return_10d", "reason",
@@ -1241,5 +1675,74 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+def _smoke_test_accuracy_fixes() -> None:
+    """20260625 시나리오 단위 검증 (로컬 fixture 없이 helper 단위)."""
+    summary_payload = {
+        "comments": {"nass_amt": "순자산"},
+        "data": [{"0": {
+            "nass_amt": "30,015,930",
+            "tot_evlu_amt": "30,015,930",
+            "prvs_rcdl_excc_amt": "22,508,720",
+            "dnca_tot_amt": "1,000,000",
+        }}],
+        "status": "ok",
+    }
+    acct, warns = _extract_account_summary(summary_payload, None)
+    assert acct["total_assets"] == 30015930, acct
+    assert acct["prvs_rcdl_excc_amt"] == 22508720, acct
+    assert "total_assets_not_found" not in warns
+
+    load_config()
+    raw_trades = [
+        {"id": 85, "ticker": "459580", "action": "BUY", "order_status": "paper_executed",
+         "order_id": None, "amount": 5385000, "quantity": 5, "price": 1077000},
+        {"id": 86, "ticker": "459580", "action": "BUY", "order_status": "paper_executed",
+         "order_id": None, "amount": 5385000, "quantity": 5, "price": 1077000},
+        {"id": 87, "ticker": "459580", "action": "BUY", "order_status": "executed",
+         "order_id": "0000008839", "amount": 5385000, "quantity": 5, "price": 1077000},
+        {"id": 88, "ticker": "004170", "action": "BUY", "order_status": "executed",
+         "order_id": "0000014720", "amount": 1057000, "quantity": 1, "price": 1057000},
+        {"id": 89, "ticker": "032830", "action": "BUY", "order_status": "executed",
+         "order_id": "0000014653", "amount": 1057000, "quantity": 3, "price": 352333},
+    ]
+    kis, paper = _normalize_trade_rows(raw_trades)
+    assert len(paper) == 2
+    assert len(kis) == 3
+    assert sum(1 for r in kis if _norm_ticker(r["ticker"]) == "459580") == 1
+
+    log = (
+        "[RECONCILE_BY_HOLDING] order_id=0000014720 ticker=004170\n"
+        "[RECONCILE_BY_HOLDING] order_id=0000014653 ticker=032830\n"
+    )
+    rmap = _parse_reconcile_holding_map(log)
+    assert rmap["0000014720"] == "holding_fallback"
+    assert _infer_reconcile_method(
+        {"order_id": "0000014720", "order_status": "executed"}, rmap
+    ) == "holding_fallback"
+    assert _infer_reconcile_method(
+        {"order_id": "0000008839", "order_status": "executed"}, rmap
+    ) == "order_query"
+
+    exec_perf = _build_execution_performance(kis, rmap, paper)
+    assert exec_perf["submitted_order_count"] == 3
+    assert exec_perf["executed_order_count"] == 3
+    assert exec_perf["reconciled_by_holding_count"] == 2
+    assert exec_perf["pending_order_count"] == 0
+
+    budget = _build_budget_usage("20260625", "", acct, [], kis, [])
+    assert budget["actual_stock_buy_amount"] == 2114000
+    assert budget["actual_bond_buy_amount"] == 5385000
+    assert budget["total_executed_buy_amount"] == 7499000
+    assert budget["executed_stock_buy_count"] == 2
+    assert budget["executed_bond_buy_count"] == 1
+    assert budget["stock_buy_budget"] > 0
+    print("smoke_test_accuracy_fixes: OK")
+
+
 if __name__ == "__main__":
+    import sys
+    if "--smoke-test" in sys.argv:
+        load_config()
+        _smoke_test_accuracy_fixes()
+        raise SystemExit(0)
     raise SystemExit(main())
