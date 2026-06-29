@@ -421,7 +421,7 @@ def _resolve_log_scope(
     line: str,
     lines: List[str],
     idx: int,
-    latest_run_id: str,
+    effective_run_ids: set,
     path: Path,
     latest_pipeline_path: Optional[Path] = None,
 ) -> Tuple[str, str]:
@@ -441,8 +441,11 @@ def _resolve_log_scope(
                 return "latest_pipeline", "current_warning"
 
     ctx_run = _nearest_run_id(lines, idx)
-    if latest_run_id and (ctx_run == latest_run_id or f"[{latest_run_id}]" in line):
-        return "latest_pipeline", "current_warning"
+    if effective_run_ids:
+        if ctx_run in effective_run_ids:
+            return "latest_pipeline", "current_warning"
+        if any(f"[{rid}]" in line for rid in effective_run_ids):
+            return "latest_pipeline", "current_warning"
     return "historical_log", "historical_warning"
 
 
@@ -475,6 +478,11 @@ def _parse_scoped_log_events(
     latest_pipeline_path, latest_pipeline_run_ts, detect_method = _resolve_latest_pipeline_log(
         date_str, log_files, latest_run_id,
     )
+    effective_run_ids: set = set()
+    if latest_run_id:
+        effective_run_ids.add(latest_run_id)
+    if latest_pipeline_run_ts:
+        effective_run_ids.add(latest_pipeline_run_ts)
     counts = _empty_scoped_counts()
     details: List[Dict[str, Any]] = []
 
@@ -497,7 +505,7 @@ def _parse_scoped_log_events(
             continue
         for i, line in enumerate(lines):
             scope, severity = _resolve_log_scope(
-                line, lines, i, latest_run_id, path, latest_pipeline_path,
+                line, lines, i, effective_run_ids, path, latest_pipeline_path,
             )
 
             if "EGW00201" in line:
@@ -1994,30 +2002,36 @@ def _smoke_test_accuracy_fixes() -> None:
             "[20260625-101015] - ERROR - latest pipeline error\n",
             encoding="utf-8",
         )
+        mgr_log = tmp / "integrated_manager.log"
+        mgr_log.write_text(
+            "[20260625-101015] KIS API EGW00201 rate limit\n"
+            "[20260625-101015] KIS API EGW00201 rate limit\n",
+            encoding="utf-8",
+        )
 
         orig_loader = _load_pipeline_state
         globals()["_load_pipeline_state"] = lambda _d: {"run_id": ""}
-        scoped, details = _parse_scoped_log_events("20260625", [hist_log, latest_log])
+        scoped, details = _parse_scoped_log_events("20260625", [hist_log, latest_log, mgr_log])
         globals()["_load_pipeline_state"] = orig_loader
         globals()["OUTPUT_DIR"] = old_output
 
         assert scoped["latest_pipeline_log_file"] == "manual_full_pipeline_after_fix_20260625_101015.log"
         assert scoped["latest_pipeline_detect_method"] == "filename_timestamp"
-        assert scoped["latest_pipeline_egw00201_count"] == 4
+        assert scoped["latest_pipeline_egw00201_count"] == 6
         assert scoped["historical_egw00201_count"] == 2
-        assert scoped["all_related_logs_egw00201_count"] == 6
-        assert scoped["egw00201_count"] == 4
-        assert scoped["kis_rate_limit_count"] == 4
+        assert scoped["all_related_logs_egw00201_count"] == 8
+        assert scoped["egw00201_count"] == 6
+        assert scoped["kis_rate_limit_count"] == 6
         assert scoped["latest_pipeline_error_count"] == 1
         assert scoped["historical_error_count"] == 1
         assert scoped["current_run_error_count"] == 0
         assert scoped["performance_review_traceback"] == 0
         latest_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "latest_pipeline"]
         hist_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "historical_log"]
-        assert len(latest_details) == 4
+        assert len(latest_details) == 6
         assert len(hist_details) == 2
-        assert all("manual_full_pipeline_after_fix_20260625_101015.log" in d["source_file"] for d in latest_details)
-        assert all("manual_full_pipeline_20260625_095009.log" in d["source_file"] for d in hist_details)
+        assert sum(1 for d in latest_details if "manual_full_pipeline_after_fix" in d["source_file"]) == 4
+        assert sum(1 for d in latest_details if "integrated_manager.log" in d["source_file"]) == 2
 
     # bracket run_id fallback
     with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as tf:
