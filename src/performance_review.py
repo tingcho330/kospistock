@@ -56,6 +56,11 @@ _RECONCILE_HOLDING_RE = re.compile(
     re.I,
 )
 _RUN_ID_IN_LINE_RE = re.compile(r"\[(\d{8}-\d{6})\]")
+_PIPELINE_EXCLUDE_SUBSTR = (
+    "manual_order_reconcile",
+    "performance_review",
+    "account",
+)
 
 
 def _norm_date(s: Optional[str]) -> str:
@@ -316,6 +321,94 @@ def _parse_reconcile_holding_map(log_text: str) -> Dict[str, str]:
     return out
 
 
+def _is_pipeline_log_candidate(path: Path, date_str: str) -> bool:
+    """full_pipeline / integrated pipeline 계열 로그만 latest_pipeline 후보."""
+    name = path.name.lower()
+    if not name.endswith(".log") or date_str not in name:
+        return False
+    for bad in _PIPELINE_EXCLUDE_SUBSTR:
+        if bad in name:
+            return False
+    if "screener" in name and "pipeline" not in name:
+        return False
+    if "full_pipeline" in name or "integrated_pipeline" in name:
+        return True
+    if name.startswith(f"pipeline_{date_str}") or name.startswith(f"pipeline-{date_str}"):
+        return True
+    if re.search(rf"(?:^|[_-])pipeline[_-]{date_str}", name):
+        return True
+    return False
+
+
+def _extract_filename_run_ts(path: Path, date_str: str) -> Optional[str]:
+    """파일명에서 YYYYMMDD-HHMMSS 추출."""
+    m = re.search(rf"{date_str}[_-](\d{{6}})", path.name)
+    if not m:
+        return None
+    return f"{date_str}-{m.group(1)}"
+
+
+def _discover_pipeline_log_files(date_str: str) -> List[Path]:
+    """output 디렉토리에서 날짜 포함 pipeline 후보 로그 검색."""
+    found: List[Path] = []
+    seen: set = set()
+    for base in (OUTPUT_DIR, OUTPUT_DIR / "debug"):
+        if not base.is_dir():
+            continue
+        for p in base.glob("*.log"):
+            if p in seen:
+                continue
+            if _is_pipeline_log_candidate(p, date_str):
+                found.append(p)
+                seen.add(p)
+    return found
+
+
+def _resolve_latest_pipeline_log(
+    date_str: str,
+    log_files: List[Path],
+    run_id: str,
+) -> Tuple[Optional[Path], Optional[str], str]:
+    """latest pipeline 로그 파일·타임스탬프·탐지 방식 반환."""
+    candidates: List[Path] = []
+    seen: set = set()
+    for p in list(log_files) + _discover_pipeline_log_files(date_str):
+        if p in seen:
+            continue
+        seen.add(p)
+        if _is_pipeline_log_candidate(p, date_str):
+            candidates.append(p)
+
+    if run_id:
+        rid_us = run_id.replace("-", "_")
+        for path in candidates:
+            if run_id in path.name or rid_us in path.name:
+                return path, _extract_filename_run_ts(path, date_str) or run_id, "pipeline_state_run_id"
+        for path in candidates:
+            try:
+                head = path.read_text(encoding="utf-8", errors="ignore")[:100000]
+            except Exception:
+                continue
+            if f"[{run_id}]" in head:
+                return path, _extract_filename_run_ts(path, date_str) or run_id, "pipeline_state_run_id"
+
+    ts_pairs: List[Tuple[str, Path]] = []
+    for path in candidates:
+        run_ts = _extract_filename_run_ts(path, date_str)
+        if run_ts:
+            ts_pairs.append((run_ts, path))
+    if ts_pairs:
+        ts_pairs.sort(key=lambda x: x[0], reverse=True)
+        run_ts, path = ts_pairs[0]
+        return path, run_ts, "filename_timestamp"
+
+    if candidates:
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        return latest, _extract_filename_run_ts(latest, date_str), "fallback_latest_full_pipeline"
+
+    return None, None, "fallback_latest_full_pipeline"
+
+
 def _nearest_run_id(lines: List[str], idx: int, lookback: int = 80) -> Optional[str]:
     for j in range(idx, max(-1, idx - lookback), -1):
         m = _RUN_ID_IN_LINE_RE.search(lines[j])
@@ -330,6 +423,7 @@ def _resolve_log_scope(
     idx: int,
     latest_run_id: str,
     path: Path,
+    latest_pipeline_path: Optional[Path] = None,
 ) -> Tuple[str, str]:
     """로그 라인 scope/severity 분류."""
     low_path = str(path).lower()
@@ -337,6 +431,15 @@ def _resolve_log_scope(
         return "current_run", "current_warning"
     if "performance_review.py" in line:
         return "current_run", "current_warning"
+
+    if latest_pipeline_path is not None:
+        try:
+            if path.resolve() == latest_pipeline_path.resolve():
+                return "latest_pipeline", "current_warning"
+        except Exception:
+            if str(path) == str(latest_pipeline_path):
+                return "latest_pipeline", "current_warning"
+
     ctx_run = _nearest_run_id(lines, idx)
     if latest_run_id and (ctx_run == latest_run_id or f"[{latest_run_id}]" in line):
         return "latest_pipeline", "current_warning"
@@ -369,16 +472,33 @@ def _parse_scoped_log_events(
     """EGW00201/ERROR/Traceback를 scope별로 집계."""
     state = _load_pipeline_state(date_str)
     latest_run_id = str(state.get("run_id") or "")
+    latest_pipeline_path, latest_pipeline_run_ts, detect_method = _resolve_latest_pipeline_log(
+        date_str, log_files, latest_run_id,
+    )
     counts = _empty_scoped_counts()
     details: List[Dict[str, Any]] = []
 
-    for path in log_files:
+    scan_files: List[Path] = []
+    seen_paths: set = set()
+    for p in list(log_files) + _discover_pipeline_log_files(date_str):
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        scan_files.append(p)
+
+    for path in scan_files:
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
         for i, line in enumerate(lines):
-            scope, severity = _resolve_log_scope(line, lines, i, latest_run_id, path)
+            scope, severity = _resolve_log_scope(
+                line, lines, i, latest_run_id, path, latest_pipeline_path,
+            )
 
             if "EGW00201" in line:
                 counts["all_related_logs_egw00201_count"] += 1
@@ -439,6 +559,9 @@ def _parse_scoped_log_events(
     result: Dict[str, Any] = {
         **counts,
         "latest_pipeline_run_id": latest_run_id or None,
+        "latest_pipeline_log_file": latest_pipeline_path.name if latest_pipeline_path else None,
+        "latest_pipeline_run_ts": latest_pipeline_run_ts,
+        "latest_pipeline_detect_method": detect_method,
         # 하위 호환: Summary/기존 필드는 최신 파이프라인 기준
         "egw00201_count": counts["latest_pipeline_egw00201_count"],
         "kis_rate_limit_count": counts["latest_pipeline_egw00201_count"],
@@ -1091,12 +1214,12 @@ def _build_system_performance(
             pass
     logger.info(
         "[PERF_SYSTEM] current_run_errors=%s latest_pipeline_egw00201=%s "
-        "historical_egw00201=%s performance_review_traceback=%s total_runtime_sec=%s",
+        "historical_egw00201=%s performance_review_traceback=%s latest_pipeline_log=%s",
         perf.get("current_run_error_count", 0),
         perf.get("latest_pipeline_egw00201_count", 0),
         perf.get("historical_egw00201_count", 0),
         perf.get("performance_review_traceback", 0),
-        perf.get("total_runtime_sec"),
+        perf.get("latest_pipeline_log_file"),
     )
     return perf
 
@@ -1848,42 +1971,74 @@ def _smoke_test_accuracy_fixes() -> None:
     assert budget["executed_bond_buy_count"] == 1
     assert budget["stock_buy_budget"] > 0
 
-    # scoped warning 집계
+    # scoped warning 집계 — 파일명 기반 latest pipeline
     import tempfile
-    sample_log = (
-        "[20260625-100000] - ERROR - old pipeline error\n"
-        "[20260625-100000] KIS API EGW00201 rate limit\n"
-        "[20260625-100000] KIS API EGW00201 rate limit\n"
-        "[20260625-143022] STEP START trader\n"
-        "[20260625-143022] KIS API EGW00201 rate limit\n"
-        "[20260625-143022] KIS API EGW00201 rate limit\n"
-        "[20260625-143022] KIS API EGW00201 rate limit\n"
-        "[20260625-143022] KIS API EGW00201 rate limit\n"
-        "Traceback (most recent call last)\n"
-        "[20260625-143022] - ERROR - latest pipeline error\n"
-    )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as tf:
-        tf.write(sample_log)
-        tmp_path = Path(tf.name)
-    try:
-        # pipeline_state mock via monkeypatching _load_pipeline_state
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        old_output = OUTPUT_DIR
+        globals()["OUTPUT_DIR"] = tmp
+
+        hist_log = tmp / "manual_full_pipeline_20260625_095009.log"
+        hist_log.write_text(
+            "KIS API EGW00201 rate limit\n"
+            "KIS API EGW00201 rate limit\n"
+            "[20260625-095009] - ERROR - old pipeline error\n",
+            encoding="utf-8",
+        )
+        latest_log = tmp / "manual_full_pipeline_after_fix_20260625_101015.log"
+        latest_log.write_text(
+            "KIS API EGW00201 rate limit\n"
+            "KIS API EGW00201 rate limit\n"
+            "KIS API EGW00201 rate limit\n"
+            "KIS API EGW00201 rate limit\n"
+            "[20260625-101015] - ERROR - latest pipeline error\n",
+            encoding="utf-8",
+        )
+
         orig_loader = _load_pipeline_state
-        def _mock_state(_date: str) -> Dict[str, Any]:
-            return {"run_id": "20260625-143022"}
-        globals()["_load_pipeline_state"] = _mock_state
-        scoped, details = _parse_scoped_log_events("20260625", [tmp_path])
+        globals()["_load_pipeline_state"] = lambda _d: {"run_id": ""}
+        scoped, details = _parse_scoped_log_events("20260625", [hist_log, latest_log])
         globals()["_load_pipeline_state"] = orig_loader
+        globals()["OUTPUT_DIR"] = old_output
+
+        assert scoped["latest_pipeline_log_file"] == "manual_full_pipeline_after_fix_20260625_101015.log"
+        assert scoped["latest_pipeline_detect_method"] == "filename_timestamp"
         assert scoped["latest_pipeline_egw00201_count"] == 4
-        assert scoped["all_related_logs_egw00201_count"] == 6
         assert scoped["historical_egw00201_count"] == 2
-        assert scoped["current_run_error_count"] == 0
+        assert scoped["all_related_logs_egw00201_count"] == 6
+        assert scoped["egw00201_count"] == 4
+        assert scoped["kis_rate_limit_count"] == 4
         assert scoped["latest_pipeline_error_count"] == 1
         assert scoped["historical_error_count"] == 1
+        assert scoped["current_run_error_count"] == 0
         assert scoped["performance_review_traceback"] == 0
-        assert any(d.get("scope") == "latest_pipeline" for d in details)
-        assert any(d.get("scope") == "historical_log" for d in details)
+        latest_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "latest_pipeline"]
+        hist_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "historical_log"]
+        assert len(latest_details) == 4
+        assert len(hist_details) == 2
+        assert all("manual_full_pipeline_after_fix_20260625_101015.log" in d["source_file"] for d in latest_details)
+        assert all("manual_full_pipeline_20260625_095009.log" in d["source_file"] for d in hist_details)
+
+    # bracket run_id fallback
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8") as tf:
+        tf.write(
+            "[20260625-100000] KIS API EGW00201 rate limit\n"
+            "[20260625-100000] KIS API EGW00201 rate limit\n"
+            "[20260625-143022] KIS API EGW00201 rate limit\n"
+            "[20260625-143022] KIS API EGW00201 rate limit\n"
+            "[20260625-143022] KIS API EGW00201 rate limit\n"
+            "[20260625-143022] KIS API EGW00201 rate limit\n"
+        )
+        bracket_path = Path(tf.name)
+    try:
+        orig_loader = _load_pipeline_state
+        globals()["_load_pipeline_state"] = lambda _d: {"run_id": "20260625-143022"}
+        scoped2, _ = _parse_scoped_log_events("20260625", [bracket_path])
+        globals()["_load_pipeline_state"] = orig_loader
+        assert scoped2["latest_pipeline_egw00201_count"] == 4
+        assert scoped2["historical_egw00201_count"] == 2
     finally:
-        tmp_path.unlink(missing_ok=True)
+        bracket_path.unlink(missing_ok=True)
 
     print("smoke_test_accuracy_fixes: OK")
 
