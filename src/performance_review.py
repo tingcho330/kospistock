@@ -109,6 +109,37 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
+def _coalesce_runtime(*values: Any) -> Optional[float]:
+    """첫 번째 유효 runtime 값 반환 (None/빈 문자열 스킵)."""
+    for v in values:
+        if v is None or v == "":
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _fmt_runtime_cell(value: Any) -> str:
+    """Markdown 표 셀용 runtime (초). None → '-'."""
+    if value is None or value == "":
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if num == int(num):
+        return str(int(num))
+    return str(round(num, 1))
+
+
+def _fmt_runtime_bullet(value: Any) -> str:
+    """Markdown bullet용 runtime. None → '-', 유효값 → '121.8s'."""
+    cell = _fmt_runtime_cell(value)
+    return cell if cell == "-" else f"{cell}s"
+
+
 def _load_json(path: Path) -> Any:
     if not path.is_file():
         return None
@@ -2136,7 +2167,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- EGW00201: {system.get('latest_execution_egw00201_count', system.get('latest_pipeline_egw00201_count', 0))}",
         f"- Traceback: {system.get('latest_execution_traceback_count', system.get('latest_pipeline_traceback_count', 0))}",
         f"- Error: {system.get('latest_execution_error_count', system.get('latest_pipeline_error_count', 0))}",
-        f"- Runtime: {system.get('latest_execution_runtime_sec', '-')}s",
+        f"- Runtime: {_fmt_runtime_bullet(system.get('latest_execution_runtime_sec'))}",
         "",
         "### Daily Pipeline Group",
         "",
@@ -2153,18 +2184,30 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- EGW00201: {system.get('daily_pipeline_egw00201_count', 0)}",
         f"- Traceback: {system.get('daily_pipeline_traceback_count', 0)}",
         f"- Error: {system.get('daily_pipeline_error_count', 0)}",
-        f"- Runtime: {system.get('daily_pipeline_runtime_sec', '-')}s",
+        f"- Runtime: {_fmt_runtime_bullet(system.get('daily_pipeline_runtime_sec'))}",
         "",
         "| Stage | Runtime (s) |",
         "|-------|------------:|",
     ])
     daily_stages = system.get("daily_pipeline_stage_runtime_sec") or {}
-    lines.append(f"| Total | {system.get('daily_pipeline_runtime_sec', system.get('total_runtime_sec', '-'))} |")
-    lines.append(f"| Screener | {daily_stages.get('screener_runtime_sec', system.get('screener_runtime_sec', '-'))} |")
-    lines.append(f"| News | {daily_stages.get('news_collector_runtime_sec', system.get('news_collector_runtime_sec', '-'))} |")
-    lines.append(f"| GPT | {daily_stages.get('gpt_analyzer_runtime_sec', system.get('gpt_analyzer_runtime_sec', '-'))} |")
-    lines.append(f"| Trader | {daily_stages.get('trader_runtime_sec', system.get('trader_runtime_sec', '-'))} |")
-    lines.append(f"| Reconciler | {daily_stages.get('order_reconciler_runtime_sec', system.get('order_reconciler_runtime_sec', '-'))} |")
+    lines.append(
+        f"| Total | {_fmt_runtime_cell(_coalesce_runtime(system.get('daily_pipeline_runtime_sec'), system.get('total_runtime_sec')))} |"
+    )
+    lines.append(
+        f"| Screener | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('screener_runtime_sec'), system.get('screener_runtime_sec')))} |"
+    )
+    lines.append(
+        f"| News | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('news_collector_runtime_sec'), system.get('news_collector_runtime_sec')))} |"
+    )
+    lines.append(
+        f"| GPT | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('gpt_analyzer_runtime_sec'), system.get('gpt_analyzer_runtime_sec')))} |"
+    )
+    lines.append(
+        f"| Trader | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('trader_runtime_sec'), system.get('trader_runtime_sec')))} |"
+    )
+    lines.append(
+        f"| Reconciler | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('order_reconciler_runtime_sec'), system.get('order_reconciler_runtime_sec')))} |"
+    )
     lines.extend([
         "",
         "## 9. Warnings",
