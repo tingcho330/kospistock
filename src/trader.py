@@ -2490,6 +2490,30 @@ class Trader:
         holding_tickers = [str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0]
         last_buy_trades = fetch_trades_by_tickers(holding_tickers)
 
+        # stale SELL pending 탐지 (기본: warning만, config로 auto cleanup)
+        try:
+            from order_reconciler import _fetch_open_orders_inquire_orders, _fetch_daily_orders
+            from stale_sell_pending import detect_and_handle_stale_sell_pending
+            from datetime import timedelta as _td
+            now_kst = datetime.now(KST)
+            since_dt = now_kst - _td(hours=120)
+            start_ymd = since_dt.strftime("%Y%m%d")
+            end_ymd = now_kst.strftime("%Y%m%d")
+            kis_open = _fetch_open_orders_inquire_orders(
+                self.kis, start_ymd=start_ymd, end_ymd=end_ymd,
+            )
+            kis_daily = _fetch_daily_orders(
+                self.kis, start_ymd=start_ymd, end_ymd=end_ymd,
+            )
+            detect_and_handle_stale_sell_pending(
+                checked_by="trader",
+                since_hours=120,
+                kis_open_order_ids=set(kis_open.keys()),
+                kis_daily_order_ids=set(kis_daily.keys()),
+            )
+        except Exception as e:
+            logger.warning("stale SELL pending 탐지 실패: %s", e)
+
         # risk_manager direct_execute 등으로 이미 제출된 pending/partial SELL은 중복 매도 방지
         open_sell_tickers: set = set()
         try:

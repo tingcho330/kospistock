@@ -173,6 +173,29 @@ SCRIPT_TIMEOUT_SEC = int(os.getenv("SCRIPT_TIMEOUT_SEC", "600"))
 SCREENER_TIMEOUT_SEC = int(os.getenv("SCREENER_TIMEOUT_SEC", "1200"))
 SLOW_STEP_SEC = int(os.getenv("SLOW_STEP_SEC", "90"))
 
+# 파이프라인 단계 순서 (수동 재개·일일 실행 공통)
+PIPELINE_STAGE_ORDER = [
+    "screener",
+    "news",
+    "gpt",
+    "trader",
+    "reconciler",
+    "performance",
+]
+
+PIPELINE_STAGE_INPUTS = {
+    "screener": [],
+    "news": ["screener_candidates_{date}_{market}.json"],
+    "gpt": [
+        "screener_candidates_{date}_{market}.json",
+        "collected_news_{date}_{market}.json",
+        "market_state_{date}_{market}.json",
+    ],
+    "trader": ["gpt_trades_{date}_{market}.json"],
+    "reconciler": [],
+    "performance": [],
+}
+
 # 파이프라인 스크립트(매 거래일 실행)
 # 주의: reviewer.py, cleanup_output.py 는 일일 파이프라인에서 제외하고
 #       월 1회 유지보수 작업(run_monthly_maintenance)으로 별도 실행한다.
@@ -739,6 +762,160 @@ def _tail(text: str, n: int = 12) -> str:
         return ""
     lines = text.strip().splitlines()
     return "\n".join(lines[-n:])
+
+def _pipeline_artifact_path(pattern: str, date_str: str, market: str) -> Path:
+    return OUTPUT_DIR / pattern.format(date=date_str, market=market)
+
+
+def _check_stage_inputs(stage: str, date_str: str, market: str) -> Tuple[bool, List[Path]]:
+    """단계 필수 입력 파일 존재 확인."""
+    required = PIPELINE_STAGE_INPUTS.get(stage, [])
+    missing: List[Path] = []
+    for pattern in required:
+        path = _pipeline_artifact_path(pattern, date_str, market)
+        exists = path.is_file()
+        logger.info("[PIPELINE_INPUT_CHECK] file=%s exists=%s", path, str(exists).lower())
+        if not exists:
+            missing.append(path)
+    return len(missing) == 0, missing
+
+
+def _run_pipeline_stage(
+    stage: str,
+    run_id: str,
+    date_str: str,
+    market: str,
+) -> Tuple[bool, float]:
+    """단일 파이프라인 단계 실행."""
+    t0 = time.perf_counter()
+    ok = False
+
+    if stage == "screener":
+        ok, _, _ = run_script("screener.py", run_id)
+    elif stage == "news":
+        candidates = _pipeline_artifact_path(
+            "screener_candidates_{date}_{market}.json", date_str, market,
+        )
+        cmd = [
+            sys.executable, "/app/src/news_collector.py",
+            "--file", str(candidates),
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            ok = True
+        except Exception as e:
+            logger.error(f"[{run_id}] news_collector 실패: {e}")
+    elif stage == "gpt":
+        cmd = [
+            sys.executable, "/app/src/gpt_analyzer.py",
+            "--date", date_str, "--market", market, "--slots", SLOTS,
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            ok = True
+        except Exception as e:
+            logger.error(f"[{run_id}] gpt_analyzer 실패: {e}")
+    elif stage == "trader":
+        _ensure_summary_file_for_risk_manager()
+        ok, _, _ = run_script("trader.py", run_id)
+    elif stage == "reconciler":
+        script = Path("/app/src/order_reconciler.py")
+        if not script.exists():
+            script = Path(__file__).resolve().parent / "order_reconciler.py"
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), "--since-hours", "120", "--limit", "100"],
+                capture_output=True, text=True, timeout=180, encoding="utf-8",
+            )
+            ok = result.returncode == 0
+            if not ok:
+                logger.error(f"[{run_id}] order_reconciler 실패: {_tail(result.stderr, 40)}")
+        except Exception as e:
+            logger.error(f"[{run_id}] order_reconciler 예외: {e}")
+    elif stage == "performance":
+        cmd = [
+            sys.executable, "/app/src/performance_review.py",
+            "--date", date_str, "--market", market, "--no-fetch-prices",
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            ok = True
+        except Exception as e:
+            logger.error(f"[{run_id}] performance_review 실패: {e}")
+    else:
+        logger.error(f"[{run_id}] 알 수 없는 단계: {stage}")
+
+    return ok, time.perf_counter() - t0
+
+
+def run_pipeline_from_stage(
+    from_stage: str = "screener",
+    date_str: Optional[str] = None,
+    market: Optional[str] = None,
+    use_existing_files: bool = False,
+    skip_screener: bool = False,
+) -> bool:
+    """
+    지정 단계부터 파이프라인 재개 실행.
+    단계: screener → news → gpt → trader → reconciler → performance
+    """
+    global MARKET
+    date_str = date_str or datetime.now(KST).strftime("%Y%m%d")
+    market = (market or MARKET or "KOSPI").upper()
+    MARKET = market
+
+    if skip_screener and from_stage == "screener":
+        from_stage = "news"
+
+    if from_stage not in PIPELINE_STAGE_ORDER:
+        logger.error("잘못된 from_stage: %s", from_stage)
+        return False
+
+    run_id = f"{date_str}-{datetime.now(KST).strftime('%H%M%S')}"
+    os.environ["RUN_ID"] = run_id
+    os.environ["RUN_STARTED_AT"] = str(time.time())
+    os.environ["MARKET"] = market
+
+    logger.info(
+        "[PIPELINE_RESUME] date=%s market=%s from_stage=%s use_existing_files=%s",
+        date_str, market, from_stage, str(use_existing_files).lower(),
+    )
+
+    start_idx = PIPELINE_STAGE_ORDER.index(from_stage)
+    stages_to_run = PIPELINE_STAGE_ORDER[start_idx:]
+
+    for stage in PIPELINE_STAGE_ORDER:
+        if stage not in stages_to_run:
+            logger.info(
+                "[PIPELINE_STAGE_SKIP] stage=%s reason=resume_from_%s",
+                stage, from_stage,
+            )
+
+    pipeline_ok = True
+    for stage in stages_to_run:
+        if PIPELINE_STAGE_INPUTS.get(stage):
+            ok_inputs, missing = _check_stage_inputs(stage, date_str, market)
+            if not ok_inputs:
+                for path in missing:
+                    logger.error(
+                        "[PIPELINE_ABORT] reason=missing_required_input file=%s",
+                        path,
+                    )
+                return False
+
+        logger.info("[PIPELINE_STAGE_START] stage=%s", stage)
+        ok, elapsed = _run_pipeline_stage(stage, run_id, date_str, market)
+        logger.info(
+            "[PIPELINE_STAGE_END] stage=%s elapsed_sec=%.1f",
+            stage, elapsed,
+        )
+        if not ok:
+            pipeline_ok = False
+            logger.error("[PIPELINE_ABORT] reason=stage_failed stage=%s", stage)
+            return False
+
+    return pipeline_ok
+
 
 def run_script(script_name: str, run_id: str) -> Tuple[bool, bool, float]:
     """주어진 파이썬 스크립트를 실행 (자동 복구 포함)"""
@@ -1312,12 +1489,43 @@ if __name__ == "__main__":
     parser.add_argument("--capture-close", action="store_true", help="장종료 잔액 캡처")
     parser.add_argument("--send-summary", action="store_true", help="일일 요약 전송")
     parser.add_argument("--no-background-risk", action="store_true", help="백그라운드 RiskManager 비활성화")
+    parser.add_argument(
+        "--from-stage",
+        choices=PIPELINE_STAGE_ORDER,
+        default="screener",
+        help="파이프라인 재개 시작 단계 (기본: screener)",
+    )
+    parser.add_argument("--date", help="파이프라인 날짜 YYYYMMDD (기본: 오늘 KST)")
+    parser.add_argument(
+        "--market",
+        choices=["KOSPI", "KOSDAQ", "KONEX"],
+        default=None,
+        help="시장 (기본: KOSPI 또는 MARKET 환경변수)",
+    )
+    parser.add_argument(
+        "--use-existing-files",
+        action="store_true",
+        help="기존 output 파일을 사용해 이후 단계 실행",
+    )
+    parser.add_argument(
+        "--skip-screener",
+        action="store_true",
+        help="true면 from-stage=news 또는 gpt로 동작",
+    )
     args = parser.parse_args()
     
     print(f"인수 파싱 완료: {args}")
     
     # 백그라운드 RiskManager 인스턴스
     background_risk_manager = None
+
+    resume_requested = (
+        args.from_stage != "screener"
+        or args.use_existing_files
+        or args.skip_screener
+        or args.date is not None
+        or args.market is not None
+    )
     
     if args.capture_open:
         capture_balance_snapshot("open")
@@ -1326,13 +1534,34 @@ if __name__ == "__main__":
     elif args.send_summary:
         send_daily_trading_summary()
     elif args.once:
-        # 단발 실행
-        logger.info("통합 매니저 단발 실행")
-        capture_balance_snapshot("open")
-        run_screener_job()
-        run_trading_pipeline()
-        capture_balance_snapshot("close")
-        send_daily_trading_summary()
+        if resume_requested:
+            logger.info("통합 매니저 단발 실행 (파이프라인 재개)")
+            date_str = args.date or datetime.now(KST).strftime("%Y%m%d")
+            market = (args.market or MARKET or "KOSPI").upper()
+            run_pipeline_from_stage(
+                from_stage=args.from_stage,
+                date_str=date_str,
+                market=market,
+                use_existing_files=args.use_existing_files,
+                skip_screener=args.skip_screener,
+            )
+        else:
+            logger.info("통합 매니저 단발 실행")
+            capture_balance_snapshot("open")
+            run_screener_job()
+            run_trading_pipeline()
+            capture_balance_snapshot("close")
+            send_daily_trading_summary()
+    elif resume_requested:
+        date_str = args.date or datetime.now(KST).strftime("%Y%m%d")
+        market = (args.market or MARKET or "KOSPI").upper()
+        run_pipeline_from_stage(
+            from_stage=args.from_stage,
+            date_str=date_str,
+            market=market,
+            use_existing_files=args.use_existing_files,
+            skip_screener=args.skip_screener,
+        )
     else:
         # 스케줄 실행
         register_jobs()

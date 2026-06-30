@@ -524,7 +524,96 @@ def _backfill_orphan_order_ids_impl(*, since_hours: int = 24, limit: int = 200) 
     return summary
 
 
-def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[str, int]:
+def cleanup_stale_sell_pending_after_reconcile(
+    *,
+    still_missing_rows: List[Dict[str, Any]],
+    kis_open_orders: Dict[str, Dict[str, Any]],
+    kis_daily_orders: Dict[str, Dict[str, Any]],
+    holdings_by_ticker: Dict[str, Dict[str, Any]],
+    stale_hours: int = 24,
+    do_cleanup: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    """리컨실 후 still_missing 중 stale SELL pending 처리."""
+    from stale_sell_pending import is_stale_sell_row, mark_stale_sell_failed
+
+    holding_tickers = {
+        t for t, h in holdings_by_ticker.items()
+        if _safe_int(h.get("hldg_qty", 0)) > 0
+    }
+    kis_open_ids = set(kis_open_orders.keys())
+    kis_daily_ids = set(kis_daily_orders.keys())
+
+    stats = {
+        "stale_sell_candidates": 0,
+        "stale_sell_updated": 0,
+        "stale_sell_skipped": 0,
+        "stale_sell_dry_run": 0,
+    }
+
+    for row in still_missing_rows:
+        row_id = row.get("id")
+        order_id = str(row.get("order_id") or "").strip()
+        ticker = str(row.get("ticker") or "").zfill(6)
+        is_stale, diag = is_stale_sell_row(
+            row,
+            stale_hours=stale_hours,
+            kis_open_order_ids=kis_open_ids,
+            kis_daily_order_ids=kis_daily_ids,
+            holding_tickers=holding_tickers,
+        )
+        if not is_stale:
+            logger.info(
+                "[RECONCILE_STALE_SELL_PENDING_SKIPPED] id=%s ticker=%s order_id=%s reason=%s",
+                row_id, ticker, order_id, diag.get("reason", "not_stale"),
+            )
+            stats["stale_sell_skipped"] += 1
+            continue
+
+        stats["stale_sell_candidates"] += 1
+        age_hours = diag.get("age_hours", "?")
+        logger.warning(
+            "[RECONCILE_STALE_SELL_PENDING_CANDIDATE] id=%s ticker=%s order_id=%s age_hours=%s",
+            row_id, ticker, order_id, age_hours,
+        )
+
+        if dry_run:
+            logger.warning(
+                "[RECONCILE_STALE_SELL_PENDING_DRY_RUN] id=%s ticker=%s order_id=%s",
+                row_id, ticker, order_id,
+            )
+            stats["stale_sell_dry_run"] += 1
+            continue
+
+        if not do_cleanup:
+            logger.warning(
+                "[RECONCILE_STALE_SELL_PENDING_SKIPPED] id=%s ticker=%s order_id=%s reason=cleanup_not_requested",
+                row_id, ticker, order_id,
+            )
+            stats["stale_sell_skipped"] += 1
+            continue
+
+        row_with_diag = {**row, "_stale_diag": diag}
+        if mark_stale_sell_failed(row_with_diag, checked_by="order_reconciler", manual=False):
+            logger.warning(
+                "[RECONCILE_STALE_SELL_PENDING_UPDATED] id=%s ticker=%s order_id=%s status=failed",
+                row_id, ticker, order_id,
+            )
+            stats["stale_sell_updated"] += 1
+        else:
+            stats["stale_sell_skipped"] += 1
+
+    return stats
+
+
+def reconcile_open_orders(
+    *,
+    since_hours: int = 24,
+    limit: int = 500,
+    cleanup_stale_sell_pending: bool = False,
+    stale_hours: int = 24,
+    dry_run: bool = False,
+) -> Dict[str, int]:
     """
     DB open(pending/partial) 주문을 KIS 조회 결과로 리컨실.
     """
@@ -616,6 +705,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     updated_by_daily_query = 0
     updated_by_holding_fallback = 0
     still_missing_after_all = 0
+    still_missing_rows: List[Dict[str, Any]] = []
 
     for r in open_rows:
         order_id = str(r.get("order_id") or "").strip()
@@ -655,6 +745,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             holding_match = _try_reconcile_buy_by_holding(r, holdings_by_ticker)
             if not holding_match:
                 still_missing_after_all += 1
+                still_missing_rows.append(r)
                 _db_dbg_skip(
                     "reconciler.loop.SKIP_KIS_MISS_AFTER_ALL",
                     reason="order_id not in KIS queries and holding fallback failed",
@@ -792,6 +883,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         "updated_by_daily_query": updated_by_daily_query,
         "updated_by_holding_fallback": updated_by_holding_fallback,
         "still_missing_after_all": still_missing_after_all,
+        "still_missing_rows": still_missing_rows,
         # legacy keys
         "resolved_by_daily": updated_by_daily_query,
         "still_missing_after_daily": still_missing_after_all,
@@ -812,6 +904,18 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
 
     backfill_summary = backfill_orphan_order_ids(since_hours=since_hours, limit=min(limit, 200))
     summary.update(backfill_summary)
+
+    stale_stats = cleanup_stale_sell_pending_after_reconcile(
+        still_missing_rows=still_missing_rows,
+        kis_open_orders=open_orders,
+        kis_daily_orders=daily_orders or {},
+        holdings_by_ticker=holdings_by_ticker,
+        stale_hours=stale_hours,
+        do_cleanup=cleanup_stale_sell_pending,
+        dry_run=dry_run,
+    )
+    summary.update(stale_stats)
+
     logger.info(f"리컨실+backfill 통합 결과: {summary}")
     _db_dbg_log("reconciler.done_with_backfill", **summary)
     return summary
@@ -829,13 +933,37 @@ def main():
         action="store_true",
         help="order_id orphan backfill만 실행 (open pending 리컨실 생략)",
     )
+    parser.add_argument(
+        "--cleanup-stale-sell-pending",
+        action="store_true",
+        help="stale SELL pending을 failed로 정리",
+    )
+    parser.add_argument(
+        "--stale-hours",
+        type=int,
+        default=24,
+        help="stale SELL pending 판정 시간(기본 24)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="stale SELL cleanup 대상만 출력 (DB 갱신 없음)",
+    )
     args = parser.parse_args()
 
     try:
         if args.backfill_only:
             summary = backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))
         else:
-            summary = reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
+            summary = reconcile_open_orders(
+                since_hours=args.since_hours,
+                limit=args.limit,
+                cleanup_stale_sell_pending=args.cleanup_stale_sell_pending,
+                stale_hours=args.stale_hours,
+                dry_run=args.dry_run,
+            )
+        # JSON 직렬화용 — row 목록 제외
+        summary.pop("still_missing_rows", None)
         print(json.dumps({"ok": True, **summary}, ensure_ascii=False))
         sys.exit(0)
     except Exception as e:

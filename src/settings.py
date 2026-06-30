@@ -146,6 +146,10 @@ class Settings:
         order_exec.setdefault("split_timebox_sec", 20)
         order_exec.setdefault("split_step_min_delay_sec", 1.0)
 
+        # stale SELL pending 탐지·정리
+        tp.setdefault("stale_pending_sell_hours", 24)
+        tp.setdefault("auto_cleanup_stale_sell_pending", False)
+
         # ── 트레이딩 가드 확장 ───────────────────────────────────────
         self.trading_guards.setdefault("cooldown_only_on_confirmed_failure", True)
 

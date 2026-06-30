@@ -57,10 +57,20 @@ _RECONCILE_HOLDING_RE = re.compile(
 )
 _RUN_ID_IN_LINE_RE = re.compile(r"\[(\d{8}-\d{6})\]")
 _PIPELINE_EXCLUDE_SUBSTR = (
-    "manual_order_reconcile",
     "performance_review",
     "account",
 )
+
+# 수동 분할 파이프라인 로그 접두사
+_SPLIT_MANUAL_LOG_PREFIXES = (
+    "manual_screener_",
+    "manual_news_collector_",
+    "manual_gpt_after_news_",
+    "manual_trader_after_gpt_",
+    "manual_order_reconcile_",
+    "manual_order_reconcile_pending_sell_",
+)
+_FULL_PIPELINE_PREFIX = "manual_full_pipeline_"
 
 
 def _norm_date(s: Optional[str]) -> str:
@@ -340,7 +350,7 @@ def _is_pipeline_log_candidate(path: Path, date_str: str) -> bool:
     return False
 
 
-def _extract_filename_run_ts(path: Path, date_str: str) -> Optional[str]:
+def _extract_log_run_ts(path: Path, date_str: str) -> Optional[str]:
     """파일명에서 YYYYMMDD-HHMMSS 추출."""
     m = re.search(rf"{date_str}[_-](\d{{6}})", path.name)
     if not m:
@@ -348,8 +358,35 @@ def _extract_filename_run_ts(path: Path, date_str: str) -> Optional[str]:
     return f"{date_str}-{m.group(1)}"
 
 
-def _discover_pipeline_log_files(date_str: str) -> List[Path]:
-    """output 디렉토리에서 날짜 포함 pipeline 후보 로그 검색."""
+def _extract_filename_run_ts(path: Path, date_str: str) -> Optional[str]:
+    """_extract_log_run_ts 별칭 (하위 호환)."""
+    return _extract_log_run_ts(path, date_str)
+
+
+def _is_split_manual_log(path: Path, date_str: str) -> bool:
+    name = path.name.lower()
+    if not name.endswith(".log") or date_str not in name:
+        return False
+    return any(name.startswith(p) and date_str in name for p in _SPLIT_MANUAL_LOG_PREFIXES)
+
+
+def _is_full_pipeline_log(path: Path, date_str: str) -> bool:
+    name = path.name.lower()
+    if not name.endswith(".log") or date_str not in name:
+        return False
+    if name.startswith(_FULL_PIPELINE_PREFIX) and date_str in name:
+        return True
+    if "integrated_pipeline" in name:
+        return True
+    if name.startswith(f"pipeline_{date_str}") or name.startswith(f"pipeline-{date_str}"):
+        return True
+    if re.search(rf"(?:^|[_-])pipeline[_-]{date_str}", name):
+        return True
+    return False
+
+
+def _discover_date_logs(date_str: str) -> List[Path]:
+    """output 디렉토리에서 날짜 포함 로그 검색."""
     found: List[Path] = []
     seen: set = set()
     for base in (OUTPUT_DIR, OUTPUT_DIR / "debug"):
@@ -358,55 +395,120 @@ def _discover_pipeline_log_files(date_str: str) -> List[Path]:
         for p in base.glob("*.log"):
             if p in seen:
                 continue
-            if _is_pipeline_log_candidate(p, date_str):
+            if date_str in p.name:
                 found.append(p)
                 seen.add(p)
     return found
+
+
+def _group_split_manual_logs(date_str: str, log_files: List[Path]) -> Dict[str, List[Path]]:
+    """분할 수동 로그를 run_ts별로 묶음."""
+    groups: Dict[str, List[Path]] = defaultdict(list)
+    for p in log_files:
+        if _is_split_manual_log(p, date_str):
+            run_ts = _extract_log_run_ts(p, date_str)
+            if run_ts:
+                groups[run_ts].append(p)
+    return dict(groups)
 
 
 def _resolve_latest_pipeline_log(
     date_str: str,
     log_files: List[Path],
     run_id: str,
-) -> Tuple[Optional[Path], Optional[str], str]:
-    """latest pipeline 로그 파일·타임스탬프·탐지 방식 반환."""
-    candidates: List[Path] = []
+) -> Tuple[List[Path], Optional[str], str]:
+    """latest pipeline 로그 파일 목록·타임스탬프·탐지 방식 반환."""
+    all_logs = list(log_files) + _discover_date_logs(date_str)
     seen: set = set()
-    for p in list(log_files) + _discover_pipeline_log_files(date_str):
-        if p in seen:
+    unique_logs: List[Path] = []
+    for p in all_logs:
+        key = str(p)
+        if key in seen:
             continue
-        seen.add(p)
-        if _is_pipeline_log_candidate(p, date_str):
-            candidates.append(p)
+        seen.add(key)
+        unique_logs.append(p)
 
+    # pipeline_state run_id 우선
     if run_id:
         rid_us = run_id.replace("-", "_")
-        for path in candidates:
+        for path in unique_logs:
             if run_id in path.name or rid_us in path.name:
-                return path, _extract_filename_run_ts(path, date_str) or run_id, "pipeline_state_run_id"
-        for path in candidates:
+                run_ts = _extract_log_run_ts(path, date_str) or run_id
+                return [path], run_ts, "pipeline_state_run_id"
+        for path in unique_logs:
             try:
                 head = path.read_text(encoding="utf-8", errors="ignore")[:100000]
             except Exception:
                 continue
             if f"[{run_id}]" in head:
-                return path, _extract_filename_run_ts(path, date_str) or run_id, "pipeline_state_run_id"
+                run_ts = _extract_log_run_ts(path, date_str) or run_id
+                return [path], run_ts, "pipeline_state_run_id"
+
+    full_logs = [p for p in unique_logs if _is_full_pipeline_log(p, date_str)]
+    split_groups = _group_split_manual_logs(date_str, unique_logs)
+
+    best_full: Optional[Tuple[str, Path]] = None
+    for p in full_logs:
+        run_ts = _extract_log_run_ts(p, date_str)
+        if run_ts:
+            if best_full is None or run_ts > best_full[0]:
+                best_full = (run_ts, p)
+
+    best_split: Optional[Tuple[str, List[Path]]] = None
+    for run_ts, files in split_groups.items():
+        if best_split is None or run_ts > best_split[0]:
+            best_split = (run_ts, files)
+
+    if best_full and best_split:
+        if best_split[0] > best_full[0]:
+            files = sorted(best_split[1], key=lambda x: x.name)
+            logger.info(
+                "[PERF_LOG_DETECT] method=split_manual_pipeline_logs files=%s",
+                ",".join(f.name for f in files),
+            )
+            return files, best_split[0], "split_manual_pipeline_logs"
+        logger.info(
+            "[PERF_LOG_DETECT] method=full_pipeline_log files=%s",
+            best_full[1].name,
+        )
+        return [best_full[1]], best_full[0], "full_pipeline_log"
+
+    if best_split:
+        files = sorted(best_split[1], key=lambda x: x.name)
+        logger.info(
+            "[PERF_LOG_DETECT] method=split_manual_pipeline_logs files=%s",
+            ",".join(f.name for f in files),
+        )
+        return files, best_split[0], "split_manual_pipeline_logs"
+
+    if best_full:
+        logger.info(
+            "[PERF_LOG_DETECT] method=full_pipeline_log files=%s",
+            best_full[1].name,
+        )
+        return [best_full[1]], best_full[0], "full_pipeline_log"
+
+    # 기존 후보 탐색 (filename_timestamp / fallback)
+    candidates: List[Path] = []
+    for p in unique_logs:
+        if _is_pipeline_log_candidate(p, date_str):
+            candidates.append(p)
 
     ts_pairs: List[Tuple[str, Path]] = []
     for path in candidates:
-        run_ts = _extract_filename_run_ts(path, date_str)
+        run_ts = _extract_log_run_ts(path, date_str)
         if run_ts:
             ts_pairs.append((run_ts, path))
     if ts_pairs:
         ts_pairs.sort(key=lambda x: x[0], reverse=True)
         run_ts, path = ts_pairs[0]
-        return path, run_ts, "filename_timestamp"
+        return [path], run_ts, "filename_timestamp"
 
     if candidates:
         latest = max(candidates, key=lambda p: p.stat().st_mtime)
-        return latest, _extract_filename_run_ts(latest, date_str), "fallback_latest_full_pipeline"
+        return [latest], _extract_log_run_ts(latest, date_str), "fallback_historical"
 
-    return None, None, "fallback_latest_full_pipeline"
+    return [], None, "fallback_historical"
 
 
 def _nearest_run_id(lines: List[str], idx: int, lookback: int = 80) -> Optional[str]:
@@ -423,7 +525,7 @@ def _resolve_log_scope(
     idx: int,
     effective_run_ids: set,
     path: Path,
-    latest_pipeline_path: Optional[Path] = None,
+    latest_pipeline_paths: Optional[List[Path]] = None,
 ) -> Tuple[str, str]:
     """로그 라인 scope/severity 분류."""
     low_path = str(path).lower()
@@ -432,12 +534,13 @@ def _resolve_log_scope(
     if "performance_review.py" in line:
         return "current_run", "current_warning"
 
-    if latest_pipeline_path is not None:
+    if latest_pipeline_paths:
         try:
-            if path.resolve() == latest_pipeline_path.resolve():
+            resolved = {p.resolve() for p in latest_pipeline_paths}
+            if path.resolve() in resolved:
                 return "latest_pipeline", "current_warning"
         except Exception:
-            if str(path) == str(latest_pipeline_path):
+            if any(str(path) == str(p) for p in latest_pipeline_paths):
                 return "latest_pipeline", "current_warning"
 
     ctx_run = _nearest_run_id(lines, idx)
@@ -475,7 +578,7 @@ def _parse_scoped_log_events(
     """EGW00201/ERROR/Traceback를 scope별로 집계."""
     state = _load_pipeline_state(date_str)
     latest_run_id = str(state.get("run_id") or "")
-    latest_pipeline_path, latest_pipeline_run_ts, detect_method = _resolve_latest_pipeline_log(
+    latest_pipeline_paths, latest_pipeline_run_ts, detect_method = _resolve_latest_pipeline_log(
         date_str, log_files, latest_run_id,
     )
     effective_run_ids: set = set()
@@ -488,7 +591,7 @@ def _parse_scoped_log_events(
 
     scan_files: List[Path] = []
     seen_paths: set = set()
-    for p in list(log_files) + _discover_pipeline_log_files(date_str):
+    for p in list(log_files) + _discover_date_logs(date_str):
         try:
             key = str(p.resolve())
         except Exception:
@@ -505,7 +608,7 @@ def _parse_scoped_log_events(
             continue
         for i, line in enumerate(lines):
             scope, severity = _resolve_log_scope(
-                line, lines, i, effective_run_ids, path, latest_pipeline_path,
+                line, lines, i, effective_run_ids, path, latest_pipeline_paths,
             )
 
             if "EGW00201" in line:
@@ -564,10 +667,13 @@ def _parse_scoped_log_events(
                 })
 
     counts["performance_review_traceback"] = counts["current_run_traceback_count"]
+    latest_pipeline_log_files = [p.name for p in latest_pipeline_paths]
+    latest_pipeline_log_file = latest_pipeline_log_files[0] if latest_pipeline_log_files else None
     result: Dict[str, Any] = {
         **counts,
         "latest_pipeline_run_id": latest_run_id or None,
-        "latest_pipeline_log_file": latest_pipeline_path.name if latest_pipeline_path else None,
+        "latest_pipeline_log_file": latest_pipeline_log_file,
+        "latest_pipeline_log_files": latest_pipeline_log_files,
         "latest_pipeline_run_ts": latest_pipeline_run_ts,
         "latest_pipeline_detect_method": detect_method,
         # 하위 호환: Summary/기존 필드는 최신 파이프라인 기준
@@ -1227,7 +1333,7 @@ def _build_system_performance(
         perf.get("latest_pipeline_egw00201_count", 0),
         perf.get("historical_egw00201_count", 0),
         perf.get("performance_review_traceback", 0),
-        perf.get("latest_pipeline_log_file"),
+        perf.get("latest_pipeline_log_files") or perf.get("latest_pipeline_log_file"),
     )
     return perf
 
@@ -1630,25 +1736,30 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     ])
 
     funnel_stages = [
-        ("전체 유니버스", funnel.get("total_universe_count")),
-        ("Marcap 통과", funnel.get("marcap_pass_count")),
-        ("Amount5D 통과", funnel.get("amount5d_pass_count")),
-        ("최종 후보", funnel.get("final_screener_candidate_count")),
-        ("스코어 저장", funnel.get("screener_score_count")),
-        ("GPT 분석", funnel.get("gpt_analysis_count")),
-        ("GPT BUY", funnel.get("gpt_buy_count")),
-        ("GPT HOLD", funnel.get("gpt_hold_count")),
-        ("GPT REJECT", funnel.get("gpt_reject_count")),
-        ("체결 BUY", funnel.get("executed_buy_count")),
+        ("전체 유니버스", funnel.get("total_universe_count"), True),
+        ("Marcap 통과", funnel.get("marcap_pass_count"), True),
+        ("Amount5D 통과", funnel.get("amount5d_pass_count"), True),
+        ("최종 후보", funnel.get("final_screener_candidate_count"), True),
+        ("스코어 저장", funnel.get("screener_score_count"), True),
+        ("GPT 분석", funnel.get("gpt_analysis_count"), True),
+        ("GPT BUY", funnel.get("gpt_buy_count"), False),
+        ("GPT HOLD", funnel.get("gpt_hold_count"), False),
+        ("GPT REJECT", funnel.get("gpt_reject_count"), False),
+        ("체결 BUY", funnel.get("executed_buy_count"), False),
+        ("주문 제출", execution.get("submitted_order_count"), False),
+        ("Pending", execution.get("pending_order_count"), False),
     ]
     prev = None
-    for label, cnt in funnel_stages:
+    for label, cnt, show_delta in funnel_stages:
         if cnt is None:
             lines.append(f"| {label} | - |")
             continue
-        drop = "" if prev is None or prev == 0 else f" (−{prev - cnt})"
+        drop = ""
+        if show_delta and prev is not None and prev > 0:
+            drop = f" (−{prev - cnt})"
         lines.append(f"| {label} | {cnt}{drop} |")
-        prev = cnt
+        if show_delta:
+            prev = cnt
 
     lines.extend(["", "## 3. GPT Decision", "", "| Action | Count | Avg GPT Score | Avg Screener | Executed | Amount |", "|--------|------:|--------------:|-------------:|---------:|-------:|"])
     for action in ("BUY", "HOLD", "REJECT"):
@@ -1767,15 +1878,28 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     raw_trade_rows = _load_trade_rows(date_str)
     kis_trade_rows, paper_db_only_rows = _normalize_trade_rows(raw_trade_rows)
     log_files = _find_log_files(date_str)
+    scoped_counts, warnings_detail = _parse_scoped_log_events(date_str, log_files)
+
     log_text = ""
-    for p in log_files[:5]:
-        try:
-            log_text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
-        except Exception:
-            pass
+    latest_names = scoped_counts.get("latest_pipeline_log_files") or []
+    if latest_names:
+        for name in latest_names:
+            for base in (OUTPUT_DIR, OUTPUT_DIR / "debug"):
+                p = base / name
+                if p.is_file():
+                    try:
+                        log_text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
+                    except Exception:
+                        pass
+                    break
+    if not log_text:
+        for p in log_files[:5]:
+            try:
+                log_text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
+            except Exception:
+                pass
 
     reconcile_map = _parse_reconcile_holding_map(log_text)
-    scoped_counts, warnings_detail = _parse_scoped_log_events(date_str, log_files)
 
     rank_map, score_map = _build_screener_maps(candidates, scores)
     screener_funnel = _build_screener_funnel(
@@ -2016,7 +2140,7 @@ def _smoke_test_accuracy_fixes() -> None:
         globals()["OUTPUT_DIR"] = old_output
 
         assert scoped["latest_pipeline_log_file"] == "manual_full_pipeline_after_fix_20260625_101015.log"
-        assert scoped["latest_pipeline_detect_method"] == "filename_timestamp"
+        assert scoped["latest_pipeline_detect_method"] in ("filename_timestamp", "full_pipeline_log")
         assert scoped["latest_pipeline_egw00201_count"] == 6
         assert scoped["historical_egw00201_count"] == 2
         assert scoped["all_related_logs_egw00201_count"] == 8
