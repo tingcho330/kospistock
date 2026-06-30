@@ -440,19 +440,54 @@ def _collect_manual_stage_logs(date_str: str, log_files: List[Path]) -> Dict[str
     return {k: v[1] for k, v in latest.items()}
 
 
-def _build_split_pipeline_group(
+def _build_daily_pipeline_group(
     date_str: str,
     stage_files: Dict[str, Path],
 ) -> Tuple[List[Path], Optional[str], str]:
     """
-    같은 날짜의 분할 수동 파이프라인 로그 묶음 구성.
-    reconcile 단독 그룹은 허용하지 않음.
+    당일 screener/news/gpt/trader/reconcile 분할 로그 묶음.
+    resume_trader는 당일 파이프라인 품질 그룹에서 제외한다.
+    """
+    daily_stages = {k: v for k, v in stage_files.items() if k != "resume_trader"}
+    core = {s for s in _CORE_MANUAL_STAGES if s in daily_stages}
+    if not core:
+        return [], None, "incomplete"
+
+    files: List[Path] = []
+    for stage in _MANUAL_STAGE_ORDER:
+        if stage == "resume_trader":
+            continue
+        if stage in daily_stages:
+            files.append(daily_stages[stage])
+
+    core_ts = [
+        _extract_log_run_ts(daily_stages[s], date_str) or ""
+        for s in core
+    ]
+    group_ts = max(core_ts) if core_ts else None
+    group_id = f"{date_str}-daily-{group_ts}" if group_ts else f"{date_str}-daily"
+    logger.info(
+        "[PERF_LOG_GROUP_CANDIDATE] date=%s group_id=%s files=%s",
+        date_str, group_id, ",".join(f.name for f in files),
+    )
+    for p in files:
+        st = _classify_manual_log_stage(p.name, date_str)
+        if st:
+            logger.info("[PERF_LOG_GROUP_STAGE] stage=%s file=%s", st, p.name)
+    return files, group_ts, "split_manual_pipeline_logs"
+
+
+def _build_latest_execution_group(
+    date_str: str,
+    stage_files: Dict[str, Path],
+) -> Tuple[List[Path], Optional[str], str]:
+    """
+    가장 최근 실행 단위 로그 묶음 (resume_trader 우선).
     """
     primary_present = {s for s in _PRIMARY_MANUAL_STAGES if s in stage_files}
     if not primary_present:
         return [], None, "incomplete"
 
-    # resume_trader 단독/최신 run
     if "resume_trader" in stage_files:
         rt_ts = _extract_log_run_ts(stage_files["resume_trader"], date_str) or ""
         other_ts = [
@@ -482,21 +517,13 @@ def _build_split_pipeline_group(
     if not core:
         return [], None, "incomplete"
 
-    files: List[Path] = []
+    files = []
     for stage in _MANUAL_STAGE_ORDER:
-        if stage in stage_files:
+        if stage in stage_files and stage != "resume_trader":
             files.append(stage_files[stage])
-            logger.info(
-                "[PERF_LOG_GROUP_STAGE] stage=%s file=%s",
-                stage, stage_files[stage].name,
-            )
-
-    core_ts = [
-        _extract_log_run_ts(stage_files[s], date_str) or ""
-        for s in core
-    ]
+    core_ts = [_extract_log_run_ts(stage_files[s], date_str) or "" for s in core]
     group_ts = max(core_ts) if core_ts else None
-    group_id = f"{date_str}-split-{group_ts}" if group_ts else f"{date_str}-split"
+    group_id = f"{date_str}-exec-{group_ts}" if group_ts else f"{date_str}-exec"
     logger.info(
         "[PERF_LOG_GROUP_CANDIDATE] date=%s group_id=%s files=%s",
         date_str, group_id, ",".join(f.name for f in files),
@@ -504,12 +531,22 @@ def _build_split_pipeline_group(
     return files, group_ts, "split_manual_pipeline_logs"
 
 
-def _resolve_latest_pipeline_log(
+def _path_in_set(path: Path, paths: Optional[List[Path]]) -> bool:
+    if not paths:
+        return False
+    try:
+        resolved = path.resolve()
+        return any(resolved == p.resolve() for p in paths)
+    except Exception:
+        return any(str(path) == str(p) for p in paths)
+
+
+def _resolve_pipeline_log_groups(
     date_str: str,
     log_files: List[Path],
     run_id: str,
-) -> Tuple[List[Path], Optional[str], str]:
-    """latest pipeline 로그 파일 목록·타임스탬프·탐지 방식 반환."""
+) -> Dict[str, Any]:
+    """latest_execution_run + daily_pipeline_group 동시 탐지."""
     all_logs = list(log_files) + _discover_date_logs(date_str)
     seen: set = set()
     unique_logs: List[Path] = []
@@ -520,13 +557,21 @@ def _resolve_latest_pipeline_log(
         seen.add(key)
         unique_logs.append(p)
 
-    # pipeline_state run_id 우선
+    # pipeline_state run_id → latest execution 단일 파일
     if run_id:
         rid_us = run_id.replace("-", "_")
         for path in unique_logs:
             if run_id in path.name or rid_us in path.name:
                 run_ts = _extract_log_run_ts(path, date_str) or run_id
-                return [path], run_ts, "pipeline_state_run_id"
+                exec_files = [path]
+                stage_files = _collect_manual_stage_logs(date_str, unique_logs)
+                daily_files, daily_ts, daily_method = _build_daily_pipeline_group(
+                    date_str, stage_files,
+                )
+                return _pack_pipeline_groups(
+                    date_str, run_id, exec_files, run_ts, "pipeline_state_run_id",
+                    daily_files, daily_ts, daily_method,
+                )
         for path in unique_logs:
             try:
                 head = path.read_text(encoding="utf-8", errors="ignore")[:100000]
@@ -534,10 +579,19 @@ def _resolve_latest_pipeline_log(
                 continue
             if f"[{run_id}]" in head:
                 run_ts = _extract_log_run_ts(path, date_str) or run_id
-                return [path], run_ts, "pipeline_state_run_id"
+                exec_files = [path]
+                stage_files = _collect_manual_stage_logs(date_str, unique_logs)
+                daily_files, daily_ts, daily_method = _build_daily_pipeline_group(
+                    date_str, stage_files,
+                )
+                return _pack_pipeline_groups(
+                    date_str, run_id, exec_files, run_ts, "pipeline_state_run_id",
+                    daily_files, daily_ts, daily_method,
+                )
 
     stage_files = _collect_manual_stage_logs(date_str, unique_logs)
-    split_files, split_ts, split_method = _build_split_pipeline_group(date_str, stage_files)
+    daily_files, daily_ts, daily_method = _build_daily_pipeline_group(date_str, stage_files)
+    exec_files, exec_ts, exec_method = _build_latest_execution_group(date_str, stage_files)
 
     best_full: Optional[Tuple[str, Path]] = None
     for p in unique_logs:
@@ -547,53 +601,114 @@ def _resolve_latest_pipeline_log(
         if run_ts and (best_full is None or run_ts > best_full[0]):
             best_full = (run_ts, p)
 
-    selected_files: List[Path] = []
-    selected_ts: Optional[str] = None
-    selected_method = "fallback_historical"
-
-    if split_files and best_full:
-        if split_ts and split_ts > best_full[0]:
-            selected_files, selected_ts, selected_method = split_files, split_ts, split_method
-        else:
-            selected_files, selected_ts, selected_method = [best_full[1]], best_full[0], "full_pipeline_log"
-    elif split_files:
-        selected_files, selected_ts, selected_method = split_files, split_ts, split_method
-    elif best_full:
-        selected_files, selected_ts, selected_method = [best_full[1]], best_full[0], "full_pipeline_log"
-    else:
-        candidates: List[Path] = []
-        for p in unique_logs:
-            if _is_pipeline_log_candidate(p, date_str):
-                candidates.append(p)
-        ts_pairs: List[Tuple[str, Path]] = []
-        for path in candidates:
-            run_ts = _extract_log_run_ts(path, date_str)
-            if run_ts:
-                ts_pairs.append((run_ts, path))
+    if exec_files and best_full:
+        if best_full[0] > (exec_ts or ""):
+            exec_files, exec_ts, exec_method = [best_full[1]], best_full[0], "full_pipeline_log"
+    elif not exec_files and best_full:
+        exec_files, exec_ts, exec_method = [best_full[1]], best_full[0], "full_pipeline_log"
+    elif not exec_files:
+        candidates = [p for p in unique_logs if _is_pipeline_log_candidate(p, date_str)]
+        ts_pairs = [
+            (_extract_log_run_ts(p, date_str), p)
+            for p in candidates
+            if _extract_log_run_ts(p, date_str)
+        ]
         if ts_pairs:
             ts_pairs.sort(key=lambda x: x[0], reverse=True)
-            selected_ts, path = ts_pairs[0]
-            selected_files = [path]
-            selected_method = "filename_timestamp"
+            exec_ts, path = ts_pairs[0]
+            exec_files, exec_method = [path], "filename_timestamp"
         elif candidates:
-            latest = max(candidates, key=lambda p: p.stat().st_mtime)
-            selected_files = [latest]
-            selected_ts = _extract_log_run_ts(latest, date_str)
-            selected_method = "fallback_historical"
+            path = max(candidates, key=lambda p: p.stat().st_mtime)
+            exec_files = [path]
+            exec_ts = _extract_log_run_ts(path, date_str)
+            exec_method = "fallback_historical"
 
-    if selected_files:
+    if not daily_files and exec_files and exec_method == "full_pipeline_log":
+        daily_files, daily_ts, daily_method = exec_files, exec_ts, "full_pipeline_log"
+
+    return _pack_pipeline_groups(
+        date_str, run_id, exec_files, exec_ts, exec_method,
+        daily_files, daily_ts, daily_method,
+    )
+
+
+def _runtime_from_log_files(paths: List[Path]) -> Tuple[Optional[float], Dict[str, float]]:
+    """로그 파일 묶음에서 runtime 집계."""
+    text = ""
+    for p in paths:
+        try:
+            text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
+        except Exception:
+            pass
+    if not text:
+        return None, {}
+    parsed = _parse_system_from_logs(text)
+    stage_keys = (
+        "screener_runtime_sec",
+        "news_collector_runtime_sec",
+        "gpt_analyzer_runtime_sec",
+        "trader_runtime_sec",
+        "order_reconciler_runtime_sec",
+    )
+    stages = {k: float(parsed[k]) for k in stage_keys if k in parsed}
+    total = parsed.get("total_runtime_sec")
+    if total is None and stages:
+        total = round(sum(stages.values()), 2)
+    return (float(total) if total is not None else None), stages
+
+
+def _pack_pipeline_groups(
+    date_str: str,
+    run_id: str,
+    exec_files: List[Path],
+    exec_ts: Optional[str],
+    exec_method: str,
+    daily_files: List[Path],
+    daily_ts: Optional[str],
+    daily_method: str,
+) -> Dict[str, Any]:
+    if exec_files:
         logger.info(
             "[PERF_LOG_GROUP_SELECTED] method=%s files=%s",
-            selected_method,
-            ",".join(f.name for f in selected_files),
+            exec_method, ",".join(f.name for f in exec_files),
         )
+    if daily_files and daily_files != exec_files:
         logger.info(
-            "[PERF_LOG_DETECT] method=%s files=%s",
-            selected_method,
-            ",".join(f.name for f in selected_files),
+            "[PERF_LOG_GROUP_SELECTED] method=%s files=%s",
+            daily_method, ",".join(f.name for f in daily_files),
         )
+    exec_runtime, _ = _runtime_from_log_files(exec_files)
+    daily_runtime, daily_stages = _runtime_from_log_files(daily_files)
+    return {
+        "latest_execution_run_ts": exec_ts,
+        "latest_execution_detect_method": exec_method if exec_files else "incomplete",
+        "latest_execution_log_files": [p.name for p in exec_files],
+        "latest_execution_runtime_sec": exec_runtime,
+        "daily_pipeline_run_ts": daily_ts,
+        "daily_pipeline_detect_method": daily_method if daily_files else "incomplete",
+        "daily_pipeline_log_files": [p.name for p in daily_files],
+        "daily_pipeline_runtime_sec": daily_runtime,
+        "daily_pipeline_stage_runtime_sec": daily_stages,
+        "latest_pipeline_run_id": run_id or None,
+        "_latest_execution_paths": exec_files,
+        "_daily_pipeline_paths": daily_files,
+    }
 
-    return selected_files, selected_ts, selected_method
+
+def _resolve_latest_pipeline_log(
+    date_str: str,
+    log_files: List[Path],
+    run_id: str,
+) -> Tuple[List[Path], Optional[str], str]:
+    """하위 호환: latest_execution_run 기준."""
+    groups = _resolve_pipeline_log_groups(date_str, log_files, run_id)
+    paths = groups.pop("_latest_execution_paths", []) or []
+    groups.pop("_daily_pipeline_paths", None)
+    return (
+        paths,
+        groups.get("latest_execution_run_ts"),
+        groups.get("latest_execution_detect_method", "fallback_historical"),
+    )
 
 
 def _nearest_run_id(lines: List[str], idx: int, lookback: int = 80) -> Optional[str]:
@@ -608,9 +723,11 @@ def _resolve_log_scope(
     line: str,
     lines: List[str],
     idx: int,
-    effective_run_ids: set,
+    execution_run_ids: set,
+    daily_run_ids: set,
     path: Path,
-    latest_pipeline_paths: Optional[List[Path]] = None,
+    latest_execution_paths: Optional[List[Path]] = None,
+    daily_pipeline_paths: Optional[List[Path]] = None,
 ) -> Tuple[str, str]:
     """로그 라인 scope/severity 분류."""
     low_path = str(path).lower()
@@ -619,21 +736,21 @@ def _resolve_log_scope(
     if "performance_review.py" in line:
         return "current_run", "current_warning"
 
-    if latest_pipeline_paths:
-        try:
-            resolved = {p.resolve() for p in latest_pipeline_paths}
-            if path.resolve() in resolved:
-                return "latest_pipeline", "current_warning"
-        except Exception:
-            if any(str(path) == str(p) for p in latest_pipeline_paths):
-                return "latest_pipeline", "current_warning"
+    in_execution = _path_in_set(path, latest_execution_paths)
+    in_daily = _path_in_set(path, daily_pipeline_paths)
 
     ctx_run = _nearest_run_id(lines, idx)
-    if effective_run_ids:
-        if ctx_run in effective_run_ids:
-            return "latest_pipeline", "current_warning"
-        if any(f"[{rid}]" in line for rid in effective_run_ids):
-            return "latest_pipeline", "current_warning"
+    if not in_execution and execution_run_ids:
+        if ctx_run in execution_run_ids or any(f"[{rid}]" in line for rid in execution_run_ids):
+            in_execution = True
+    if not in_daily and daily_run_ids:
+        if ctx_run in daily_run_ids or any(f"[{rid}]" in line for rid in daily_run_ids):
+            in_daily = True
+
+    if in_execution:
+        return "latest_execution", "current_warning"
+    if in_daily:
+        return "daily_pipeline", "current_warning"
     return "historical_log", "historical_warning"
 
 
@@ -641,14 +758,20 @@ def _empty_scoped_counts() -> Dict[str, int]:
     return {
         "current_run_egw00201_count": 0,
         "current_pipeline_egw00201_count": 0,
+        "latest_execution_egw00201_count": 0,
+        "daily_pipeline_egw00201_count": 0,
         "latest_pipeline_egw00201_count": 0,
         "all_related_logs_egw00201_count": 0,
         "historical_egw00201_count": 0,
         "current_run_error_count": 0,
+        "latest_execution_error_count": 0,
+        "daily_pipeline_error_count": 0,
         "latest_pipeline_error_count": 0,
         "historical_error_count": 0,
         "all_related_logs_error_count": 0,
         "current_run_traceback_count": 0,
+        "latest_execution_traceback_count": 0,
+        "daily_pipeline_traceback_count": 0,
         "latest_pipeline_traceback_count": 0,
         "historical_traceback_count": 0,
         "traceback_count": 0,
@@ -663,18 +786,31 @@ def _parse_scoped_log_events(
     """EGW00201/ERROR/Traceback를 scope별로 집계."""
     state = _load_pipeline_state(date_str)
     latest_run_id = str(state.get("run_id") or "")
-    latest_pipeline_paths, latest_pipeline_run_ts, detect_method = _resolve_latest_pipeline_log(
-        date_str, log_files, latest_run_id,
-    )
-    effective_run_ids: set = set()
+    groups = _resolve_pipeline_log_groups(date_str, log_files, latest_run_id)
+
+    latest_execution_paths: List[Path] = groups.pop("_latest_execution_paths", []) or []
+    daily_pipeline_paths: List[Path] = groups.pop("_daily_pipeline_paths", []) or []
+
+    execution_run_ids: set = set()
+    daily_run_ids: set = set()
     if latest_run_id:
-        effective_run_ids.add(latest_run_id)
-    if latest_pipeline_run_ts:
-        effective_run_ids.add(latest_pipeline_run_ts)
-    for path in latest_pipeline_paths:
+        execution_run_ids.add(latest_run_id)
+    exec_ts = groups.get("latest_execution_run_ts")
+    if exec_ts:
+        execution_run_ids.add(exec_ts)
+    for path in latest_execution_paths:
         run_ts = _extract_log_run_ts(path, date_str)
         if run_ts:
-            effective_run_ids.add(run_ts)
+            execution_run_ids.add(run_ts)
+
+    daily_ts = groups.get("daily_pipeline_run_ts")
+    if daily_ts:
+        daily_run_ids.add(daily_ts)
+    for path in daily_pipeline_paths:
+        run_ts = _extract_log_run_ts(path, date_str)
+        if run_ts:
+            daily_run_ids.add(run_ts)
+
     counts = _empty_scoped_counts()
     details: List[Dict[str, Any]] = []
 
@@ -697,16 +833,20 @@ def _parse_scoped_log_events(
             continue
         for i, line in enumerate(lines):
             scope, severity = _resolve_log_scope(
-                line, lines, i, effective_run_ids, path, latest_pipeline_paths,
+                line, lines, i,
+                execution_run_ids, daily_run_ids, path,
+                latest_execution_paths, daily_pipeline_paths,
             )
 
             if "EGW00201" in line:
                 counts["all_related_logs_egw00201_count"] += 1
                 if scope == "current_run":
                     counts["current_run_egw00201_count"] += 1
-                elif scope == "latest_pipeline":
-                    counts["current_pipeline_egw00201_count"] += 1
+                elif scope == "latest_execution":
+                    counts["latest_execution_egw00201_count"] += 1
                     counts["latest_pipeline_egw00201_count"] += 1
+                elif scope == "daily_pipeline":
+                    counts["daily_pipeline_egw00201_count"] += 1
                 else:
                     counts["historical_egw00201_count"] += 1
                 details.append({
@@ -722,8 +862,11 @@ def _parse_scoped_log_events(
                 counts["all_related_logs_error_count"] += 1
                 if scope == "current_run":
                     counts["current_run_error_count"] += 1
-                elif scope == "latest_pipeline":
+                elif scope == "latest_execution":
+                    counts["latest_execution_error_count"] += 1
                     counts["latest_pipeline_error_count"] += 1
+                elif scope == "daily_pipeline":
+                    counts["daily_pipeline_error_count"] += 1
                 else:
                     counts["historical_error_count"] += 1
                 details.append({
@@ -742,8 +885,11 @@ def _parse_scoped_log_events(
                     sample = f"{line} | next: {lines[i + 1][:120]}"
                 if scope == "current_run":
                     counts["current_run_traceback_count"] += 1
-                elif scope == "latest_pipeline":
+                elif scope == "latest_execution":
+                    counts["latest_execution_traceback_count"] += 1
                     counts["latest_pipeline_traceback_count"] += 1
+                elif scope == "daily_pipeline":
+                    counts["daily_pipeline_traceback_count"] += 1
                 else:
                     counts["historical_traceback_count"] += 1
                 details.append({
@@ -756,19 +902,21 @@ def _parse_scoped_log_events(
                 })
 
     counts["performance_review_traceback"] = counts["current_run_traceback_count"]
-    latest_pipeline_log_files = [p.name for p in latest_pipeline_paths]
+    counts["current_pipeline_egw00201_count"] = counts["latest_execution_egw00201_count"]
+
+    latest_pipeline_log_files = groups.get("latest_execution_log_files") or []
     latest_pipeline_log_file = latest_pipeline_log_files[0] if latest_pipeline_log_files else None
     result: Dict[str, Any] = {
         **counts,
-        "latest_pipeline_run_id": latest_run_id or None,
+        **groups,
         "latest_pipeline_log_file": latest_pipeline_log_file,
         "latest_pipeline_log_files": latest_pipeline_log_files,
-        "latest_pipeline_run_ts": latest_pipeline_run_ts,
-        "latest_pipeline_detect_method": detect_method,
-        # 하위 호환: Summary/기존 필드는 최신 파이프라인 기준
-        "egw00201_count": counts["latest_pipeline_egw00201_count"],
-        "kis_rate_limit_count": counts["latest_pipeline_egw00201_count"],
-        "error_count": counts["latest_pipeline_error_count"],
+        "latest_pipeline_run_ts": groups.get("latest_execution_run_ts"),
+        "latest_pipeline_detect_method": groups.get("latest_execution_detect_method"),
+        # 하위 호환: latest_pipeline_* = latest_execution_*
+        "egw00201_count": counts["latest_execution_egw00201_count"],
+        "kis_rate_limit_count": counts["latest_execution_egw00201_count"],
+        "error_count": counts["latest_execution_error_count"],
     }
     return result, details
 
@@ -1467,13 +1615,16 @@ def _build_system_performance(
         except Exception:
             pass
     logger.info(
-        "[PERF_SYSTEM] current_run_errors=%s latest_pipeline_egw00201=%s "
-        "historical_egw00201=%s performance_review_traceback=%s latest_pipeline_log=%s",
+        "[PERF_SYSTEM] current_run_errors=%s latest_execution_egw00201=%s "
+        "daily_pipeline_egw00201=%s historical_egw00201=%s "
+        "performance_review_traceback=%s latest_execution_log=%s daily_pipeline_log=%s",
         perf.get("current_run_error_count", 0),
-        perf.get("latest_pipeline_egw00201_count", 0),
+        perf.get("latest_execution_egw00201_count", 0),
+        perf.get("daily_pipeline_egw00201_count", 0),
         perf.get("historical_egw00201_count", 0),
         perf.get("performance_review_traceback", 0),
-        perf.get("latest_pipeline_log_files") or perf.get("latest_pipeline_log_file"),
+        perf.get("latest_execution_log_files") or perf.get("latest_pipeline_log_files"),
+        perf.get("daily_pipeline_log_files"),
     )
     return perf
 
@@ -1695,8 +1846,11 @@ def _build_warnings(
     perf_tb = system.get("performance_review_traceback", 0)
     current.append(f"performance_review_traceback={perf_tb}")
 
-    lp_egw = system.get("latest_pipeline_egw00201_count", 0)
-    current.append(f"최신 파이프라인 EGW00201: {lp_egw}회")
+    lp_egw = system.get("latest_execution_egw00201_count", system.get("latest_pipeline_egw00201_count", 0))
+    current.append(f"최신 실행 EGW00201: {lp_egw}회")
+
+    daily_egw = system.get("daily_pipeline_egw00201_count", 0)
+    current.append(f"당일 파이프라인 EGW00201: {daily_egw}회")
 
     hist_tb = system.get("historical_traceback_count", 0)
     if hist_tb == 0 and warnings_detail:
@@ -1864,9 +2018,12 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- 총평가금액: {summary.get('tot_evlu_amt', 0):,}원",
         f"- D+2 출금가능금액: {summary.get('prvs_rcdl_excc_amt', 0):,}원",
     ]
-    lp_egw = system.get("latest_pipeline_egw00201_count", system.get("egw00201_count", 0))
+    lp_egw = system.get("latest_execution_egw00201_count", system.get("latest_pipeline_egw00201_count", system.get("egw00201_count", 0)))
     if lp_egw > 0:
-        lines.append(f"- EGW00201 rate limit: {lp_egw}회 발생 (최신 파이프라인)")
+        lines.append(f"- EGW00201 rate limit: {lp_egw}회 발생 (최신 실행)")
+    daily_egw = system.get("daily_pipeline_egw00201_count", 0)
+    if daily_egw > 0:
+        lines.append(f"- EGW00201 rate limit: {daily_egw}회 발생 (당일 파이프라인)")
     lines.extend([
         "",
         "## 2. Screener Funnel",
@@ -1972,14 +2129,43 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         "## 8. System Performance",
         "",
+        "### Latest Execution Run",
+        "",
+        f"- Method: {system.get('latest_execution_detect_method', system.get('latest_pipeline_detect_method', '-'))}",
+        f"- Files: {', '.join(system.get('latest_execution_log_files') or system.get('latest_pipeline_log_files') or []) or '-'}",
+        f"- EGW00201: {system.get('latest_execution_egw00201_count', system.get('latest_pipeline_egw00201_count', 0))}",
+        f"- Traceback: {system.get('latest_execution_traceback_count', system.get('latest_pipeline_traceback_count', 0))}",
+        f"- Error: {system.get('latest_execution_error_count', system.get('latest_pipeline_error_count', 0))}",
+        f"- Runtime: {system.get('latest_execution_runtime_sec', '-')}s",
+        "",
+        "### Daily Pipeline Group",
+        "",
+        f"- Method: {system.get('daily_pipeline_detect_method', '-')}",
+        "- Files:",
+    ])
+    daily_files = system.get("daily_pipeline_log_files") or []
+    if daily_files:
+        for fname in daily_files:
+            lines.append(f"  - {fname}")
+    else:
+        lines.append("  - -")
+    lines.extend([
+        f"- EGW00201: {system.get('daily_pipeline_egw00201_count', 0)}",
+        f"- Traceback: {system.get('daily_pipeline_traceback_count', 0)}",
+        f"- Error: {system.get('daily_pipeline_error_count', 0)}",
+        f"- Runtime: {system.get('daily_pipeline_runtime_sec', '-')}s",
+        "",
         "| Stage | Runtime (s) |",
         "|-------|------------:|",
-        f"| Total | {system.get('total_runtime_sec', '-')} |",
-        f"| Screener | {system.get('screener_runtime_sec', '-')} |",
-        f"| News | {system.get('news_collector_runtime_sec', '-')} |",
-        f"| GPT | {system.get('gpt_analyzer_runtime_sec', '-')} |",
-        f"| Trader | {system.get('trader_runtime_sec', '-')} |",
-        f"| Reconciler | {system.get('order_reconciler_runtime_sec', '-')} |",
+    ])
+    daily_stages = system.get("daily_pipeline_stage_runtime_sec") or {}
+    lines.append(f"| Total | {system.get('daily_pipeline_runtime_sec', system.get('total_runtime_sec', '-'))} |")
+    lines.append(f"| Screener | {daily_stages.get('screener_runtime_sec', system.get('screener_runtime_sec', '-'))} |")
+    lines.append(f"| News | {daily_stages.get('news_collector_runtime_sec', system.get('news_collector_runtime_sec', '-'))} |")
+    lines.append(f"| GPT | {daily_stages.get('gpt_analyzer_runtime_sec', system.get('gpt_analyzer_runtime_sec', '-'))} |")
+    lines.append(f"| Trader | {daily_stages.get('trader_runtime_sec', system.get('trader_runtime_sec', '-'))} |")
+    lines.append(f"| Reconciler | {daily_stages.get('order_reconciler_runtime_sec', system.get('order_reconciler_runtime_sec', '-'))} |")
+    lines.extend([
         "",
         "## 9. Warnings",
         "",
@@ -2023,20 +2209,34 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     scoped_counts, warnings_detail = _parse_scoped_log_events(date_str, log_files)
 
     latest_pipeline_paths: List[Path] = []
-    for name in scoped_counts.get("latest_pipeline_log_files") or []:
+    daily_pipeline_paths: List[Path] = []
+    seen_log_paths: set = set()
+    for name in (scoped_counts.get("daily_pipeline_log_files") or []):
         for base in (OUTPUT_DIR, OUTPUT_DIR / "debug"):
             p = base / name
             if p.is_file():
-                latest_pipeline_paths.append(p)
+                key = str(p.resolve())
+                if key not in seen_log_paths:
+                    seen_log_paths.add(key)
+                    daily_pipeline_paths.append(p)
+                break
+    for name in (scoped_counts.get("latest_execution_log_files")
+                 or scoped_counts.get("latest_pipeline_log_files") or []):
+        for base in (OUTPUT_DIR, OUTPUT_DIR / "debug"):
+            p = base / name
+            if p.is_file():
+                key = str(p.resolve())
+                if key not in seen_log_paths:
+                    seen_log_paths.add(key)
+                    latest_pipeline_paths.append(p)
                 break
 
     log_text = ""
-    if latest_pipeline_paths:
-        for p in latest_pipeline_paths:
-            try:
-                log_text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
-            except Exception:
-                pass
+    for p in daily_pipeline_paths + latest_pipeline_paths:
+        try:
+            log_text += p.read_text(encoding="utf-8", errors="ignore") + "\n"
+        except Exception:
+            pass
     if not log_text:
         for p in log_files[:5]:
             try:
@@ -2049,7 +2249,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     rank_map, score_map = _build_screener_maps(candidates, scores)
     screener_funnel = _build_screener_funnel(
         date_str, market, candidates, scores, gpt_plans, kis_trade_rows, log_text,
-        latest_pipeline_paths=latest_pipeline_paths,
+        latest_pipeline_paths=daily_pipeline_paths or latest_pipeline_paths,
     )
     gpt_decision = _build_gpt_decision(gpt_plans, rank_map, score_map, kis_trade_rows, reconcile_map)
     budget_usage = _build_budget_usage(
@@ -2296,14 +2496,14 @@ def _smoke_test_accuracy_fixes() -> None:
         assert scoped["historical_error_count"] == 1
         assert scoped["current_run_error_count"] == 0
         assert scoped["performance_review_traceback"] == 0
-        latest_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "latest_pipeline"]
+        latest_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "latest_execution"]
         hist_details = [d for d in details if d.get("type") == "egw00201" and d.get("scope") == "historical_log"]
         assert len(latest_details) == 6
         assert len(hist_details) == 2
         assert sum(1 for d in latest_details if "manual_full_pipeline_after_fix" in d["source_file"]) == 4
         assert sum(1 for d in latest_details if "integrated_manager.log" in d["source_file"]) == 2
 
-    # 20260630 분할 수동 파이프라인 — 날짜·스테이지별 그룹핑
+    # 20260630 분할 수동 파이프라인 — daily group + resume_trader execution
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         old_output = OUTPUT_DIR
@@ -2330,21 +2530,27 @@ def _smoke_test_accuracy_fixes() -> None:
             "[20260630-093332] - ERROR - old full pipeline\n",
             encoding="utf-8",
         )
+        resume = tmp / "manual_resume_trader_20260630_20260630_103151.log"
+        resume.write_text("resume trader step\n", encoding="utf-8")
 
         orig_loader = _load_pipeline_state
         globals()["_load_pipeline_state"] = lambda _d: {"run_id": ""}
         scoped3, _ = _parse_scoped_log_events(
             "20260630",
-            [screener, reconcile, old_full],
+            [screener, reconcile, old_full, resume],
         )
         globals()["_load_pipeline_state"] = orig_loader
 
-        files = scoped3.get("latest_pipeline_log_files") or []
-        assert scoped3["latest_pipeline_detect_method"] == "split_manual_pipeline_logs"
-        assert "manual_screener_20260630_094652.log" in files
-        assert "manual_order_reconcile_pending_sell_20260630_101600.log" in files
-        assert "manual_full_pipeline_20260630_093332.log" not in files
-        assert scoped3["latest_pipeline_egw00201_count"] == 3
+        assert scoped3["latest_execution_detect_method"] == "resume_trader_run"
+        assert "manual_resume_trader_20260630_20260630_103151.log" in (
+            scoped3.get("latest_execution_log_files") or []
+        )
+        assert scoped3["latest_execution_egw00201_count"] == 0
+        assert scoped3["daily_pipeline_detect_method"] == "split_manual_pipeline_logs"
+        daily_files = scoped3.get("daily_pipeline_log_files") or []
+        assert "manual_screener_20260630_094652.log" in daily_files
+        assert "manual_news_collector_20260630_100735.log" in daily_files
+        assert scoped3["daily_pipeline_egw00201_count"] == 3
         assert scoped3["historical_egw00201_count"] == 1
 
         funnel_log, _ = _resolve_screener_funnel_log_text("20260630", [screener])
@@ -2352,13 +2558,10 @@ def _smoke_test_accuracy_fixes() -> None:
         assert parsed["marcap_pass_count"] == 131
         assert parsed["amount5d_pass_count"] == 104
 
-        # reconcile 단독은 latest group이 되지 않음
         reconcile_only = tmp / "manual_order_reconcile_pending_sell_20260630_120000.log"
         reconcile_only.write_text("solo reconcile\n", encoding="utf-8")
-        paths, _, method = _resolve_latest_pipeline_log("20260630", [reconcile_only], "")
-        assert method != "split_manual_pipeline_logs" or any(
-            "screener" in f.name for f in paths
-        )
+        groups = _resolve_pipeline_log_groups("20260630", [reconcile_only], "")
+        assert groups.get("daily_pipeline_detect_method") == "incomplete" or not groups.get("daily_pipeline_log_files")
 
         globals()["OUTPUT_DIR"] = old_output
 
