@@ -2190,24 +2190,12 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "|-------|------------:|",
     ])
     daily_stages = system.get("daily_pipeline_stage_runtime_sec") or {}
-    lines.append(
-        f"| Total | {_fmt_runtime_cell(_coalesce_runtime(system.get('daily_pipeline_runtime_sec'), system.get('total_runtime_sec')))} |"
-    )
-    lines.append(
-        f"| Screener | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('screener_runtime_sec'), system.get('screener_runtime_sec')))} |"
-    )
-    lines.append(
-        f"| News | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('news_collector_runtime_sec'), system.get('news_collector_runtime_sec')))} |"
-    )
-    lines.append(
-        f"| GPT | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('gpt_analyzer_runtime_sec'), system.get('gpt_analyzer_runtime_sec')))} |"
-    )
-    lines.append(
-        f"| Trader | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('trader_runtime_sec'), system.get('trader_runtime_sec')))} |"
-    )
-    lines.append(
-        f"| Reconciler | {_fmt_runtime_cell(_coalesce_runtime(daily_stages.get('order_reconciler_runtime_sec'), system.get('order_reconciler_runtime_sec')))} |"
-    )
+    lines.append(f"| Total | {_fmt_runtime_cell(system.get('daily_pipeline_runtime_sec'))} |")
+    lines.append(f"| Screener | {_fmt_runtime_cell(daily_stages.get('screener_runtime_sec'))} |")
+    lines.append(f"| News | {_fmt_runtime_cell(daily_stages.get('news_collector_runtime_sec'))} |")
+    lines.append(f"| GPT | {_fmt_runtime_cell(daily_stages.get('gpt_analyzer_runtime_sec'))} |")
+    lines.append(f"| Trader | {_fmt_runtime_cell(daily_stages.get('trader_runtime_sec'))} |")
+    lines.append(f"| Reconciler | {_fmt_runtime_cell(daily_stages.get('order_reconciler_runtime_sec'))} |")
     lines.extend([
         "",
         "## 9. Warnings",
