@@ -170,8 +170,54 @@ SLOTS = os.getenv("SLOTS", "3")
 MAX_ATTEMPTS = int(os.getenv("SCHED_MAX_ATTEMPTS", "3"))
 INITIAL_BACKOFF_MINUTES = int(os.getenv("SCHED_INITIAL_BACKOFF_MINUTES", "2"))
 SCRIPT_TIMEOUT_SEC = int(os.getenv("SCRIPT_TIMEOUT_SEC", "600"))
-SCREENER_TIMEOUT_SEC = int(os.getenv("SCREENER_TIMEOUT_SEC", "1200"))
 SLOW_STEP_SEC = int(os.getenv("SLOW_STEP_SEC", "90"))
+
+DEFAULT_STAGE_TIMEOUT_SEC: Dict[str, int] = {
+    "screener": 3600,
+    "news": 600,
+    "gpt": 900,
+    "trader": 900,
+    "reconciler": 300,
+    "performance": 300,
+}
+
+
+def _load_stage_timeouts() -> Dict[str, int]:
+    """config.json stage_timeout_sec + 환경변수 오버라이드."""
+    timeouts = dict(DEFAULT_STAGE_TIMEOUT_SEC)
+    try:
+        cfg = getattr(settings, "_config", {}) or {}
+        overrides = cfg.get("stage_timeout_sec") or {}
+        if isinstance(overrides, dict):
+            for stage, sec in overrides.items():
+                if stage in timeouts and sec is not None:
+                    timeouts[stage] = int(sec)
+    except Exception as e:
+        logger.warning("stage_timeout_sec 로드 실패, 기본값 사용: %s", e)
+    if os.getenv("SCREENER_TIMEOUT_SEC"):
+        timeouts["screener"] = int(os.getenv("SCREENER_TIMEOUT_SEC", str(timeouts["screener"])))
+    script_env = os.getenv("SCRIPT_TIMEOUT_SEC")
+    if script_env:
+        script_sec = int(script_env)
+        for stage in ("news", "gpt", "trader", "performance"):
+            timeouts[stage] = script_sec
+    return timeouts
+
+
+_STAGE_TIMEOUTS = _load_stage_timeouts()
+SCREENER_TIMEOUT_SEC = _STAGE_TIMEOUTS["screener"]
+
+
+def get_stage_timeout(stage: str) -> int:
+    return int(_STAGE_TIMEOUTS.get(stage, SCRIPT_TIMEOUT_SEC))
+
+
+def _script_stage(script_name: str) -> Optional[str]:
+    mapping = {
+        "screener.py": "screener",
+        "trader.py": "trader",
+    }
+    return mapping.get(script_name)
 
 # 파이프라인 단계 순서 (수동 재개·일일 실행 공통)
 PIPELINE_STAGE_ORDER = [
@@ -767,6 +813,46 @@ def _pipeline_artifact_path(pattern: str, date_str: str, market: str) -> Path:
     return OUTPUT_DIR / pattern.format(date=date_str, market=market)
 
 
+def _log_screener_timeout_diagnostics(
+    date_str: str,
+    market: str,
+    elapsed_sec: float,
+    timeout_sec: int,
+) -> None:
+    """screener timeout 시 partial output 존재 여부 및 재개 힌트."""
+    logger.error(
+        "[PIPELINE_STAGE_TIMEOUT] stage=screener timeout_sec=%s elapsed_sec=%.1f",
+        timeout_sec, elapsed_sec,
+    )
+    partial_patterns = [
+        "market_state_{date}_{market}.json",
+        "screener_candidates_{date}_{market}.json",
+        "screener_candidates_full_{date}_{market}.json",
+        "screener_scores_{date}_{market}.json",
+    ]
+    candidates_path = _pipeline_artifact_path(
+        "screener_candidates_{date}_{market}.json", date_str, market,
+    )
+    for pattern in partial_patterns:
+        path = _pipeline_artifact_path(pattern, date_str, market)
+        exists = path.is_file()
+        logger.error(
+            "[PIPELINE_PARTIAL_OUTPUT_CHECK] file=%s exists=%s",
+            path, str(exists).lower(),
+        )
+    candidates_exists = candidates_path.is_file()
+    if candidates_exists:
+        logger.error(
+            "[PIPELINE_RESUME_HINT] next_stage=news date=%s market=%s use_existing_files=true",
+            date_str, market,
+        )
+    else:
+        logger.error(
+            "[PIPELINE_RESUME_HINT] next_stage=screener date=%s market=%s use_existing_files=false",
+            date_str, market,
+        )
+
+
 def _check_stage_inputs(stage: str, date_str: str, market: str) -> Tuple[bool, List[Path]]:
     """단계 필수 입력 파일 존재 확인."""
     required = PIPELINE_STAGE_INPUTS.get(stage, [])
@@ -790,8 +876,10 @@ def _run_pipeline_stage(
     t0 = time.perf_counter()
     ok = False
 
+    timeout_sec = get_stage_timeout(stage)
+
     if stage == "screener":
-        ok, _, _ = run_script("screener.py", run_id)
+        ok, _, _ = run_script("screener.py", run_id, stage=stage, date_str=date_str, market=market)
     elif stage == "news":
         candidates = _pipeline_artifact_path(
             "screener_candidates_{date}_{market}.json", date_str, market,
@@ -801,8 +889,13 @@ def _run_pipeline_stage(
             "--file", str(candidates),
         ]
         try:
-            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            subprocess.run(cmd, check=True, timeout=timeout_sec, encoding="utf-8")
             ok = True
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[PIPELINE_STAGE_TIMEOUT] stage=%s timeout_sec=%s elapsed_sec=%.1f",
+                stage, timeout_sec, time.perf_counter() - t0,
+            )
         except Exception as e:
             logger.error(f"[{run_id}] news_collector 실패: {e}")
     elif stage == "gpt":
@@ -811,13 +904,18 @@ def _run_pipeline_stage(
             "--date", date_str, "--market", market, "--slots", SLOTS,
         ]
         try:
-            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            subprocess.run(cmd, check=True, timeout=timeout_sec, encoding="utf-8")
             ok = True
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[PIPELINE_STAGE_TIMEOUT] stage=%s timeout_sec=%s elapsed_sec=%.1f",
+                stage, timeout_sec, time.perf_counter() - t0,
+            )
         except Exception as e:
             logger.error(f"[{run_id}] gpt_analyzer 실패: {e}")
     elif stage == "trader":
         _ensure_summary_file_for_risk_manager()
-        ok, _, _ = run_script("trader.py", run_id)
+        ok, _, _ = run_script("trader.py", run_id, stage=stage, date_str=date_str, market=market)
     elif stage == "reconciler":
         script = Path("/app/src/order_reconciler.py")
         if not script.exists():
@@ -825,11 +923,16 @@ def _run_pipeline_stage(
         try:
             result = subprocess.run(
                 [sys.executable, str(script), "--since-hours", "120", "--limit", "100"],
-                capture_output=True, text=True, timeout=180, encoding="utf-8",
+                capture_output=True, text=True, timeout=timeout_sec, encoding="utf-8",
             )
             ok = result.returncode == 0
             if not ok:
                 logger.error(f"[{run_id}] order_reconciler 실패: {_tail(result.stderr, 40)}")
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[PIPELINE_STAGE_TIMEOUT] stage=%s timeout_sec=%s elapsed_sec=%.1f",
+                stage, timeout_sec, time.perf_counter() - t0,
+            )
         except Exception as e:
             logger.error(f"[{run_id}] order_reconciler 예외: {e}")
     elif stage == "performance":
@@ -838,8 +941,13 @@ def _run_pipeline_stage(
             "--date", date_str, "--market", market, "--no-fetch-prices",
         ]
         try:
-            subprocess.run(cmd, check=True, timeout=SCRIPT_TIMEOUT_SEC, encoding="utf-8")
+            subprocess.run(cmd, check=True, timeout=timeout_sec, encoding="utf-8")
             ok = True
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[PIPELINE_STAGE_TIMEOUT] stage=%s timeout_sec=%s elapsed_sec=%.1f",
+                stage, timeout_sec, time.perf_counter() - t0,
+            )
         except Exception as e:
             logger.error(f"[{run_id}] performance_review 실패: {e}")
     else:
@@ -917,9 +1025,17 @@ def run_pipeline_from_stage(
     return pipeline_ok
 
 
-def run_script(script_name: str, run_id: str) -> Tuple[bool, bool, float]:
+def run_script(
+    script_name: str,
+    run_id: str,
+    *,
+    stage: Optional[str] = None,
+    date_str: Optional[str] = None,
+    market: Optional[str] = None,
+) -> Tuple[bool, bool, float]:
     """주어진 파이썬 스크립트를 실행 (자동 복구 포함)"""
-    timeout_sec = SCREENER_TIMEOUT_SEC if script_name == "screener.py" else SCRIPT_TIMEOUT_SEC
+    stage_name = stage or _script_stage(script_name) or "unknown"
+    timeout_sec = get_stage_timeout(stage_name) if stage_name in DEFAULT_STAGE_TIMEOUT_SEC else SCRIPT_TIMEOUT_SEC
 
     args = []
     if script_name == "screener.py":
@@ -968,6 +1084,15 @@ def run_script(script_name: str, run_id: str) -> Tuple[bool, bool, float]:
     except subprocess.TimeoutExpired:
         dur = time.perf_counter() - t0
         logger.error(f"[{run_id}] ❌ STEP TIMEOUT: {script_name} ({timeout_sec}s) | {dur:.1f}s 경과")
+        if script_name == "screener.py":
+            ds = date_str or datetime.now(KST).strftime("%Y%m%d")
+            mk = (market or MARKET or "KOSPI").upper()
+            _log_screener_timeout_diagnostics(ds, mk, dur, timeout_sec)
+        elif stage_name in DEFAULT_STAGE_TIMEOUT_SEC:
+            logger.error(
+                "[PIPELINE_STAGE_TIMEOUT] stage=%s timeout_sec=%s elapsed_sec=%.1f",
+                stage_name, timeout_sec, dur,
+            )
         return False, warned, dur
 
     except subprocess.CalledProcessError as e:

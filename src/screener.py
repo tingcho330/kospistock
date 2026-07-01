@@ -135,7 +135,7 @@ def _notify(content: str, key: str, cooldown_sec: int = 120):
             pass
 
 @contextmanager
-def stage(name: str, notify_key: Optional[str] = None):
+def stage(name: str, notify_key: Optional[str] = None, runtime_key: Optional[str] = None):
     t0 = time.perf_counter()
     logger.info("▶ %s 시작", name)
     if notify_key:
@@ -147,6 +147,8 @@ def stage(name: str, notify_key: Optional[str] = None):
         yield
     finally:
         secs = time.perf_counter() - t0
+        if runtime_key:
+            _STAGE_RUNTIMES[runtime_key] = _STAGE_RUNTIMES.get(runtime_key, 0.0) + secs
         logger.info("⏱ %s 완료 (%.2fs)", name, secs)
         if notify_key:
             try:
@@ -229,6 +231,7 @@ from kis_rate_limit import (
     cache_put,
     log_cache_summary,
     reset_cache_stats,
+    get_rate_limit_summary,
 )
 
 _KIS_RATE_LIMITER = None  # legacy compat: truthy when limits active
@@ -711,6 +714,8 @@ def get_listing_date(ticker: str) -> Optional[datetime]:
 
 # ─────────── 스코어링 실패/스킵 집계 ───────────
 _fail_stats = defaultdict(int)
+_STAGE_RUNTIMES: Dict[str, float] = {}
+_SCREENER_FUNNEL: Dict[str, int] = {}
 _fail_rows: List[Dict[str, Any]] = []
 _fail_lock = threading.Lock()
 
@@ -2110,6 +2115,11 @@ def _filter_initial_stocks(
         "✅ 1차 필터링 완료: %d → %d 종목 (시장=%s, 기준일=%s, min_mc=%s, min_amt5D=%s)",
         len(df_pre), len(df_filtered), market, fixed_date, f"{int(min_mc):,}", f"{int(min_amt):,}",
     )
+    _SCREENER_FUNNEL.update({
+        "total": n0,
+        "marcap_pass": n1,
+        "amount5d_pass": n2,
+    })
     return df_filtered, fixed_date
 
 def _calculate_scores_for_holdings_ticker(
@@ -2756,6 +2766,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     _FLOW_DATE_SHIFT_LOGGED = False
     _INVESTOR_FLOW_CACHE.clear()
     _DAILY_PRICE_CACHE.clear()
+    _STAGE_RUNTIMES.clear()
+    _SCREENER_FUNNEL.clear()
+    screener_started_at = time.perf_counter()
     start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
@@ -2842,7 +2855,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     except Exception:
         pass
 
-    with stage("1차 필터링", notify_key="screener_stage1"):
+    with stage("1차 필터링", notify_key="screener_stage1", runtime_key="first_filter"):
         # 시장 상태를 고려한 스크리닝 파라미터 조정
         from screener_core import get_market_aware_screening_params
         if _CURRENT_MARKET_STATE is not None:
@@ -2869,7 +2882,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             df_filtered, order, kis, workers, fixed_date, market, exclude_tickers=_bond_exclude,
         )
 
-    with stage("시장 레짐 계산", notify_key="screener_regime"):
+    with stage("시장 레짐 계산", notify_key="screener_regime", runtime_key="market_regime"):
         # 기존 시장 레짐 계산
         regime = _get_market_regime_score(fixed_date, market)
         market_score = 0.7 * regime + 0.3 * 0.5
@@ -2931,7 +2944,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         except Exception as e:
             logger.debug("지수 종가 캐시 실패: %s", e)
 
-    with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
+    with stage("섹터 트렌드 계산", notify_key="screener_sector_trend", runtime_key="market_regime"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
     # ✅ 보유 종목 스코어 업데이트
@@ -2950,7 +2963,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
     with stage("상장일(KIS) 프리패치", notify_key=None):
         get_listing_date_kis_prefetch(kis, list(df_filtered.index), fixed_date, workers)
 
-    with stage("프리스코어(경량)", notify_key="screener_prescore"):
+    with stage("프리스코어(경량)", notify_key="screener_prescore", runtime_key="prescore"):
         prescore_cfg = screener_params.get("prescore", {}) if isinstance(screener_params.get("prescore"), dict) else {}
         if prescore_cfg.get("enabled", True) and len(df_filtered) > int(prescore_cfg.get("max_candidates", 50)):
             max_c = int(prescore_cfg.get("max_candidates", 50))
@@ -2965,8 +2978,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             if top_codes:
                 df_filtered = df_filtered.loc[df_filtered.index.astype(str).isin(top_codes)]
                 logger.info("프리스코어: %d → %d 종목 (max_candidates=%d)", before_n, len(df_filtered), max_c)
+        _SCREENER_FUNNEL["prescore"] = len(df_filtered)
 
-    with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
+    with stage("상세 분석(스코어링)", notify_key="screener_scoring", runtime_key="scoring"):
         # 빈/무효 티커 제거 (All attempts failed for "" 방지)
         _valid_idx = df_filtered.index.notna() & (df_filtered.index.astype(str).str.strip().str.len() >= 4)
         if not _valid_idx.all():
@@ -3101,7 +3115,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             _notify(msg, key="screener_no_candidates_stage2", cooldown_sec=60)
             return
 
-    with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize"):
+    with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize", runtime_key="final_save"):
         df_scores = pd.DataFrame(results).set_index("Ticker")
         left = df_filtered.copy()
         right = df_scores.copy()
@@ -3436,6 +3450,45 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             log_cache_summary()
         except Exception:
             pass
+
+        total_sec = time.perf_counter() - screener_started_at
+        rl = get_rate_limit_summary()
+        _SCREENER_FUNNEL.update({
+            "scored": n_scored_total,
+            "volatility_pass": n_after_vol,
+            "breakout_pass": n_after_breakout_gate,
+            "final": len(final_candidates_base),
+        })
+        logger.info(
+            "[SCREENER_STAGE_RUNTIME_SUMMARY] first_filter_sec=%.1f market_regime_sec=%.1f "
+            "prescore_sec=%.1f scoring_sec=%.1f final_save_sec=%.1f total_sec=%.1f",
+            _STAGE_RUNTIMES.get("first_filter", 0.0),
+            _STAGE_RUNTIMES.get("market_regime", 0.0),
+            _STAGE_RUNTIMES.get("prescore", 0.0),
+            _STAGE_RUNTIMES.get("scoring", 0.0),
+            _STAGE_RUNTIMES.get("final_save", 0.0),
+            total_sec,
+        )
+        logger.info(
+            "[SCREENER_FUNNEL_SUMMARY] total=%d marcap_pass=%d amount5d_pass=%d prescore=%d "
+            "scored=%d volatility_pass=%d breakout_pass=%d final=%d",
+            _SCREENER_FUNNEL.get("total", 0),
+            _SCREENER_FUNNEL.get("marcap_pass", 0),
+            _SCREENER_FUNNEL.get("amount5d_pass", 0),
+            _SCREENER_FUNNEL.get("prescore", 0),
+            _SCREENER_FUNNEL.get("scored", 0),
+            _SCREENER_FUNNEL.get("volatility_pass", 0),
+            _SCREENER_FUNNEL.get("breakout_pass", 0),
+            _SCREENER_FUNNEL.get("final", 0),
+        )
+        by_api = rl.get("by_api") or {}
+        by_ticker = rl.get("by_ticker") or {}
+        logger.info(
+            "[SCREENER_RATE_LIMIT_SUMMARY] egw00201_count=%d by_api=%s by_ticker=%s",
+            int(rl.get("egw00201_count", 0)),
+            by_api,
+            by_ticker,
+        )
 
 # ─────────── CLI ───────────
 def parse_args():

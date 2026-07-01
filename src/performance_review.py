@@ -68,13 +68,37 @@ _MANUAL_STAGE_ORDER = (
     "gpt",
     "trader",
     "resume_trader",
+    "resume_from_news",
+    "resume_from_gpt",
+    "resume_from_trader",
+    "resume_from_reconciler",
+    "resume_from_performance",
+    "full_from_screener",
     "reconcile",
     "reconcile_pending_sell",
 )
 _PRIMARY_MANUAL_STAGES = frozenset({
     "screener", "news", "gpt", "trader", "resume_trader",
+    "resume_from_news", "resume_from_gpt", "resume_from_trader",
+    "resume_from_reconciler", "resume_from_performance",
 })
 _CORE_MANUAL_STAGES = frozenset({"screener", "news", "gpt", "trader"})
+_RESUME_FROM_STAGES = (
+    "resume_from_news",
+    "resume_from_gpt",
+    "resume_from_trader",
+    "resume_from_reconciler",
+    "resume_from_performance",
+)
+_RESUME_EXECUTION_PRIORITY = (
+    ("resume_from_news", "resume_from_news_run"),
+    ("resume_from_gpt", "resume_from_gpt_run"),
+    ("resume_from_trader", "resume_from_trader_run"),
+    ("resume_from_reconciler", "resume_from_reconciler_run"),
+    ("resume_from_performance", "resume_from_performance_run"),
+    ("resume_trader", "resume_trader_run"),
+)
+_RESUME_EXEC_METHODS = frozenset(m for _, m in _RESUME_EXECUTION_PRIORITY)
 _FULL_PIPELINE_PREFIX = "manual_full_pipeline_"
 
 
@@ -407,6 +431,12 @@ def _classify_manual_log_stage(filename: str, date_str: str) -> Optional[str]:
     stage_prefixes = [
         ("reconcile_pending_sell", "manual_order_reconcile_pending_sell_"),
         ("reconcile", "manual_order_reconcile_"),
+        ("resume_from_performance", "manual_resume_from_performance_"),
+        ("resume_from_reconciler", "manual_resume_from_reconciler_"),
+        ("resume_from_trader", "manual_resume_from_trader_"),
+        ("resume_from_gpt", "manual_resume_from_gpt_"),
+        ("resume_from_news", "manual_resume_from_news_"),
+        ("full_from_screener", "manual_full_from_screener_"),
         ("screener", "manual_screener_"),
         ("news", "manual_news_collector_"),
         ("gpt", "manual_gpt_after_news_"),
@@ -422,16 +452,19 @@ def _classify_manual_log_stage(filename: str, date_str: str) -> Optional[str]:
 
 def _is_split_manual_log(path: Path, date_str: str) -> bool:
     stage = _classify_manual_log_stage(path.name, date_str)
-    return stage is not None and stage not in ("full_pipeline",)
+    return stage is not None and stage not in ("full_pipeline", "full_from_screener")
 
 
 def _is_full_pipeline_log(path: Path, date_str: str) -> bool:
-    if _classify_manual_log_stage(path.name, date_str) == "full_pipeline":
+    stage = _classify_manual_log_stage(path.name, date_str)
+    if stage in ("full_pipeline", "full_from_screener"):
         return True
     name = path.name.lower()
     if not name.endswith(".log") or date_str not in name:
         return False
     if "integrated_pipeline" in name:
+        return True
+    if name.startswith(f"manual_full_from_screener_{date_str}"):
         return True
     if name.startswith(f"pipeline_{date_str}") or name.startswith(f"pipeline-{date_str}"):
         return True
@@ -461,7 +494,7 @@ def _collect_manual_stage_logs(date_str: str, log_files: List[Path]) -> Dict[str
     latest: Dict[str, Tuple[str, Path]] = {}
     for p in log_files:
         stage = _classify_manual_log_stage(p.name, date_str)
-        if not stage or stage == "full_pipeline":
+        if not stage or stage in ("full_pipeline", "full_from_screener"):
             continue
         run_ts = _extract_log_run_ts(p, date_str)
         if not run_ts:
@@ -476,17 +509,44 @@ def _build_daily_pipeline_group(
     stage_files: Dict[str, Path],
 ) -> Tuple[List[Path], Optional[str], str]:
     """
-    당일 screener/news/gpt/trader/reconcile 분할 로그 묶음.
+    당일 screener/news/gpt/trader 분할 로그 또는 screener+resume_from_* 묶음.
     resume_trader는 당일 파이프라인 품질 그룹에서 제외한다.
     """
+    resume_present = [s for s in _RESUME_FROM_STAGES if s in stage_files]
+    if resume_present:
+        resume_stage = resume_present[0]
+        files: List[Path] = []
+        if "screener" in stage_files:
+            files.append(stage_files["screener"])
+        files.append(stage_files[resume_stage])
+        for aux in ("reconcile", "reconcile_pending_sell"):
+            if aux in stage_files:
+                files.append(stage_files[aux])
+        files = sorted(files, key=lambda p: p.name)
+        core_ts = [
+            _extract_log_run_ts(p, date_str) or ""
+            for p in files
+        ]
+        group_ts = max(core_ts) if core_ts else None
+        group_id = f"{date_str}-daily-{group_ts}" if group_ts else f"{date_str}-daily"
+        logger.info(
+            "[PERF_LOG_GROUP_CANDIDATE] date=%s group_id=%s files=%s",
+            date_str, group_id, ",".join(f.name for f in files),
+        )
+        for p in files:
+            st = _classify_manual_log_stage(p.name, date_str)
+            if st:
+                logger.info("[PERF_LOG_GROUP_STAGE] stage=%s file=%s", st, p.name)
+        return files, group_ts, "split_manual_pipeline_logs"
+
     daily_stages = {k: v for k, v in stage_files.items() if k != "resume_trader"}
     core = {s for s in _CORE_MANUAL_STAGES if s in daily_stages}
     if not core:
         return [], None, "incomplete"
 
-    files: List[Path] = []
+    files = []
     for stage in _MANUAL_STAGE_ORDER:
-        if stage == "resume_trader":
+        if stage in ("resume_trader",) or stage.startswith("resume_from_") or stage == "full_from_screener":
             continue
         if stage in daily_stages:
             files.append(daily_stages[stage])
@@ -513,36 +573,33 @@ def _build_latest_execution_group(
     stage_files: Dict[str, Path],
 ) -> Tuple[List[Path], Optional[str], str]:
     """
-    가장 최근 실행 단위 로그 묶음 (resume_trader 우선).
+    가장 최근 실행 단위 로그 묶음 (resume_from_* / resume_trader 우선).
     """
+    for stage, method in _RESUME_EXECUTION_PRIORITY:
+        if stage not in stage_files:
+            continue
+        run_ts = _extract_log_run_ts(stage_files[stage], date_str) or ""
+        files = [stage_files[stage]]
+        for aux in ("reconcile", "reconcile_pending_sell"):
+            if aux in stage_files:
+                aux_ts = _extract_log_run_ts(stage_files[aux], date_str) or ""
+                if aux_ts >= run_ts:
+                    files.append(stage_files[aux])
+        files = sorted(files, key=lambda p: p.name)
+        group_id = f"{date_str}-resume-{run_ts}"
+        logger.info(
+            "[PERF_LOG_GROUP_CANDIDATE] date=%s group_id=%s files=%s",
+            date_str, group_id, ",".join(f.name for f in files),
+        )
+        for p in files:
+            st = _classify_manual_log_stage(p.name, date_str)
+            if st:
+                logger.info("[PERF_LOG_GROUP_STAGE] stage=%s file=%s", st, p.name)
+        return files, run_ts or None, method
+
     primary_present = {s for s in _PRIMARY_MANUAL_STAGES if s in stage_files}
     if not primary_present:
         return [], None, "incomplete"
-
-    if "resume_trader" in stage_files:
-        rt_ts = _extract_log_run_ts(stage_files["resume_trader"], date_str) or ""
-        other_ts = [
-            _extract_log_run_ts(stage_files[s], date_str) or ""
-            for s in primary_present - {"resume_trader"}
-        ]
-        if not other_ts or (rt_ts and rt_ts > max(other_ts)):
-            files = [stage_files["resume_trader"]]
-            for aux in ("reconcile", "reconcile_pending_sell"):
-                if aux in stage_files:
-                    aux_ts = _extract_log_run_ts(stage_files[aux], date_str) or ""
-                    if aux_ts >= rt_ts:
-                        files.append(stage_files[aux])
-            files = sorted(files, key=lambda p: p.name)
-            group_id = f"{date_str}-resume-{rt_ts}"
-            logger.info(
-                "[PERF_LOG_GROUP_CANDIDATE] date=%s group_id=%s files=%s",
-                date_str, group_id, ",".join(f.name for f in files),
-            )
-            for p in files:
-                st = _classify_manual_log_stage(p.name, date_str)
-                if st:
-                    logger.info("[PERF_LOG_GROUP_STAGE] stage=%s file=%s", st, p.name)
-            return files, rt_ts or None, "resume_trader_run"
 
     core = {s for s in _CORE_MANUAL_STAGES if s in stage_files}
     if not core:
@@ -550,7 +607,9 @@ def _build_latest_execution_group(
 
     files = []
     for stage in _MANUAL_STAGE_ORDER:
-        if stage in stage_files and stage != "resume_trader":
+        if stage in stage_files and stage not in _RESUME_FROM_STAGES and stage != "full_from_screener":
+            if stage == "resume_trader":
+                continue
             files.append(stage_files[stage])
     core_ts = [_extract_log_run_ts(stage_files[s], date_str) or "" for s in core]
     group_ts = max(core_ts) if core_ts else None
@@ -632,7 +691,7 @@ def _resolve_pipeline_log_groups(
         if run_ts and (best_full is None or run_ts > best_full[0]):
             best_full = (run_ts, p)
 
-    if exec_files and best_full:
+    if exec_files and best_full and exec_method not in _RESUME_EXEC_METHODS:
         if best_full[0] > (exec_ts or ""):
             exec_files, exec_ts, exec_method = [best_full[1]], best_full[0], "full_pipeline_log"
     elif not exec_files and best_full:
@@ -868,18 +927,21 @@ def _parse_scoped_log_events(
                 execution_run_ids, daily_run_ids, path,
                 latest_execution_paths, daily_pipeline_paths,
             )
+            in_execution = _path_in_set(path, latest_execution_paths)
+            in_daily = _path_in_set(path, daily_pipeline_paths)
 
             if "EGW00201" in line:
                 counts["all_related_logs_egw00201_count"] += 1
                 if scope == "current_run":
                     counts["current_run_egw00201_count"] += 1
-                elif scope == "latest_execution":
-                    counts["latest_execution_egw00201_count"] += 1
-                    counts["latest_pipeline_egw00201_count"] += 1
-                elif scope == "daily_pipeline":
-                    counts["daily_pipeline_egw00201_count"] += 1
                 else:
-                    counts["historical_egw00201_count"] += 1
+                    if in_execution:
+                        counts["latest_execution_egw00201_count"] += 1
+                        counts["latest_pipeline_egw00201_count"] += 1
+                    if in_daily:
+                        counts["daily_pipeline_egw00201_count"] += 1
+                    if scope != "current_run" and not in_execution and not in_daily:
+                        counts["historical_egw00201_count"] += 1
                 details.append({
                     "type": "egw00201",
                     "scope": scope,
@@ -893,13 +955,14 @@ def _parse_scoped_log_events(
                 counts["all_related_logs_error_count"] += 1
                 if scope == "current_run":
                     counts["current_run_error_count"] += 1
-                elif scope == "latest_execution":
-                    counts["latest_execution_error_count"] += 1
-                    counts["latest_pipeline_error_count"] += 1
-                elif scope == "daily_pipeline":
-                    counts["daily_pipeline_error_count"] += 1
                 else:
-                    counts["historical_error_count"] += 1
+                    if in_execution:
+                        counts["latest_execution_error_count"] += 1
+                        counts["latest_pipeline_error_count"] += 1
+                    if in_daily:
+                        counts["daily_pipeline_error_count"] += 1
+                    if scope != "current_run" and not in_execution and not in_daily:
+                        counts["historical_error_count"] += 1
                 details.append({
                     "type": "error",
                     "scope": scope,
@@ -916,13 +979,14 @@ def _parse_scoped_log_events(
                     sample = f"{line} | next: {lines[i + 1][:120]}"
                 if scope == "current_run":
                     counts["current_run_traceback_count"] += 1
-                elif scope == "latest_execution":
-                    counts["latest_execution_traceback_count"] += 1
-                    counts["latest_pipeline_traceback_count"] += 1
-                elif scope == "daily_pipeline":
-                    counts["daily_pipeline_traceback_count"] += 1
                 else:
-                    counts["historical_traceback_count"] += 1
+                    if in_execution:
+                        counts["latest_execution_traceback_count"] += 1
+                        counts["latest_pipeline_traceback_count"] += 1
+                    if in_daily:
+                        counts["daily_pipeline_traceback_count"] += 1
+                    if scope != "current_run" and not in_execution and not in_daily:
+                        counts["historical_traceback_count"] += 1
                 details.append({
                     "type": "traceback",
                     "scope": scope,
@@ -2583,6 +2647,38 @@ def _smoke_test_accuracy_fixes() -> None:
         assert "manual_news_collector_20260630_100735.log" in daily_files
         assert scoped3["daily_pipeline_egw00201_count"] == 3
         assert scoped3["historical_egw00201_count"] == 1
+
+        # screener + resume_from_news 분할 재개 (20260701 패턴)
+        screener2 = tmp / "manual_screener_20260701_094652.log"
+        screener2.write_text("screener only\n", encoding="utf-8")
+        resume_news = tmp / "manual_resume_from_news_20260701_120530.log"
+        resume_news.write_text(
+            "news step\n"
+            "gpt step\n"
+            "KIS API EGW00201 rate limit\n",
+            encoding="utf-8",
+        )
+        timeout_full = tmp / "manual_full_from_screener_20260701_125848.log"
+        timeout_full.write_text(
+            "[PIPELINE_STAGE_TIMEOUT] stage=screener timeout_sec=1200\n"
+            " - ERROR - screener timeout\n",
+            encoding="utf-8",
+        )
+        scoped4, _ = _parse_scoped_log_events(
+            "20260701",
+            [screener2, resume_news, timeout_full],
+        )
+        assert scoped4["latest_execution_detect_method"] == "resume_from_news_run"
+        assert "manual_resume_from_news_20260701_120530.log" in (
+            scoped4.get("latest_execution_log_files") or []
+        )
+        daily4 = scoped4.get("daily_pipeline_log_files") or []
+        assert "manual_screener_20260701_094652.log" in daily4
+        assert "manual_resume_from_news_20260701_120530.log" in daily4
+        assert scoped4["daily_pipeline_detect_method"] == "split_manual_pipeline_logs"
+        assert scoped4["latest_execution_egw00201_count"] == 1
+        assert scoped4["daily_pipeline_egw00201_count"] == 1
+        assert scoped4["historical_error_count"] >= 1
 
         funnel_log, _ = _resolve_screener_funnel_log_text("20260630", [screener])
         parsed = _parse_funnel_from_logs(funnel_log)

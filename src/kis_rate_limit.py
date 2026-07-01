@@ -57,6 +57,9 @@ _MAX_CONCURRENCY: int = 1
 _MEM_CACHE: Dict[str, Any] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_STATS: Counter = Counter()
+_RATE_LIMIT_HITS: Counter = Counter()
+_RATE_LIMIT_BY_API: Counter = Counter()
+_RATE_LIMIT_BY_TICKER: Counter = Counter()
 
 
 class KisRateLimiter:
@@ -196,6 +199,30 @@ def reset_cache_stats() -> None:
     with _CACHE_LOCK:
         _CACHE_STATS.clear()
         _MEM_CACHE.clear()
+        _RATE_LIMIT_HITS.clear()
+        _RATE_LIMIT_BY_API.clear()
+        _RATE_LIMIT_BY_TICKER.clear()
+
+
+def record_rate_limit_hit(api: str = "", ticker: str = "", msg_cd: str = "EGW00201") -> None:
+    with _CACHE_LOCK:
+        _RATE_LIMIT_HITS[msg_cd or "EGW00201"] += 1
+        if api:
+            _RATE_LIMIT_BY_API[api] += 1
+        if ticker:
+            _RATE_LIMIT_BY_TICKER[str(ticker).zfill(6)] += 1
+
+
+def get_rate_limit_summary() -> Dict[str, Any]:
+    with _CACHE_LOCK:
+        total = sum(_RATE_LIMIT_HITS.values())
+        by_api = dict(_RATE_LIMIT_BY_API)
+        by_ticker = dict(_RATE_LIMIT_BY_TICKER)
+    return {
+        "egw00201_count": total,
+        "by_api": by_api,
+        "by_ticker": by_ticker,
+    }
 
 
 def call_with_rate_limit_retry(
@@ -225,6 +252,7 @@ def call_with_rate_limit_retry(
         limited, msg_cd = is_rate_limited(last)
         if not limited:
             return last
+        record_rate_limit_hit(api=api, ticker=ticker, msg_cd=msg_cd or "EGW00201")
         if attempt >= retries:
             logger.warning(
                 "[KIS_RATE_LIMIT] ticker=%s api=%s retry=%d/%d exhausted msg_cd=%s",

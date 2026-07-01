@@ -58,13 +58,14 @@
 
 ## 2. 주요 기능
 
-- **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·매매 파이프라인·잔액·체결확인·리컨실·요약 담당
+- **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·매매 파이프라인·잔액·체결확인·리컨실·요약 담당. `--from-stage`로 **screener → news → gpt → trader → reconciler → performance** 단계별 재개 지원
+- **파이프라인 stage timeout** — `config.json`의 `stage_timeout_sec` 또는 기본값(screener **3600**초, news 600, gpt/trader 900, reconciler/performance 300). screener timeout 시 partial output 존재 여부·`news`부터 재개 힌트 로그 출력
 - **KOSPI 7축 스크리닝** — Flow 25% · RS Momentum 25% · Growth 15% · Breakout 15% · Fin 10% · Mkt 5% · Sector 5% (Tech 0%, 진입 보조만)
 - **Breakout Gate (2단)** — Tier1 `Br≥0.25 OR Pos≥0.90` → 부족 시 Tier2 `Br≥0.20 OR Pos≥0.85` 종료 (Tier3 없음). Pos52w 단독 통과 시 `Breakout≥0.05` 필수
 - **스코어 조정** — `BreakoutBonus`(최대 +0.08), `NearHighPenalty`(최대 −0.05), `WeakBreakoutPenalty`(Br<0.10 ×0.95, Br<0.05 추가 ×0.90)
 - **확신도·해석 필드** — `ConvictionScore`, `rank_reason`, `selection_summary`, `penalty_reason`, `WeakBreakoutMultiplier`, `gate_tier` / `gate_reason` (후보 JSON schema **1.7**)
 - **포트폴리오 비중** — `weight_mode: conviction` (`ConvictionScore` 비례, min **2%** / max **7.5%**). `rank_tier` 모드도 config로 선택 가능
-- **다단계 스크리닝** — 1차 유동성 필터 → 프리스코어(50종) → 상세 스코어링 → 변동성·게이트·섹터 다양화 (`--debug` 시 퍼널 로그)
+- **다단계 스크리닝** — 1차 유동성 필터 → 프리스코어(50종) → 상세 스코어링 → 변동성·게이트·섹터 다양화 (`--debug` 시 퍼널 로그). 완료 시 `[SCREENER_STAGE_RUNTIME_SUMMARY]` · `[SCREENER_FUNNEL_SUMMARY]` · `[SCREENER_RATE_LIMIT_SUMMARY]` 한 번에 출력
 - **KIS 시장·섹터 분석** — 업종지수 페이지네이션, MA/RSI 기반 레짐·섹터 트렌드
 - **GPT / 휴리스틱 분석** — 1차 필터(뉴스·점수) → 전술 계획(차트·패턴·예산 가드) 2단계. `OPENAI_API_KEY` 없으면 휴리스틱 폴백. 1차 필터 탈락 시 `gpt_trades_*.json`에 **`결정: "미진입"`** 기록(탈락 사유·`initial_filter` 메타 포함). `trader.py`는 **`결정 == "매수"`** 만 실행
 - **장중 리스크** — `background_risk_manager` 컨테이너에서 ATR·스윙저점·RSI·긴급 낙폭·전략 믹서 기반 매도  
@@ -83,7 +84,7 @@
 - **회전 매매** — `rotation.enabled` 시 보유 최약 종목을 고득점 후보로 교체(리밸런싱). 공통 정책은 `rotation_policy.py`에서 일원화. **459580(bond ETF)은 회전·GPT 리밸런싱 대상에서 제외**
 - **자산 배분 (선택)** — `asset_allocation.enabled` 시 주문 실행 단계에서만 70% 주식 / 20% 459580 / 10% 현금(최소 5%) 가드. 스크리너·GPT 전략은 변경 없음. 주식 매수 후 잔여 현금으로 459580 자동 매수(국내주식 현금주문 경로)
 - **일일 매매 요약** — `output/daily_balances/` 장시작·종료 스냅샷 + KIS 공식 수치(`nass_amt`, `rlzt_pfls`, `thdt_*`) 기반 Discord 전송. DB `profit_loss`는 보조·불일치 시 ⚠️ 표시
-- **일별 성능 리뷰** — `performance_review.py`가 스크리너 퍼널·GPT BUY/HOLD/REJECT·예산 사용률·체결 품질·파이프라인 runtime을 **JSON/CSV/Markdown**으로 자동 생성. `candidate_tracking_*.json`으로 미매수 후보 사후 추적(1D/3D/5D/10D)
+- **일별 성능 리뷰** — `performance_review.py`가 스크리너 퍼널·GPT BUY/HOLD/REJECT·예산 사용률·체결 품질·파이프라인 runtime을 **JSON/CSV/Markdown**으로 자동 생성. `manual_screener` + `manual_resume_from_news` 등 **분할 수동 로그를 Daily Pipeline Group으로 묶음**, Latest Execution / Daily Pipeline / Historical scope로 EGW00201·Error 분리 집계. `candidate_tracking_*.json`으로 미매수 후보 사후 추적(1D/3D/5D/10D)
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용 (예시: `.env.example`)
 
 ---
@@ -269,6 +270,18 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 
 실패 시 `output/pipeline_state.json`에 저장 후 `STEP_DEPENDENCIES` 기준 **실패 단계부터 재시도** (`MAX_ATTEMPTS`).
 
+**단계별 재개 (`integrated_manager.py --once`):**
+
+| 옵션 | 설명 |
+|------|------|
+| `--from-stage` | `screener` \| `news` \| `gpt` \| `trader` \| `reconciler` \| `performance` |
+| `--date YYYYMMDD` | 대상 거래일 (기본: 오늘 KST) |
+| `--market KOSPI` | 시장 |
+| `--use-existing-files` | 기존 `output/` 산출물로 이후 단계 실행 |
+| `--skip-screener` | `from-stage=news`와 동일 효과 |
+
+screener timeout 후 `screener_candidates_*.json`이 있으면 `news`부터 `--use-existing-files`로 재개. 수동 실행 로그 예: `manual_screener_YYYYMMDD_*.log`, `manual_resume_from_news_YYYYMMDD_*.log`, `manual_full_from_screener_YYYYMMDD_*.log`(실패·historical).
+
 #### `gpt_trades_*.json` 스키마 (`gpt_analyzer.py`)
 
 ```json
@@ -404,7 +417,18 @@ python scripts/replay_screener_logic.py --amount5d-test [풀JSON]
 [PERF_EXECUTION]        — 체결률·holding fallback·pending
 [PERF_SYSTEM]           — 단계별 runtime·rate limit·error count
 [PERF_TRACKING_SNAPSHOT]— candidate_tracking 저장
+[PERF_LOG_GROUP_*]      — daily_pipeline / latest_execution 로그 묶음 탐지
 ```
+
+**System Performance (Markdown) 구조:**
+
+| 블록 | Method 예시 | Files |
+|------|-------------|-------|
+| Latest Execution Run | `resume_from_news_run` | `manual_resume_from_news_YYYYMMDD_*.log` |
+| Daily Pipeline Group | `split_manual_pipeline_logs` | `manual_screener_*.log` + `manual_resume_from_news_*.log` |
+| Warnings | — | latest / daily / historical scope별 EGW00201·Error |
+
+인식하는 수동 로그 패턴: `manual_resume_from_{news,gpt,trader,reconciler,performance}_*`, `manual_full_from_screener_*`(timeout 등 historical).
 
 ```bash
 # 수동 생성 (날짜·시장 지정)
@@ -496,7 +520,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 
 | 파일 | 역할 |
 |------|------|
-| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, `daily_balances` 스냅샷·일일 Discord 요약·리컨실, 파이프라인 상태 복구, **성공 시 `performance_review` 자동 호출** |
+| `integrated_manager.py` | 스케줄 등록, subprocess 파이프라인, `daily_balances` 스냅샷·일일 Discord 요약·리컨실, 파이프라인 상태 복구, **stage timeout·partial output·재개 힌트**, `--from-stage` 재개, **성공 시 `performance_review` 자동 호출** |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 (`--once`, `--capture-open` 등) |
 | `risk_manager.py` | 장중 리스크 사이클, 매도·파이프라인 재기동 |
 | `run_background_risk_manager.py` | 리스크 전용 컨테이너 진입점 (`BackgroundRiskManager`) |
@@ -911,6 +935,12 @@ docker compose down
 # 통합 매니저: 하루치 순서 (--once)
 docker compose exec integrated_manager python /app/run_integrated_manager.py --once
 
+# 파이프라인 단계별 재개 (screener ~ performance)
+docker compose exec integrated_manager python /app/src/integrated_manager.py --once \
+  --from-stage screener --date 20260701 --market KOSPI
+docker compose exec integrated_manager python /app/src/integrated_manager.py --once \
+  --from-stage news --date 20260701 --market KOSPI --use-existing-files
+
 # 잔액·요약만
 docker compose exec integrated_manager python /app/run_integrated_manager.py --capture-open
 docker compose exec integrated_manager python /app/run_integrated_manager.py --capture-close
@@ -976,7 +1006,13 @@ docker compose exec integrated_manager python -u /app/src/order_reconciler.py --
 # order_id 누락 행만 KIS 일별 주문으로 backfill
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --backfill-only
 
-# DB 확인 (컨테이너에 sqlite3 CLI 없음 → Python 사용)
+# DB 점검 (scripts/check_trade_db.py)
+PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --today
+PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --pending
+PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --verify-account-match
+PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --stale-sell-pending
+
+# DB 확인 (컨테이너에 sqlite3 CLI 없음 → Python 원시 쿼리)
 docker compose exec integrated_manager python -c "
 import sqlite3
 for r in sqlite3.connect('/app/output/trading_data.db').execute(
@@ -1010,8 +1046,8 @@ python run_integrated_manager.py --once
 | `REVIEWER_ALLOW_PARTIAL` | `1`이면 표본 부족해도 보수 GPT 회고 |
 | `REVIEWER_MAX_DIGEST` | GPT 프롬프트 매도 샘플 상한 (기본 15) |
 | `REVIEWER_DRY_RUN` | `1`이면 config 미적용 |
-| `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃(초) |
-| `SCRIPT_TIMEOUT_SEC` | 기타 스크립트 타임아웃 |
+| `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃(초, 기본 **3600**, `stage_timeout_sec`보다 우선) |
+| `SCRIPT_TIMEOUT_SEC` | news/gpt/trader/performance 등 타임아웃 오버라이드 |
 | `KIS_TOKEN_FILE` | 토큰 캐시 경로 (기본 `output/cache/kis_token.json`) |
 | `KIS_TOKEN_BACKOFF_SEC` | EGW00133 재시도 대기(초, 기본 65) |
 | `KIS_REAUTH_COOLDOWN_SEC` | 재인증 API 호출 쿨다운(초, 기본 60) |
@@ -1019,6 +1055,21 @@ python run_integrated_manager.py --once
 | `KIS_HEALTHCHECK_ENV` | 헬스체크 KIS env (기본 `prod`) |
 | `DISCORD_WEBHOOK_URL_RISK` | 리스크 매니저 전용 Discord 웹훅 |
 | `ASSET_ALLOCATION_ALLOW_PROD` | **`1`/`true`일 때만** prod + `asset_allocation.enabled` 주문 허용. 모의 검증 중 **설정 금지** |
+
+**`config.json` — 파이프라인 stage timeout (선택):**
+
+```json
+"stage_timeout_sec": {
+  "screener": 3600,
+  "news": 600,
+  "gpt": 900,
+  "trader": 900,
+  "reconciler": 300,
+  "performance": 300
+}
+```
+
+미설정 시 위 기본값 사용. `SCREENER_TIMEOUT_SEC` / `SCRIPT_TIMEOUT_SEC` 환경변수가 있으면 해당 단계를 덮어씁니다.
 
 ### 7.5 Phase 6 검증 (asset_allocation)
 
@@ -1095,6 +1146,7 @@ kospistock/
 ├── .devcontainer/
 ├── scripts/
 │   ├── replay_screener_logic.py   # 게이트·가산/감점·Conviction·비중 오프라인 검증
+│   ├── check_trade_db.py          # trade_records 점검 (--today, --pending, --verify-account-match)
 │   ├── replay_asset_allocation.py # asset_allocator Case 1–7
 │   ├── dry_run_asset_allocation.py# [ASSET_ALLOCATION] 로그 dry-run (KIS 없음)
 │   ├── check_vps_deploy_ready.sh  # vps + asset_allocation 배포 전 점검
