@@ -29,6 +29,11 @@ from utils import (
 )
 from settings import settings
 from recorder import classify_trade_record, is_real_kis_trade_record
+from position_ledger import (
+    analyze_account_db_match,
+    format_repair_candidate_line,
+    load_all_trade_rows,
+)
 
 logger = logging.getLogger("PerformanceReview")
 
@@ -1379,42 +1384,6 @@ def _load_sell_rows_for_tickers(tickers: List[str]) -> Dict[str, List[Dict[str, 
     return dict(by_ticker)
 
 
-def _compute_db_open_positions_all() -> Dict[str, int]:
-    """전체 DB executed 기준 open position."""
-    db_path = OUTPUT_DIR / "trading_data.db"
-    if not db_path.is_file():
-        return {}
-    qty_by_ticker: Dict[str, int] = defaultdict(int)
-    executed_statuses = {"executed", "partial", "completed", "paper_executed"}
-    try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(
-            """
-            SELECT ticker, action, executed_qty, quantity, order_status
-            FROM trade_records
-            ORDER BY timestamp ASC
-            """
-        )
-        for r in cur.fetchall():
-            row = dict(r)
-            status = str(row.get("order_status") or "").lower()
-            if status not in executed_statuses:
-                continue
-            exe = _safe_int(row.get("executed_qty") or row.get("quantity"))
-            if exe <= 0:
-                continue
-            ticker = _norm_ticker(row.get("ticker"))
-            action = str(row.get("action") or "").upper()
-            if action == "BUY":
-                qty_by_ticker[ticker] += exe
-            elif action == "SELL":
-                qty_by_ticker[ticker] -= exe
-        conn.close()
-    except Exception as e:
-        logger.warning("DB open position 계산 실패: %s", e)
-    return {t: q for t, q in qty_by_ticker.items() if q > 0}
-
 
 def _get_account_qty_snapshot() -> Tuple[Dict[str, int], str]:
     _, holdings, _, balance_path = get_account_snapshot_cached(
@@ -1479,55 +1448,51 @@ def _detect_account_db_mismatch(
     review_tickers: List[str],
     pending_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    db_positions = _compute_db_open_positions_all()
+    rows = load_all_trade_rows()
     account_positions, account_source = _get_account_qty_snapshot()
-    pending_sells = [
-        r for r in pending_rows
-        if str(r.get("action") or "").upper() == "SELL"
-    ]
-    pending_by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in pending_sells:
-        pending_by_ticker[_norm_ticker(r.get("ticker"))].append(r)
-
-    relevant_tickers = sorted(
-        set(review_tickers) | set(db_positions) | set(account_positions) | set(pending_by_ticker)
+    analysis = analyze_account_db_match(
+        rows,
+        account_positions,
+        include_paper_executed=False,
+        review_tickers=review_tickers,
     )
-    mismatches: List[Dict[str, Any]] = []
-    for ticker in relevant_tickers:
-        db_qty = _safe_int(db_positions.get(ticker, 0))
-        account_qty = _safe_int(account_positions.get(ticker, 0))
-        if db_qty == account_qty:
-            continue
-        pending_ids = [r.get("id") for r in pending_by_ticker.get(ticker, [])]
-        mismatches.append({
-            "ticker": ticker,
-            "db_qty": db_qty,
-            "account_qty": account_qty,
-            "pending_sell_ids": pending_ids,
-            "likely_pending_sell_mismatch": bool(pending_ids and db_qty > account_qty),
-        })
 
     out = {
         "account_source": account_source,
-        "db_open_tickers": len(db_positions),
+        "db_open_tickers": len(analysis["open_positions"]),
         "account_tickers": len(account_positions),
-        "mismatch_count": len(mismatches),
-        "mismatches": mismatches,
-        "pending_sell_count": len(pending_sells),
-        "pending_sell_rows": pending_sells,
+        "mismatch_count": analysis["mismatch_count"],
+        "mismatches": analysis["mismatches"],
+        "repair_candidates": analysis["repair_candidates"],
+        "paper_positions": analysis["paper_positions"],
+        "open_positions": analysis["open_positions"],
+        "pending_sell_count": sum(
+            1 for r in pending_rows if str(r.get("action") or "").upper() == "SELL"
+        ),
+        "pending_sell_rows": [
+            r for r in pending_rows if str(r.get("action") or "").upper() == "SELL"
+        ],
+        "include_paper_executed": False,
     }
-    if mismatches:
+    if analysis["mismatch_count"] > 0:
         logger.warning(
             "[PERF_ACCOUNT_DB_MISMATCH] mismatch_count=%s pending_sell=%s account_source=%s",
-            len(mismatches),
-            len(pending_sells),
+            analysis["mismatch_count"],
+            out["pending_sell_count"],
             account_source,
         )
-        for m in mismatches[:10]:
+        for m in analysis["mismatches"][:10]:
             logger.warning(
-                "[PERF_ACCOUNT_DB_MISMATCH] ticker=%s db_qty=%s account_qty=%s pending_sell_ids=%s",
-                m["ticker"], m["db_qty"], m["account_qty"], m["pending_sell_ids"],
+                "[PERF_ACCOUNT_DB_MISMATCH] ticker=%s db_qty=%s account_qty=%s "
+                "reason=%s related_ids=%s",
+                m["ticker"],
+                m["db_qty"],
+                m["account_qty"],
+                m.get("mismatch_reason"),
+                m.get("related_trade_ids"),
             )
+        for c in analysis["repair_candidates"][:10]:
+            logger.warning(format_repair_candidate_line(c))
     return out
 
 
@@ -2247,16 +2212,16 @@ def _build_warnings(
     if recon.get("mismatch_count", 0) > 0:
         current.append(
             f"DB-계좌 보유수량 불일치 {recon['mismatch_count']}건 "
-            f"(account_source={recon.get('account_source', '?')})"
+            f"(open_basis=executed,partial paper_excluded account_source={recon.get('account_source', '?')})"
         )
         for m in (recon.get("mismatches") or [])[:8]:
-            note = ""
-            if m.get("pending_sell_ids"):
-                note = f" pending_sell_ids={m['pending_sell_ids']}"
             current.append(
                 f"  mismatch ticker={m.get('ticker')} db_qty={m.get('db_qty')} "
-                f"account_qty={m.get('account_qty')}{note}"
+                f"account_qty={m.get('account_qty')} reason={m.get('mismatch_reason')} "
+                f"related_ids={m.get('related_trade_ids')}"
             )
+        for c in (recon.get("repair_candidates") or [])[:8]:
+            current.append(format_repair_candidate_line(c))
 
     for bypass in (auto_sell_policy or [])[:5]:
         current.append(

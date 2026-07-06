@@ -10,6 +10,8 @@ Usage:
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --stale-sell-pending --stale-hours 24
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --ticker 032830
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --order-status failed
+  PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --verify-account-match
+  PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --show-position-ledger
 """
 
 from __future__ import annotations
@@ -22,6 +24,15 @@ from typing import Any, Dict, List, Tuple
 
 from utils import KST, OUTPUT_DIR, setup_logging, get_account_snapshot_cached
 from stale_sell_pending import find_stale_sell_pending_candidates, get_stale_pending_sell_hours
+from position_ledger import (
+    analyze_account_db_match,
+    build_position_ledger,
+    compute_open_positions,
+    compute_paper_open_positions,
+    format_repair_candidate_line,
+    load_all_trade_rows,
+    norm_ticker,
+)
 
 DB_PATH = OUTPUT_DIR / "trading_data.db"
 
@@ -62,40 +73,6 @@ def _print_rows(rows: List[Dict[str, Any]], title: str) -> None:
         )
 
 
-def _compute_db_open_positions() -> Dict[str, int]:
-    """DB executed 체결 기준 순보유 수량."""
-    rows = _fetch_rows(limit=10000, order="timestamp ASC")
-    qty_by_ticker: Dict[str, int] = defaultdict(int)
-    executed_statuses = {"executed", "partial", "completed", "paper_executed"}
-    for r in rows:
-        status = str(r.get("order_status") or "").lower()
-        if status not in executed_statuses:
-            continue
-        exe = int(r.get("executed_qty") or r.get("quantity") or 0)
-        if exe <= 0:
-            continue
-        ticker = str(r.get("ticker") or "").zfill(6)
-        action = str(r.get("action") or "").upper()
-        if action == "BUY":
-            qty_by_ticker[ticker] += exe
-        elif action == "SELL":
-            qty_by_ticker[ticker] -= exe
-    return {t: q for t, q in qty_by_ticker.items() if q > 0}
-
-
-def _load_pending_sell_by_ticker() -> Dict[str, List[Dict[str, Any]]]:
-    """ticker → pending/partial SELL 목록."""
-    rows = _fetch_rows(
-        "WHERE UPPER(action) = 'SELL' AND lower(order_status) IN ('pending','partial')",
-        limit=500,
-    )
-    by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in rows:
-        ticker = str(r.get("ticker") or "").zfill(6)
-        by_ticker[ticker].append(r)
-    return dict(by_ticker)
-
-
 def _get_account_qty_by_ticker() -> Tuple[Dict[str, int], str]:
     """balance 스냅샷 기준 계좌 보유 수량."""
     _, holdings, _, balance_path = get_account_snapshot_cached(
@@ -116,55 +93,120 @@ def _get_account_qty_by_ticker() -> Tuple[Dict[str, int], str]:
     return qty_map, source
 
 
-def _verify_account_match() -> int:
-    db_positions = _compute_db_open_positions()
+def _verify_account_match(*, include_paper_executed: bool = False) -> int:
+    rows = load_all_trade_rows(str(DB_PATH))
     account_positions, source = _get_account_qty_by_ticker()
-    pending_sells = _load_pending_sell_by_ticker()
     if not account_positions:
         print(
             "[ACCOUNT_DB_MATCH] status=skip reason=no_balance_snapshot "
             "(KIS account.py 실행 또는 balance_*.json 필요)"
         )
         return 1
+
+    analysis = analyze_account_db_match(
+        rows,
+        account_positions,
+        include_paper_executed=include_paper_executed,
+    )
+    open_positions = analysis["open_positions"]
+    paper_positions = analysis["paper_positions"]
+
     print(f"[ACCOUNT_DB_MATCH] account_source={source}")
     print(
-        f"[ACCOUNT_DB_MATCH] db_open_tickers={len(db_positions)} "
-        f"account_tickers={len(account_positions)} "
-        f"pending_sell_tickers={len(pending_sells)}"
+        f"[ACCOUNT_DB_MATCH] open_basis=executed,partial "
+        f"include_paper_executed={include_paper_executed}"
     )
-    all_tickers = sorted(set(db_positions) | set(account_positions))
+    print(
+        f"[ACCOUNT_DB_MATCH] db_open_tickers={len(open_positions)} "
+        f"account_tickers={len(account_positions)} "
+        f"pending_count={analysis['pending_count']} "
+        f"paper_bucket_tickers={len(paper_positions)}"
+    )
+
+    all_tickers = sorted(set(open_positions) | set(account_positions))
     mismatches = 0
     for ticker in all_tickers:
-        db_qty = int(db_positions.get(ticker, 0))
+        db_qty = int(open_positions.get(ticker, 0))
         account_qty = int(account_positions.get(ticker, 0))
         status = "ok" if db_qty == account_qty else "mismatch"
-        pending_ids: List[str] = []
-        pending_note = ""
+        note = ""
         if status == "mismatch":
             mismatches += 1
-            sells = pending_sells.get(ticker) or []
-            if sells and db_qty > account_qty:
-                pending_ids = [str(s.get("id")) for s in sells]
-                pending_note = (
-                    f" pending_sell_ids={','.join(pending_ids)}"
-                    f" (DB still counts open qty; SELL not executed in DB)"
+            mm = next(
+                (m for m in analysis["mismatches"] if m["ticker"] == ticker),
+                None,
+            )
+            if mm:
+                note = (
+                    f" reason={mm.get('mismatch_reason')} "
+                    f"related_ids={mm.get('related_trade_ids')}"
                 )
-            elif db_qty > 0 and account_qty == 0:
-                pending_note = " account_empty_db_still_open (reconcile candidate)"
         print(
             f"[ACCOUNT_DB_MATCH] ticker={ticker} db_qty={db_qty} "
-            f"account_qty={account_qty} status={status}{pending_note}"
+            f"account_qty={account_qty} status={status}{note}"
         )
-    if pending_sells:
-        print(f"\n=== pending SELL by ticker ({sum(len(v) for v in pending_sells.values())}건) ===")
-        for ticker, rows in sorted(pending_sells.items()):
-            for r in rows:
-                print(
-                    f"  id={r.get('id')} ticker={ticker} order_id={r.get('order_id')} "
-                    f"requested_qty={r.get('requested_qty') or r.get('quantity')} "
-                    f"reason={r.get('reason_code') or ''}"
-                )
+
+    if paper_positions:
+        print(f"\n=== paper_executed bucket ({len(paper_positions)} tickers) ===")
+        for ticker, qty in sorted(paper_positions.items()):
+            print(f"  ticker={ticker} paper_qty={qty}")
+
+    repair_candidates = analysis.get("repair_candidates") or []
+    if repair_candidates:
+        print(f"\n=== position repair candidates (dry-run, {len(repair_candidates)}건) ===")
+        for c in repair_candidates:
+            print(format_repair_candidate_line(c))
+
+    pending_rows = analysis.get("pending_rows") or []
+    if pending_rows:
+        print(f"\n=== pending/partial ({len(pending_rows)}건, open qty 미포함) ===")
+        for r in pending_rows:
+            print(
+                f"  id={r.get('id')} ticker={norm_ticker(r.get('ticker'))} "
+                f"action={r.get('action')} status={r.get('order_status')} "
+                f"order_id={r.get('order_id')} qty={r.get('executed_qty') or r.get('quantity')}"
+            )
+
     return 1 if mismatches else 0
+
+
+def _show_position_ledger(*, include_paper_executed: bool = False, ticker: str = "") -> int:
+    rows = load_all_trade_rows(str(DB_PATH))
+    if ticker:
+        t = norm_ticker(ticker)
+        rows = [r for r in rows if norm_ticker(r.get("ticker")) == t]
+
+    ledger = build_position_ledger(rows, include_paper_executed=include_paper_executed)
+    open_positions = compute_open_positions(rows, include_paper_executed=include_paper_executed)
+    paper_positions = compute_paper_open_positions(rows)
+
+    print(
+        f"[POSITION_LEDGER] rows={len(ledger)} include_paper_executed={include_paper_executed}"
+    )
+    print(f"[POSITION_LEDGER] open_positions={dict(sorted(open_positions.items()))}")
+    if paper_positions:
+        print(f"[POSITION_LEDGER] paper_bucket={dict(sorted(paper_positions.items()))}")
+
+    by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for entry in ledger:
+        by_ticker[entry["ticker"]].append(entry)
+
+    for t in sorted(by_ticker):
+        entries = by_ticker[t]
+        print(f"\n--- ticker={t} open_qty={open_positions.get(t, 0)} ---")
+        for e in entries:
+            note = ""
+            if e.get("repair_note"):
+                note = f" repair_note={e['repair_note']}"
+            excl = e.get("exclude_reason") or "-"
+            print(
+                f"  id={e.get('id')} action={e.get('action')} status={e.get('order_status')} "
+                f"qty={e.get('executed_qty')} order_id={e.get('order_id') or ''} "
+                f"included={e.get('included')} exclude_reason={excl} "
+                f"delta={e.get('open_qty_delta')} running_open={e.get('running_open_qty')}"
+                f"{note}"
+            )
+    return 0
 
 
 def main() -> int:
@@ -180,13 +222,29 @@ def main() -> int:
     parser.add_argument(
         "--verify-account-match",
         action="store_true",
-        help="DB executed open position과 account balance 보유 수량 비교",
+        help="DB open position(executed/partial)과 account balance 비교",
+    )
+    parser.add_argument(
+        "--show-position-ledger",
+        action="store_true",
+        help="ticker별 position ledger (included/exclude_reason)",
+    )
+    parser.add_argument(
+        "--include-paper-executed",
+        action="store_true",
+        help="open position 계산에 paper_executed 포함",
     )
     parser.add_argument("--limit", type=int, default=100, help="최대 조회 건수")
     args = parser.parse_args()
 
     if args.verify_account_match:
-        return _verify_account_match()
+        return _verify_account_match(include_paper_executed=args.include_paper_executed)
+
+    if args.show_position_ledger:
+        return _show_position_ledger(
+            include_paper_executed=args.include_paper_executed,
+            ticker=args.ticker or "",
+        )
 
     if args.stale_sell_pending:
         stale_hours = args.stale_hours if args.stale_hours is not None else get_stale_pending_sell_hours()

@@ -20,6 +20,7 @@ from settings import settings
 from utils import setup_logging, KST, get_account_snapshot_cached
 from api.kis_auth import KIS
 from recorder import get_recorder, log_trade_record_classify
+from position_ledger import compute_open_positions, load_all_trade_rows
 
 try:
     from db_debug import log as _db_dbg_log, log_skip as _db_dbg_skip, is_enabled as _db_dbg_enabled
@@ -255,27 +256,13 @@ def _append_reason_code(existing: str, code: str) -> str:
 
 
 def _compute_db_open_positions(recorder) -> Dict[str, int]:
-    """DB executed 체결 기준 순보유 수량 (pending SELL은 아직 차감되지 않음)."""
-    qty_by_ticker: Dict[str, int] = {}
-    executed_statuses = {"executed", "partial", "completed", "paper_executed"}
+    """DB executed/partial 기준 순보유 (paper_executed 제외)."""
     try:
-        rows = recorder.get_trade_records()
-        for row in rows:
-            status = str(getattr(row, "order_status", "") or "").lower()
-            if status not in executed_statuses:
-                continue
-            exe = _safe_int(getattr(row, "executed_qty", 0) or getattr(row, "quantity", 0))
-            if exe <= 0:
-                continue
-            ticker = str(getattr(row, "ticker", "") or "").zfill(6)
-            action = str(getattr(row, "action", "") or "").upper()
-            if action == "BUY":
-                qty_by_ticker[ticker] = qty_by_ticker.get(ticker, 0) + exe
-            elif action == "SELL":
-                qty_by_ticker[ticker] = qty_by_ticker.get(ticker, 0) - exe
+        rows = load_all_trade_rows(str(recorder.db_path))
+        return compute_open_positions(rows, include_paper_executed=False)
     except Exception as e:
         logger.warning("DB open position 계산 실패: %s", e)
-    return {t: q for t, q in qty_by_ticker.items() if q > 0}
+        return {}
 
 
 def _account_holding_qty(
