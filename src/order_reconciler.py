@@ -237,13 +237,106 @@ def _holding_fill_price(holding: Dict[str, Any]) -> Optional[int]:
     return prpr if prpr > 0 else None
 
 
+_HOLDING_FALLBACK_SELL_REASON = "RECONCILED_BY_HOLDING_FALLBACK_SELL"
+
+
+def _append_reason_code(existing: str, code: str) -> str:
+    existing = str(existing or "").strip()
+    code = str(code or "").strip()
+    if not code:
+        return existing
+    if not existing:
+        return code
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if code in parts:
+        return existing
+    parts.append(code)
+    return ",".join(parts)
+
+
+def _compute_db_open_positions(recorder) -> Dict[str, int]:
+    """DB executed 체결 기준 순보유 수량 (pending SELL은 아직 차감되지 않음)."""
+    qty_by_ticker: Dict[str, int] = {}
+    executed_statuses = {"executed", "partial", "completed", "paper_executed"}
+    try:
+        rows = recorder.get_trade_records()
+        for row in rows:
+            status = str(getattr(row, "order_status", "") or "").lower()
+            if status not in executed_statuses:
+                continue
+            exe = _safe_int(getattr(row, "executed_qty", 0) or getattr(row, "quantity", 0))
+            if exe <= 0:
+                continue
+            ticker = str(getattr(row, "ticker", "") or "").zfill(6)
+            action = str(getattr(row, "action", "") or "").upper()
+            if action == "BUY":
+                qty_by_ticker[ticker] = qty_by_ticker.get(ticker, 0) + exe
+            elif action == "SELL":
+                qty_by_ticker[ticker] = qty_by_ticker.get(ticker, 0) - exe
+    except Exception as e:
+        logger.warning("DB open position 계산 실패: %s", e)
+    return {t: q for t, q in qty_by_ticker.items() if q > 0}
+
+
+def _account_holding_qty(
+    ticker: str,
+    holdings_by_ticker: Dict[str, Dict[str, Any]],
+) -> int:
+    holding = holdings_by_ticker.get(str(ticker).zfill(6))
+    if not holding:
+        return 0
+    return _safe_int(holding.get("hldg_qty", 0))
+
+
+def _try_reconcile_sell_by_holding(
+    row: Dict[str, Any],
+    holdings_by_ticker: Dict[str, Dict[str, Any]],
+    db_open_positions: Dict[str, int],
+    *,
+    kis_query_status: str = "miss",
+) -> Optional[Dict[str, Any]]:
+    """
+    KIS 주문조회 miss/pending(미체결) 시 SELL pending을 계좌 잔고로 executed 판정.
+    - DB open qty > 0 이고 account qty == 0 이면 체결된 것으로 간주.
+    - 실제 미체결 vs 수동 매도 구분 불가 → 로그에 근거를 남긴다.
+    """
+    action = str(row.get("action") or row.get("side") or "").strip().upper()
+    if action not in ("SELL", "S"):
+        return None
+
+    ticker = str(row.get("ticker") or "").zfill(6)
+    requested_qty = _row_target_qty(row)
+    if not ticker or requested_qty <= 0:
+        return None
+
+    db_open_qty = _safe_int(db_open_positions.get(ticker, 0))
+    if db_open_qty <= 0:
+        return None
+
+    account_qty = _account_holding_qty(ticker, holdings_by_ticker)
+    if account_qty > 0:
+        return None
+
+    return {
+        "status": "executed",
+        "executed_qty": requested_qty,
+        "db_open_qty": db_open_qty,
+        "account_qty": account_qty,
+        "kis_query_status": kis_query_status,
+        "evidence": "db_open_qty_gt_0_and_account_qty_zero",
+        "caveat": (
+            "cannot_distinguish_manual_sell_vs_kis_unfilled;"
+            "if_shares_sold_manually_this_order_may_still_be_open_at_broker"
+        ),
+    }
+
+
 def _try_reconcile_buy_by_holding(
     row: Dict[str, Any],
     holdings_by_ticker: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     """
     KIS 주문조회 miss 시 BUY pending을 계좌 잔고로 executed 판정.
-    SELL은 별도 로직(미구현) — None 반환.
     """
     action = str(row.get("action") or row.get("side") or "").strip().upper()
     if action not in ("BUY", "B"):
@@ -282,28 +375,33 @@ def _apply_reconcile_update(
     executed_qty: int,
     price: Optional[int],
     reconciled_price_source: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    extra_context: Optional[Dict[str, Any]] = None,
 ) -> int:
     amount: Optional[int] = None
     ctx_updates: Optional[Dict[str, Any]] = None
     original_price = _safe_int(row.get("price", 0))
     if price and executed_qty > 0:
         amount = int(price) * int(executed_qty)
-        if reconciled_price_source and (
+    if reconciled_price_source or extra_context:
+        ctx_updates = dict(extra_context or {})
+        if reconciled_price_source:
+            ctx_updates["reconciled_price_source"] = reconciled_price_source
+            ctx_updates["reconcile_source"] = reconciled_price_source
+        if price and executed_qty > 0 and (
             original_price != int(price)
-            or _safe_int(row.get("amount", 0)) != amount
+            or _safe_int(row.get("amount", 0)) != (amount or 0)
         ):
-            ctx_updates = {
-                "original_order_price": original_price if original_price > 0 else None,
-                "reconciled_price_source": reconciled_price_source,
-                "reconciled_price": int(price),
-                "reconciled_amount": amount,
-            }
+            ctx_updates["original_order_price"] = original_price if original_price > 0 else None
+            ctx_updates["reconciled_price"] = int(price)
+            ctx_updates["reconciled_amount"] = amount
     return recorder.update_order_status(
         order_id=order_id,
         order_status=new_status,
         executed_qty=executed_qty,
         price=price if price and price > 0 else None,
         amount=float(amount) if amount is not None else None,
+        reason_code=reason_code,
         structured_context=json.dumps(ctx_updates, ensure_ascii=False) if ctx_updates else None,
         merge_context=bool(ctx_updates),
     )
@@ -692,7 +790,12 @@ def reconcile_open_orders(
     )
     daily_orders: Optional[Dict[str, Dict[str, Any]]] = None
     holdings_by_ticker = _load_holdings_by_ticker()
-    logger.info("holding fallback용 잔고 종목: %d건", len(holdings_by_ticker))
+    db_open_positions = _compute_db_open_positions(recorder)
+    logger.info(
+        "holding fallback용 잔고 종목: %d건, DB open positions: %d건",
+        len(holdings_by_ticker),
+        len(db_open_positions),
+    )
 
     updated = 0
     to_executed = 0
@@ -704,6 +807,7 @@ def reconcile_open_orders(
     updated_by_order_query = 0
     updated_by_daily_query = 0
     updated_by_holding_fallback = 0
+    updated_by_holding_fallback_sell = 0
     still_missing_after_all = 0
     still_missing_rows: List[Dict[str, Any]] = []
 
@@ -718,6 +822,10 @@ def reconcile_open_orders(
                 ticker=r.get("ticker"),
             )
             continue
+
+        action = str(r.get("action") or r.get("side") or "").strip().upper()
+        is_sell = action in ("SELL", "S")
+        ticker = str(r.get("ticker") or "").zfill(6)
 
         reconcile_source = None
         kis_o = open_orders.get(order_id)
@@ -735,15 +843,88 @@ def reconcile_open_orders(
                 reconcile_source = "daily_query"
 
         holding_match: Optional[Dict[str, Any]] = None
+        sell_holding_match: Optional[Dict[str, Any]] = None
+        kis_exe_early = _safe_int(kis_o.get("executed_qty", 0)) if kis_o else 0
+        kis_query_status = reconcile_source or "miss"
+
+        if is_sell and (not kis_o or (kis_exe_early <= 0 and not kis_o.get("cancelled"))):
+            sell_holding_match = _try_reconcile_sell_by_holding(
+                r,
+                holdings_by_ticker,
+                db_open_positions,
+                kis_query_status=kis_query_status,
+            )
+            if sell_holding_match:
+                reconcile_source = "holding_fallback_sell"
+                new_status = str(sell_holding_match.get("status") or "executed")
+                kis_exe = _safe_int(sell_holding_match.get("executed_qty", 0))
+                existing_reason = str(r.get("reason_code") or "")
+                new_reason = _append_reason_code(
+                    existing_reason, _HOLDING_FALLBACK_SELL_REASON
+                )
+                if _is_already_reconciled(
+                    r, new_status=new_status, executed_qty=kis_exe, price=None
+                ):
+                    _db_dbg_skip(
+                        "reconciler.loop.SKIP_ALREADY_EXECUTED",
+                        reason="holding fallback sell but row already reconciled",
+                        order_id=order_id,
+                        ticker=ticker,
+                    )
+                    continue
+                logger.warning(
+                    "[RECONCILE_BY_HOLDING_FALLBACK_SELL] order_id=%s ticker=%s "
+                    "requested_qty=%s db_open_qty=%s account_qty=%s kis_query_status=%s "
+                    "evidence=%s caveat=%s",
+                    order_id,
+                    ticker,
+                    _row_target_qty(r),
+                    sell_holding_match.get("db_open_qty"),
+                    sell_holding_match.get("account_qty"),
+                    sell_holding_match.get("kis_query_status"),
+                    sell_holding_match.get("evidence"),
+                    sell_holding_match.get("caveat"),
+                )
+                extra_ctx = {
+                    "reconcile_evidence": sell_holding_match.get("evidence"),
+                    "reconcile_caveat": sell_holding_match.get("caveat"),
+                    "db_open_qty_at_reconcile": sell_holding_match.get("db_open_qty"),
+                    "account_qty_at_reconcile": sell_holding_match.get("account_qty"),
+                    "kis_query_status": sell_holding_match.get("kis_query_status"),
+                }
+                n = _apply_reconcile_update(
+                    recorder,
+                    order_id=order_id,
+                    row=r,
+                    new_status=new_status,
+                    executed_qty=kis_exe,
+                    price=None,
+                    reconciled_price_source="holding_fallback_sell",
+                    reason_code=new_reason,
+                    extra_context=extra_ctx,
+                )
+                if n:
+                    updated += n
+                    updated_by_holding_fallback_sell += n
+                    if new_status == "executed":
+                        to_executed += n
+                    db_open_positions[ticker] = max(
+                        0,
+                        _safe_int(db_open_positions.get(ticker, 0)) - kis_exe,
+                    )
+                    if db_open_positions.get(ticker, 0) <= 0:
+                        db_open_positions.pop(ticker, None)
+                continue
+
         if not kis_o:
             skipped_kis_miss += 1
-            ticker = str(r.get("ticker") or "").zfill(6)
             logger.warning(
-                "KIS 주문조회 miss: order_id=%s ticker=%s db_status=%s — holding fallback 시도",
-                order_id, ticker, r.get("order_status"),
+                "KIS 주문조회 miss: order_id=%s ticker=%s db_status=%s action=%s — holding fallback 시도",
+                order_id, ticker, r.get("order_status"), action,
             )
-            holding_match = _try_reconcile_buy_by_holding(r, holdings_by_ticker)
-            if not holding_match:
+            if not is_sell:
+                holding_match = _try_reconcile_buy_by_holding(r, holdings_by_ticker)
+            if not holding_match and not sell_holding_match:
                 still_missing_after_all += 1
                 still_missing_rows.append(r)
                 _db_dbg_skip(
@@ -762,6 +943,8 @@ def reconcile_open_orders(
                     db_ticker=r.get("ticker"),
                     db_requested_qty=r.get("requested_qty"),
                 )
+                continue
+            if is_sell:
                 continue
             reconcile_source = "holding_fallback"
 
@@ -882,6 +1065,7 @@ def reconcile_open_orders(
         "updated_by_order_query": updated_by_order_query,
         "updated_by_daily_query": updated_by_daily_query,
         "updated_by_holding_fallback": updated_by_holding_fallback,
+        "updated_by_holding_fallback_sell": updated_by_holding_fallback_sell,
         "still_missing_after_all": still_missing_after_all,
         "still_missing_rows": still_missing_rows,
         # legacy keys

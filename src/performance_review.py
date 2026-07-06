@@ -23,6 +23,7 @@ from utils import (
     KST,
     OUTPUT_DIR,
     extract_kis_official_summary,
+    get_account_snapshot_cached,
     load_config,
     setup_logging,
 )
@@ -52,7 +53,11 @@ _SUMMARY_KEY_MAP = {
 }
 
 _RECONCILE_HOLDING_RE = re.compile(
-    r"\[RECONCILE_BY_HOLDING\]\s+order_id=(\S+)\s+ticker=(\d+)",
+    r"\[RECONCILE_BY_HOLDING(?:_FALLBACK_SELL)?\]\s+order_id=(\S+)\s+ticker=(\d+)",
+    re.I,
+)
+_AUTO_SELL_MIN_HOLDING_BYPASS_RE = re.compile(
+    r"\[AUTO_SELL_MIN_HOLDING_BYPASS\]\s+ticker=(\S+)\s+reason=(\S+)\s+holding_hours=([\d.]+)",
     re.I,
 )
 _RUN_ID_IN_LINE_RE = re.compile(r"\[(\d{8}-\d{6})\]")
@@ -384,10 +389,22 @@ def _asset_class(ticker: str, bond_tickers: set) -> str:
 
 
 def _parse_reconcile_holding_map(log_text: str) -> Dict[str, str]:
-    """order_id → holding_fallback."""
+    """order_id → holding_fallback / holding_fallback_sell."""
     out: Dict[str, str] = {}
     for m in _RECONCILE_HOLDING_RE.finditer(log_text):
-        out[str(m.group(1)).strip()] = "holding_fallback"
+        method = "holding_fallback_sell" if "FALLBACK_SELL" in m.group(0).upper() else "holding_fallback"
+        out[str(m.group(1)).strip()] = method
+    return out
+
+
+def _parse_auto_sell_min_holding_bypasses(log_text: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for m in _AUTO_SELL_MIN_HOLDING_BYPASS_RE.finditer(log_text):
+        out.append({
+            "ticker": _norm_ticker(m.group(1)),
+            "reason": m.group(2),
+            "holding_hours": _safe_float(m.group(3)),
+        })
     return out
 
 
@@ -1067,6 +1084,8 @@ def _infer_reconcile_method(
 
     ctx = _parse_structured_context(row.get("structured_context"))
     src = str(ctx.get("reconciled_price_source") or ctx.get("reconcile_source") or "").lower()
+    if "holding_fallback_sell" in src or src == "holding_fallback_sell":
+        return "holding_fallback_sell"
     if "holding" in src:
         return "holding_fallback"
     if src in ("order_query", "daily_query", "manual", "kis_order_query"):
@@ -1284,7 +1303,7 @@ def _load_trade_rows(date_str: str) -> List[Dict[str, Any]]:
             """
             SELECT id, timestamp, ticker, action, quantity, price, amount,
                    order_status, order_id, requested_qty, executed_qty,
-                   structured_context, last_status_update_ts
+                   structured_context, last_status_update_ts, reason_code
             FROM trade_records
             WHERE timestamp LIKE ? OR timestamp LIKE ?
             ORDER BY timestamp
@@ -1296,6 +1315,220 @@ def _load_trade_rows(date_str: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("trade_records 조회 실패: %s", e)
     return rows
+
+
+def _load_live_pending_orders() -> List[Dict[str, Any]]:
+    """DB 최신 pending/partial 주문 (리뷰 날짜 무관)."""
+    db_path = OUTPUT_DIR / "trading_data.db"
+    if not db_path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT id, timestamp, ticker, action, quantity, price, amount,
+                   order_status, order_id, requested_qty, executed_qty,
+                   structured_context, reason_code
+            FROM trade_records
+            WHERE lower(order_status) IN ('pending', 'partial')
+            ORDER BY timestamp DESC
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning("live pending 조회 실패: %s", e)
+        return []
+
+
+def _load_sell_rows_for_tickers(tickers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """ticker별 SELL 기록 (최신순)."""
+    if not tickers:
+        return {}
+    db_path = OUTPUT_DIR / "trading_data.db"
+    if not db_path.is_file():
+        return {}
+    normalized = sorted({_norm_ticker(t) for t in tickers if t})
+    if not normalized:
+        return {}
+    placeholders = ",".join("?" * len(normalized))
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            f"""
+            SELECT id, timestamp, ticker, action, quantity, price, amount,
+                   order_status, order_id, requested_qty, executed_qty,
+                   structured_context, reason_code
+            FROM trade_records
+            WHERE UPPER(action) = 'SELL' AND ticker IN ({placeholders})
+            ORDER BY timestamp DESC
+            """,
+            normalized,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        logger.warning("SELL rows 조회 실패: %s", e)
+        return {}
+    by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_ticker[_norm_ticker(r.get("ticker"))].append(r)
+    return dict(by_ticker)
+
+
+def _compute_db_open_positions_all() -> Dict[str, int]:
+    """전체 DB executed 기준 open position."""
+    db_path = OUTPUT_DIR / "trading_data.db"
+    if not db_path.is_file():
+        return {}
+    qty_by_ticker: Dict[str, int] = defaultdict(int)
+    executed_statuses = {"executed", "partial", "completed", "paper_executed"}
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT ticker, action, executed_qty, quantity, order_status
+            FROM trade_records
+            ORDER BY timestamp ASC
+            """
+        )
+        for r in cur.fetchall():
+            row = dict(r)
+            status = str(row.get("order_status") or "").lower()
+            if status not in executed_statuses:
+                continue
+            exe = _safe_int(row.get("executed_qty") or row.get("quantity"))
+            if exe <= 0:
+                continue
+            ticker = _norm_ticker(row.get("ticker"))
+            action = str(row.get("action") or "").upper()
+            if action == "BUY":
+                qty_by_ticker[ticker] += exe
+            elif action == "SELL":
+                qty_by_ticker[ticker] -= exe
+        conn.close()
+    except Exception as e:
+        logger.warning("DB open position 계산 실패: %s", e)
+    return {t: q for t, q in qty_by_ticker.items() if q > 0}
+
+
+def _get_account_qty_snapshot() -> Tuple[Dict[str, int], str]:
+    _, holdings, _, balance_path = get_account_snapshot_cached(
+        summary_pattern="summary_*.json",
+        balance_pattern="balance_*.json",
+        ttl_sec=5,
+    )
+    if not holdings:
+        return {}, "balance_snapshot_missing"
+    qty_map: Dict[str, int] = {}
+    for h in holdings:
+        qty = _safe_int(h.get("hldg_qty", 0))
+        if qty <= 0:
+            continue
+        ticker = _norm_ticker(h.get("pdno", h.get("ticker")))
+        qty_map[ticker] = qty
+    source = f"balance_file:{balance_path.name}" if balance_path else "balance_snapshot"
+    return qty_map, source
+
+
+def _extract_sell_reason_label(row: Dict[str, Any]) -> str:
+    reason_code = str(row.get("reason_code") or "")
+    for label in ("EmergencyDrop", "TakeProfit", "StopLoss"):
+        if label in reason_code:
+            return label
+    ctx = _parse_structured_context(row.get("structured_context"))
+    sell_type = str(ctx.get("type") or ctx.get("strategy_details", {}).get("type") or "")
+    for label in ("EmergencyDrop", "TakeProfit", "StopLoss", "PartialProfit"):
+        if label in sell_type:
+            return label
+    return reason_code.split(",")[0] if reason_code else "unknown"
+
+
+def _summarize_sell_for_ticker(sell_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not sell_rows:
+        return {
+            "sell_occurred": False,
+            "sell_status": None,
+            "sell_reason": None,
+            "sell_qty": 0,
+            "sell_amount": None,
+            "sell_order_id": None,
+            "sell_record_id": None,
+        }
+    latest = sell_rows[0]
+    status = str(latest.get("order_status") or "").lower()
+    qty = _safe_int(latest.get("executed_qty") or latest.get("requested_qty") or latest.get("quantity"))
+    price = _safe_int(latest.get("price"))
+    amount = _safe_int(latest.get("amount")) or (qty * price if qty and price else 0)
+    return {
+        "sell_occurred": status in ("executed", "partial", "completed", "pending"),
+        "sell_status": status,
+        "sell_reason": _extract_sell_reason_label(latest),
+        "sell_qty": qty,
+        "sell_amount": amount if amount > 0 else None,
+        "sell_order_id": latest.get("order_id"),
+        "sell_record_id": latest.get("id"),
+    }
+
+
+def _detect_account_db_mismatch(
+    review_tickers: List[str],
+    pending_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    db_positions = _compute_db_open_positions_all()
+    account_positions, account_source = _get_account_qty_snapshot()
+    pending_sells = [
+        r for r in pending_rows
+        if str(r.get("action") or "").upper() == "SELL"
+    ]
+    pending_by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in pending_sells:
+        pending_by_ticker[_norm_ticker(r.get("ticker"))].append(r)
+
+    relevant_tickers = sorted(
+        set(review_tickers) | set(db_positions) | set(account_positions) | set(pending_by_ticker)
+    )
+    mismatches: List[Dict[str, Any]] = []
+    for ticker in relevant_tickers:
+        db_qty = _safe_int(db_positions.get(ticker, 0))
+        account_qty = _safe_int(account_positions.get(ticker, 0))
+        if db_qty == account_qty:
+            continue
+        pending_ids = [r.get("id") for r in pending_by_ticker.get(ticker, [])]
+        mismatches.append({
+            "ticker": ticker,
+            "db_qty": db_qty,
+            "account_qty": account_qty,
+            "pending_sell_ids": pending_ids,
+            "likely_pending_sell_mismatch": bool(pending_ids and db_qty > account_qty),
+        })
+
+    out = {
+        "account_source": account_source,
+        "db_open_tickers": len(db_positions),
+        "account_tickers": len(account_positions),
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+        "pending_sell_count": len(pending_sells),
+        "pending_sell_rows": pending_sells,
+    }
+    if mismatches:
+        logger.warning(
+            "[PERF_ACCOUNT_DB_MISMATCH] mismatch_count=%s pending_sell=%s account_source=%s",
+            len(mismatches),
+            len(pending_sells),
+            account_source,
+        )
+        for m in mismatches[:10]:
+            logger.warning(
+                "[PERF_ACCOUNT_DB_MISMATCH] ticker=%s db_qty=%s account_qty=%s pending_sell_ids=%s",
+                m["ticker"], m["db_qty"], m["account_qty"], m["pending_sell_ids"],
+            )
+    return out
 
 
 def _build_screener_maps(candidates: List[Dict[str, Any]], scores: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, float]]:
@@ -1587,9 +1820,10 @@ def _build_execution_performance(
     kis_trade_rows: List[Dict[str, Any]],
     reconcile_map: Optional[Dict[str, str]] = None,
     paper_db_only_rows: Optional[List[Dict[str, Any]]] = None,
+    live_pending_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     submitted = executed = pending = cancelled = failed = 0
-    reconciled = holding_fb = unreconciled = 0
+    reconciled = holding_fb = holding_fb_sell = unreconciled = 0
     slippages: List[float] = []
     pending_durations: List[float] = []
 
@@ -1613,6 +1847,8 @@ def _build_execution_performance(
             reconciled += 1
             if method == "holding_fallback":
                 holding_fb += 1
+            elif method == "holding_fallback_sell":
+                holding_fb_sell += 1
         elif status in ("pending", "failed") and order_id:
             unreconciled += 1
 
@@ -1647,6 +1883,13 @@ def _build_execution_performance(
             except Exception:
                 pass
 
+    live_pending = live_pending_rows or []
+    live_pending_count = len(live_pending)
+    live_pending_sell_count = sum(
+        1 for r in live_pending if str(r.get("action") or "").upper() == "SELL"
+    )
+    review_date_pending_count = pending
+
     paper_db_only_submitted = sum(
         1 for r in (paper_db_only_rows or [])
         if str(r.get("action", "")).upper() == "BUY"
@@ -1657,7 +1900,9 @@ def _build_execution_performance(
         "order_count": order_count,
         "submitted_order_count": submitted,
         "executed_order_count": executed,
-        "pending_order_count": pending,
+        "pending_order_count": live_pending_count,
+        "review_date_pending_order_count": review_date_pending_count,
+        "live_pending_sell_count": live_pending_sell_count,
         "cancelled_order_count": cancelled,
         "failed_order_count": failed,
         "execution_rate": execution_rate,
@@ -1665,16 +1910,30 @@ def _build_execution_performance(
         "slippage_pct_avg": round(sum(slippages) / len(slippages), 6) if slippages else None,
         "reconciled_count": reconciled,
         "reconciled_by_holding_count": holding_fb,
+        "reconciled_by_holding_sell_count": holding_fb_sell,
         "unreconciled_count": unreconciled,
         "paper_db_only_submitted": paper_db_only_submitted,
         "orders": order_details,
+        "live_pending_orders": [
+            {
+                "id": r.get("id"),
+                "ticker": _norm_ticker(r.get("ticker")),
+                "action": str(r.get("action") or "").upper(),
+                "order_status": str(r.get("order_status") or "").lower(),
+                "order_id": r.get("order_id"),
+                "reason_code": r.get("reason_code"),
+            }
+            for r in live_pending
+        ],
     }
     logger.info(
-        "[PERF_EXECUTION] submitted=%s executed=%s pending=%s execution_rate=%s "
-        "reconciled_by_holding=%s unreconciled=%s paper_db_only=%s",
+        "[PERF_EXECUTION] submitted=%s executed=%s pending_live=%s pending_review_date=%s "
+        "pending_sell_live=%s execution_rate=%s reconciled_by_holding=%s unreconciled=%s paper_db_only=%s",
         perf["submitted_order_count"],
         perf["executed_order_count"],
         perf["pending_order_count"],
+        perf["review_date_pending_order_count"],
+        perf["live_pending_sell_count"],
         perf["execution_rate"],
         perf["reconciled_by_holding_count"],
         perf["unreconciled_count"],
@@ -1749,6 +2008,7 @@ def _build_candidate_tracking_snapshot(
     gpt_plans: List[Dict[str, Any]],
     trade_rows: List[Dict[str, Any]],
     balance_rows: List[Dict[str, Any]],
+    sell_by_ticker: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     gpt_by_ticker = {_plan_ticker(p): p for p in gpt_plans}
     trade_by_ticker = {
@@ -1756,10 +2016,14 @@ def _build_candidate_tracking_snapshot(
         for r in trade_rows
         if str(r.get("action", "")).upper() == "BUY"
     }
+    sell_by_ticker = sell_by_ticker or {}
     close_prices = {
         _norm_ticker(r.get("pdno")): _safe_float(r.get("prpr"))
         for r in balance_rows
     }
+
+    def _sell_fields(ticker: str) -> Dict[str, Any]:
+        return _summarize_sell_for_ticker(sell_by_ticker.get(ticker, []))
 
     tickers = set()
     for row in candidates or []:
@@ -1800,6 +2064,7 @@ def _build_candidate_tracking_snapshot(
             "return_3d": None,
             "return_5d": None,
             "return_10d": None,
+            **_sell_fields(ticker),
         })
 
     for ticker, plan in gpt_by_ticker.items():
@@ -1829,6 +2094,7 @@ def _build_candidate_tracking_snapshot(
             "return_3d": None,
             "return_5d": None,
             "return_10d": None,
+            **_sell_fields(ticker),
         })
 
     buy_n = sum(1 for r in out if r.get("gpt_action") == "BUY")
@@ -1903,6 +2169,7 @@ def _build_summary(
     balance_rows: List[Dict[str, Any]],
     kis_trade_rows: List[Dict[str, Any]],
     execution: Dict[str, Any],
+    reconciliation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     buy_trades = [
         r for r in kis_trade_rows
@@ -1917,6 +2184,8 @@ def _build_summary(
         "holdings_count": len(holdings),
         "new_buy_count": len(buy_trades),
         "pending_orders": execution.get("pending_order_count", 0),
+        "pending_sell_orders": execution.get("live_pending_sell_count", 0),
+        "account_db_mismatch_count": (reconciliation or {}).get("mismatch_count", 0),
         "dnca_tot_amt": _safe_int(account_summary.get("dnca_tot_amt")),
         "prvs_rcdl_excc_amt": _safe_int(account_summary.get("prvs_rcdl_excc_amt")),
         "nxdy_excc_amt": _safe_int(account_summary.get("nxdy_excc_amt")),
@@ -1930,6 +2199,8 @@ def _build_warnings(
     budget: Dict[str, Any],
     account_warnings: Optional[List[str]] = None,
     warnings_detail: Optional[List[Dict[str, Any]]] = None,
+    reconciliation: Optional[Dict[str, Any]] = None,
+    auto_sell_policy: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[str], List[str]]:
     """(current_warnings, historical_warnings) 반환."""
     current: List[str] = list(account_warnings or [])
@@ -1959,9 +2230,40 @@ def _build_warnings(
     current.append(f"과거 로그 EGW00201: {hist_egw}회")
 
     if execution.get("pending_order_count", 0) > 0:
-        current.append(f"미해결 pending 주문 {execution['pending_order_count']}건")
+        current.append(
+            f"미해결 pending 주문 {execution['pending_order_count']}건 "
+            f"(SELL {execution.get('live_pending_sell_count', 0)}건, DB 최신 기준)"
+        )
+        for p in (execution.get("live_pending_orders") or [])[:8]:
+            current.append(
+                f"  pending id={p.get('id')} {p.get('ticker')} {p.get('action')} "
+                f"status={p.get('order_status')} order_id={p.get('order_id')} "
+                f"reason={p.get('reason_code') or ''}"
+            )
     if execution.get("unreconciled_count", 0) > 0:
         current.append(f"미리컨실 주문 {execution['unreconciled_count']}건")
+
+    recon = reconciliation or {}
+    if recon.get("mismatch_count", 0) > 0:
+        current.append(
+            f"DB-계좌 보유수량 불일치 {recon['mismatch_count']}건 "
+            f"(account_source={recon.get('account_source', '?')})"
+        )
+        for m in (recon.get("mismatches") or [])[:8]:
+            note = ""
+            if m.get("pending_sell_ids"):
+                note = f" pending_sell_ids={m['pending_sell_ids']}"
+            current.append(
+                f"  mismatch ticker={m.get('ticker')} db_qty={m.get('db_qty')} "
+                f"account_qty={m.get('account_qty')}{note}"
+            )
+
+    for bypass in (auto_sell_policy or [])[:5]:
+        current.append(
+            f"auto_sell min_holding 우회: {bypass.get('ticker')} "
+            f"reason={bypass.get('reason')} holding_hours={bypass.get('holding_hours')}"
+        )
+
     unused = budget.get("unused_reason")
     if unused and unused not in ("budget_utilized", "derived_from_db"):
         current.append(f"주식 예산 미사용: {unused}")
@@ -2109,7 +2411,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         f"- 총자산: {summary.get('total_assets', 0):,}원",
         f"- 보유종목 수: {summary.get('holdings_count', 0)}",
         f"- 당일 신규매수 수: {summary.get('new_buy_count', 0)}",
-        f"- pending 주문 수: {summary.get('pending_orders', 0)}",
+        f"- pending 주문 수: {summary.get('pending_orders', 0)} (DB 최신, SELL {summary.get('pending_sell_orders', 0)}건)",
+        f"- DB-계좌 불일치: {summary.get('account_db_mismatch_count', 0)}건",
         f"- 총평가금액: {summary.get('tot_evlu_amt', 0):,}원",
         f"- D+2 출금가능금액: {summary.get('prvs_rcdl_excc_amt', 0):,}원",
     ]
@@ -2164,7 +2467,11 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             f"{agg.get('executed_amount', 0):,} |"
         )
 
-    lines.extend(["", "## 4. Executed Trades", "", "| Ticker | Name | Action | Qty | Price | Amount | Status | Reconcile |", "|--------|------|--------|----:|------:|-------:|--------|-----------|"])
+    lines.extend(["", "## 4. Executed Trades", "", "| Ticker | Name | Action | Qty | Price | Amount | Status | Reconcile | Sell | Sell Reason |", "|--------|------|--------|----:|------:|-------:|--------|-----------|------|-------------|"])
+    sell_by_ticker = {
+        _norm_ticker(r.get("ticker")): r
+        for r in (report.get("candidate_tracking") or [])
+    }
     for row in trade_rows:
         if str(row.get("action", "")).upper() != "BUY":
             continue
@@ -2176,8 +2483,15 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         amount = _safe_int(row.get("amount")) or qty * price
         method = _infer_reconcile_method(row, reconcile_map)
         name = _lookup_name(_norm_ticker(row.get("ticker")), candidates, balance_rows, bond_cfg)
+        t = _norm_ticker(row.get("ticker"))
+        sell_info = sell_by_ticker.get(t, {})
+        sell_status = sell_info.get("sell_status") or "-"
+        sell_reason = sell_info.get("sell_reason") or "-"
+        sell_label = sell_status
+        if sell_info.get("sell_amount"):
+            sell_label = f"{sell_status} ({sell_info.get('sell_amount'):,})"
         lines.append(
-            f"| {_norm_ticker(row.get('ticker'))} | {name} | BUY | {qty} | {price:,} | {amount:,} | {status} | {method} |"
+            f"| {t} | {name} | BUY | {qty} | {price:,} | {amount:,} | {status} | {method} | {sell_label} | {sell_reason} |"
         )
 
     lines.extend([
@@ -2210,14 +2524,18 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         "## 7. Candidate Tracking",
         "",
-        "| Ticker | Name | Rank | GPT | Base | 1D | 3D | 5D |",
-        "|--------|------|-----:|-----|-----:|---:|---:|---:|",
+        "| Ticker | Name | Rank | GPT | Base | 1D | 3D | 5D | Sell | Reason |",
+        "|--------|------|-----:|-----|-----:|---:|---:|---:|------|--------|",
     ])
     for row in tracking[:30]:
+        sell_status = row.get("sell_status") or "-"
+        if row.get("sell_amount"):
+            sell_status = f"{sell_status} ({row.get('sell_amount'):,})"
         lines.append(
             f"| {row.get('ticker')} | {row.get('name', '')} | {row.get('screener_rank', '-')} | "
             f"{row.get('gpt_action', '-')} | {row.get('base_price', '-')} | "
-            f"{row.get('return_1d', '-')} | {row.get('return_3d', '-')} | {row.get('return_5d', '-')} |"
+            f"{row.get('return_1d', '-')} | {row.get('return_3d', '-')} | {row.get('return_5d', '-')} | "
+            f"{sell_status} | {row.get('sell_reason') or '-'} |"
         )
 
     lines.extend([
@@ -2300,6 +2618,14 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
 
     raw_trade_rows = _load_trade_rows(date_str)
     kis_trade_rows, paper_db_only_rows = _normalize_trade_rows(raw_trade_rows)
+    live_pending_rows = _load_live_pending_orders()
+    review_tickers = sorted({
+        _norm_ticker(r.get("ticker"))
+        for r in kis_trade_rows
+        if str(r.get("action") or "").upper() == "BUY"
+    })
+    sell_by_ticker = _load_sell_rows_for_tickers(review_tickers)
+    reconciliation = _detect_account_db_mismatch(review_tickers, live_pending_rows)
     log_files = _find_log_files(date_str)
     scoped_counts, warnings_detail = _parse_scoped_log_events(date_str, log_files)
 
@@ -2340,6 +2666,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
                 pass
 
     reconcile_map = _parse_reconcile_holding_map(log_text)
+    auto_sell_policy = _parse_auto_sell_min_holding_bypasses(log_text)
 
     rank_map, score_map = _build_screener_maps(candidates, scores)
     screener_funnel = _build_screener_funnel(
@@ -2351,15 +2678,23 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         date_str, log_text, account_summary, balance_rows, kis_trade_rows, gpt_plans
     )
     execution_performance = _build_execution_performance(
-        kis_trade_rows, reconcile_map, paper_db_only_rows
+        kis_trade_rows, reconcile_map, paper_db_only_rows, live_pending_rows
     )
     system_performance = _build_system_performance(date_str, log_text, scoped_counts)
     candidate_tracking = _build_candidate_tracking_snapshot(
-        date_str, market, candidates, gpt_plans, kis_trade_rows, balance_rows
+        date_str, market, candidates, gpt_plans, kis_trade_rows, balance_rows, sell_by_ticker
     )
-    summary = _build_summary(date_str, account_summary, balance_rows, kis_trade_rows, execution_performance)
+    summary = _build_summary(
+        date_str, account_summary, balance_rows, kis_trade_rows, execution_performance, reconciliation
+    )
     warnings, historical_warnings = _build_warnings(
-        system_performance, execution_performance, budget_usage, account_warnings, warnings_detail
+        system_performance,
+        execution_performance,
+        budget_usage,
+        account_warnings,
+        warnings_detail,
+        reconciliation,
+        auto_sell_policy,
     )
 
     if fetch_tracking_prices:
@@ -2392,6 +2727,8 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "warnings": warnings,
         "historical_warnings": historical_warnings,
         "warnings_detail": warnings_detail,
+        "reconciliation": reconciliation,
+        "auto_sell_policy": auto_sell_policy,
         "paper_db_only_records": [
             {
                 "id": r.get("id"),

@@ -83,6 +83,19 @@ def _compute_db_open_positions() -> Dict[str, int]:
     return {t: q for t, q in qty_by_ticker.items() if q > 0}
 
 
+def _load_pending_sell_by_ticker() -> Dict[str, List[Dict[str, Any]]]:
+    """ticker → pending/partial SELL 목록."""
+    rows = _fetch_rows(
+        "WHERE UPPER(action) = 'SELL' AND lower(order_status) IN ('pending','partial')",
+        limit=500,
+    )
+    by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        ticker = str(r.get("ticker") or "").zfill(6)
+        by_ticker[ticker].append(r)
+    return dict(by_ticker)
+
+
 def _get_account_qty_by_ticker() -> Tuple[Dict[str, int], str]:
     """balance 스냅샷 기준 계좌 보유 수량."""
     _, holdings, _, balance_path = get_account_snapshot_cached(
@@ -106,6 +119,7 @@ def _get_account_qty_by_ticker() -> Tuple[Dict[str, int], str]:
 def _verify_account_match() -> int:
     db_positions = _compute_db_open_positions()
     account_positions, source = _get_account_qty_by_ticker()
+    pending_sells = _load_pending_sell_by_ticker()
     if not account_positions:
         print(
             "[ACCOUNT_DB_MATCH] status=skip reason=no_balance_snapshot "
@@ -113,18 +127,43 @@ def _verify_account_match() -> int:
         )
         return 1
     print(f"[ACCOUNT_DB_MATCH] account_source={source}")
+    print(
+        f"[ACCOUNT_DB_MATCH] db_open_tickers={len(db_positions)} "
+        f"account_tickers={len(account_positions)} "
+        f"pending_sell_tickers={len(pending_sells)}"
+    )
     all_tickers = sorted(set(db_positions) | set(account_positions))
     mismatches = 0
     for ticker in all_tickers:
         db_qty = int(db_positions.get(ticker, 0))
         account_qty = int(account_positions.get(ticker, 0))
         status = "ok" if db_qty == account_qty else "mismatch"
+        pending_ids: List[str] = []
+        pending_note = ""
         if status == "mismatch":
             mismatches += 1
+            sells = pending_sells.get(ticker) or []
+            if sells and db_qty > account_qty:
+                pending_ids = [str(s.get("id")) for s in sells]
+                pending_note = (
+                    f" pending_sell_ids={','.join(pending_ids)}"
+                    f" (DB still counts open qty; SELL not executed in DB)"
+                )
+            elif db_qty > 0 and account_qty == 0:
+                pending_note = " account_empty_db_still_open (reconcile candidate)"
         print(
             f"[ACCOUNT_DB_MATCH] ticker={ticker} db_qty={db_qty} "
-            f"account_qty={account_qty} status={status}"
+            f"account_qty={account_qty} status={status}{pending_note}"
         )
+    if pending_sells:
+        print(f"\n=== pending SELL by ticker ({sum(len(v) for v in pending_sells.values())}건) ===")
+        for ticker, rows in sorted(pending_sells.items()):
+            for r in rows:
+                print(
+                    f"  id={r.get('id')} ticker={ticker} order_id={r.get('order_id')} "
+                    f"requested_qty={r.get('requested_qty') or r.get('quantity')} "
+                    f"reason={r.get('reason_code') or ''}"
+                )
     return 1 if mismatches else 0
 
 

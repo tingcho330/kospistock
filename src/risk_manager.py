@@ -449,6 +449,63 @@ class RiskManager:
         self._recent_direct_sell[ticker] = now
         return True
 
+    def _compute_actual_holding_hours(self, ticker: str) -> float:
+        """최근 executed BUY 시각 기준 실제 보유시간(시간)."""
+        try:
+            from recorder import fetch_trades_by_tickers
+            from utils import normalize_ticker_6
+
+            ticker = normalize_ticker_6(ticker)
+            trades = fetch_trades_by_tickers([ticker])
+            rows = (trades or {}).get(ticker) or []
+            buy_times: List[datetime] = []
+            for t in rows:
+                if str(t.get("action") or "").upper() != "BUY":
+                    continue
+                st = str(t.get("order_status") or "executed").lower()
+                if st not in ("executed", "partial", "completed"):
+                    continue
+                ts = t.get("timestamp")
+                if ts is None:
+                    continue
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=KST)
+                buy_times.append(ts.astimezone(KST))
+            if not buy_times:
+                return 0.0
+            buy_time = max(buy_times)
+            return max(0.0, (datetime.now(KST) - buy_time).total_seconds() / 3600.0)
+        except Exception as e:
+            logger.debug("[%s] actual holding hours 계산 실패: %s", ticker, e)
+            return 0.0
+
+    def _log_auto_sell_min_holding_policy(self, ticker: str, reason_type: str) -> None:
+        """min_holding_hours 대비 실제 보유시간 정책 점검 로그."""
+        try:
+            trading_params = self.config.get("trading_params", {}) or {}
+            min_holding_hours = int(trading_params.get("min_holding_hours", 0) or 0)
+        except Exception:
+            min_holding_hours = 0
+        if min_holding_hours <= 0:
+            return
+
+        holding_hours = self._compute_actual_holding_hours(ticker)
+        same_day_eligible, same_day_hours = check_min_holding_hours(ticker, min_holding_hours)
+        if holding_hours < min_holding_hours:
+            logger.warning(
+                "[AUTO_SELL_MIN_HOLDING_BYPASS] ticker=%s reason=%s holding_hours=%.1f "
+                "min_holding_hours=%s same_day_guard_eligible=%s same_day_guard_hours=%.1f "
+                "note=check_min_holding_hours_only_blocks_same_day_buys",
+                ticker,
+                reason_type,
+                holding_hours,
+                min_holding_hours,
+                same_day_eligible,
+                same_day_hours,
+            )
+
     def _direct_execute_sell(self, ticker: str, name: str, qty: int, reason_meta: Dict) -> bool:
         """[NEW] 즉시 시장가 매도(브로커 지원 기준: ord_unpr=0)"""
         try:
@@ -1036,6 +1093,8 @@ class RiskManager:
         logger.debug(f"[기본규칙체크] {ticker} 시작")
         basic_decision, basic_reason, basic_context = self._check_basic_rules(holding, stock_info)
         if basic_decision == "SELL":
+            sell_type = (basic_context or {}).get("type", "Unknown")
+            self._log_auto_sell_min_holding_policy(ticker, sell_type)
             logger.info(f"[판단결과] {ticker} 기본규칙 → SELL: {basic_reason}")
             return basic_decision, f"기본규칙: {basic_reason}", basic_context
         elif basic_decision == "PARTIAL_SELL":
@@ -1047,6 +1106,8 @@ class RiskManager:
             logger.debug(f"[고급전략체크] {ticker} 시작 (mode={self.strategy_mode})")
             advanced_decision, advanced_reason, advanced_context = self._check_advanced_strategies(holding, stock_info)
             if advanced_decision == "SELL":
+                sell_type = (advanced_context or {}).get("type", "Advanced")
+                self._log_auto_sell_min_holding_policy(ticker, sell_type)
                 logger.info(f"[판단결과] {ticker} 고급전략 → SELL: {advanced_reason}")
                 return advanced_decision, f"고급전략: {advanced_reason}", advanced_context
             else:
