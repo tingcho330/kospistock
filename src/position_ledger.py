@@ -8,11 +8,14 @@ check_trade_db.py, performance_review.py에서 공유한다.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import OUTPUT_DIR
+
+logger = logging.getLogger("PositionLedger")
 
 OPEN_POSITION_STATUSES = frozenset({"executed", "partial"})
 PAPER_STATUS = "paper_executed"
@@ -450,8 +453,20 @@ def append_reason_code(existing: str, code: str) -> str:
     return ",".join(parts)
 
 
+def _row_to_dict(cursor: sqlite3.Cursor, row: Any) -> Dict[str, Any]:
+    """sqlite3.Row 또는 tuple fetch 결과를 dict로 변환."""
+    if row is None:
+        return {}
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    columns = [desc[0] for desc in (cursor.description or [])]
+    if columns and len(columns) == len(row):
+        return dict(zip(columns, row))
+    return {}
+
+
 def _fetch_row_by_id(conn: sqlite3.Connection, row_id: int) -> Optional[Dict[str, Any]]:
-    cur = conn.execute(
+    cursor = conn.execute(
         """
         SELECT id, ticker, action, quantity, requested_qty, executed_qty,
                order_status, order_id, reason_code
@@ -459,10 +474,36 @@ def _fetch_row_by_id(conn: sqlite3.Connection, row_id: int) -> Optional[Dict[str
         """,
         (int(row_id),),
     )
-    r = cur.fetchone()
-    if not r:
+    row = cursor.fetchone()
+    if row is None:
         return None
-    return dict(r)
+    return _row_to_dict(cursor, row)
+
+
+def _repair_skip(row_id: Any, reason: str) -> Dict[str, Any]:
+    print(f"[POSITION_REPAIR_SKIP] id={row_id} reason={reason}")
+    return {"status": "skipped", "id": row_id, "reason": reason}
+
+
+def _is_already_repaired_sell(row: Dict[str, Any]) -> bool:
+    reason = str(row.get("reason_code") or "")
+    if REPAIR_TAG_SELL_EXECUTED in reason:
+        return True
+    status = str(row.get("order_status") or "").lower()
+    target_qty = safe_int(row.get("quantity") or row.get("requested_qty") or row_executed_qty(row))
+    if status == "executed" and safe_int(row.get("executed_qty")) == target_qty and target_qty > 0:
+        return True
+    return False
+
+
+def _is_already_repaired_buy_failed(row: Dict[str, Any]) -> bool:
+    reason = str(row.get("reason_code") or "")
+    if REPAIR_TAG_BUY_FAILED in reason:
+        return True
+    status = str(row.get("order_status") or "").lower()
+    if status == "failed" and safe_int(row.get("executed_qty")) == 0:
+        return True
+    return False
 
 
 def apply_single_repair(
@@ -471,13 +512,14 @@ def apply_single_repair(
     *,
     now_iso: str,
 ) -> Optional[Dict[str, Any]]:
-    """단일 repair 후보 적용. 반환: before/after 요약 또는 None(스킵)."""
+    """단일 repair 후보 적용. 반환: applied 요약 dict, skipped dict, 또는 None."""
     row_id = candidate.get("id")
     if row_id is None:
-        return None
+        return _repair_skip("?", "missing_row_id")
+
     before = _fetch_row_by_id(conn, int(row_id))
     if not before:
-        return None
+        return _repair_skip(row_id, "row_not_found")
 
     action = str(candidate.get("action") or "")
     ticker = norm_ticker(before.get("ticker"))
@@ -485,9 +527,12 @@ def apply_single_repair(
 
     if action == "mark_failed_sell_executed":
         if not action_is_sell(before):
-            return None
+            return _repair_skip(row_id, "not_sell")
+        if _is_already_repaired_sell(before):
+            return _repair_skip(row_id, "already_repaired")
         if str(before.get("order_status") or "").lower() != "failed":
-            return None
+            return _repair_skip(row_id, "status_not_failed")
+
         target_qty = safe_int(before.get("quantity") or before.get("requested_qty") or qty)
         new_reason = append_reason_code(before.get("reason_code") or "", REPAIR_TAG_SELL_EXECUTED)
         conn.execute(
@@ -507,15 +552,25 @@ def apply_single_repair(
             "executed_qty": target_qty,
             "reason_code": new_reason,
         }
-        return {"id": row_id, "ticker": ticker, "action": action, "before": before, "after": after}
+        return {
+            "status": "applied",
+            "id": row_id,
+            "ticker": ticker,
+            "action": action,
+            "before": before,
+            "after": after,
+        }
 
     if action == "mark_empty_order_buy_failed":
         if not action_is_buy(before):
-            return None
+            return _repair_skip(row_id, "not_buy")
+        if _is_already_repaired_buy_failed(before):
+            return _repair_skip(row_id, "already_repaired")
         if str(before.get("order_status") or "").lower() not in OPEN_POSITION_STATUSES:
-            return None
+            return _repair_skip(row_id, "status_not_executed")
         if str(before.get("order_id") or "").strip():
-            return None
+            return _repair_skip(row_id, "order_id_present")
+
         new_reason = append_reason_code(before.get("reason_code") or "", REPAIR_TAG_BUY_FAILED)
         conn.execute(
             """
@@ -534,9 +589,16 @@ def apply_single_repair(
             "executed_qty": 0,
             "reason_code": new_reason,
         }
-        return {"id": row_id, "ticker": ticker, "action": action, "before": before, "after": after}
+        return {
+            "status": "applied",
+            "id": row_id,
+            "ticker": ticker,
+            "action": action,
+            "before": before,
+            "after": after,
+        }
 
-    return None
+    return _repair_skip(row_id, f"unknown_action={action}")
 
 
 def apply_repair_candidates_to_db(
@@ -557,13 +619,33 @@ def apply_repair_candidates_to_db(
     if not applicable:
         return {"applied": applied, "skipped": skipped, "applied_count": 0}
 
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
         for candidate in applicable:
             result = apply_single_repair(conn, candidate, now_iso=now_iso)
-            if result:
+            if result and result.get("status") == "applied":
                 applied.append(result)
+                before = result.get("before") or {}
+                after = result.get("after") or {}
+                print(
+                    f"[POSITION_REPAIR_APPLY] id={result.get('id')} "
+                    f"before_status={before.get('order_status')} "
+                    f"after_status={after.get('order_status')} "
+                    f"before_qty={before.get('executed_qty')} "
+                    f"after_qty={after.get('executed_qty')}"
+                )
+            elif result:
+                skipped.append(result)
             else:
-                skipped.append(candidate)
+                skipped.append({"id": candidate.get("id"), "reason": "unknown_skip"})
         conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[POSITION_REPAIR_ROLLBACK] error={e}")
+        logger.exception("position repair rollback: %s", e)
+        raise
+    finally:
+        conn.close()
 
     return {"applied": applied, "skipped": skipped, "applied_count": len(applied)}

@@ -188,24 +188,18 @@ def _apply_repair_candidates(*, include_paper_executed: bool = False) -> int:
 
     result = apply_repair_candidates_to_db(str(DB_PATH), applicable)
     applied = result.get("applied") or []
-    if not applied:
+    skipped = result.get("skipped") or []
+
+    if not applied and not skipped:
         print("[POSITION_REPAIR] no repair candidates applied")
+        return 0
+    if not applied:
+        print("[POSITION_REPAIR] no repair candidates applied (all skipped)")
         return 0
 
     print(f"\n=== position repair applied ({len(applied)}건) ===")
-    for item in applied:
-        before = item.get("before") or {}
-        after = item.get("after") or {}
-        print(
-            f"[POSITION_REPAIR_APPLIED] id={item.get('id')} ticker={item.get('ticker')} "
-            f"action={item.get('action')} "
-            f"before_status={before.get('order_status')} before_executed_qty={before.get('executed_qty')} "
-            f"after_status={after.get('order_status')} after_executed_qty={after.get('executed_qty')}"
-        )
-
-    skipped = result.get("skipped") or []
     if skipped:
-        print(f"[POSITION_REPAIR] skipped={len(skipped)} (validation failed or already fixed)")
+        print(f"[POSITION_REPAIR] skipped={len(skipped)}")
 
     print("\n=== post-repair account match ===")
     post_analysis, _ = _load_repair_analysis(include_paper_executed=include_paper_executed)
