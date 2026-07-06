@@ -15,7 +15,7 @@ import logging
 import re
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +24,7 @@ from utils import (
     OUTPUT_DIR,
     extract_kis_official_summary,
     get_account_snapshot_cached,
+    is_market_open_day,
     load_config,
     setup_logging,
 )
@@ -43,6 +44,7 @@ GPT_ACTION_MAP = {
     "미진입": "REJECT",
 }
 TRACK_HORIZONS = (1, 3, 5, 10)
+TRACK_DISPLAY_HORIZONS = (1, 3, 5)
 
 _SUMMARY_KEY_MAP = {
     "total_assets": [
@@ -1948,22 +1950,469 @@ def _build_system_performance(
     return perf
 
 
+def _normalize_trading_day(d: date) -> date:
+    cur = d
+    while not is_market_open_day(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _next_trading_day(d: date) -> date:
+    cur = d + timedelta(days=1)
+    while not is_market_open_day(cur):
+        cur += timedelta(days=1)
+    return cur
+
+
+def _nth_trading_day_after(base: date, n: int) -> date:
+    cur = _normalize_trading_day(base)
+    for _ in range(max(0, n)):
+        cur = _next_trading_day(cur)
+    return cur
+
+
+def _tracking_horizon_dates(base_dt: date) -> Dict[int, date]:
+    base = _normalize_trading_day(base_dt)
+    return {h: _nth_trading_day_after(base, h) for h in TRACK_HORIZONS}
+
+
+def _init_kis_tracking_client():
+    try:
+        from api.kis_auth import KIS
+        from kis_rate_limit import init_kis_rate_limits
+
+        env = getattr(settings, "_config", {}).get("trading_environment", "prod")
+        if env not in ("prod", "vps", "kis_paper"):
+            env = "prod"
+        init_kis_rate_limits(env)
+        kis = KIS(env=env)
+        try:
+            import screener_core as sc
+
+            sc._KIS_PRICE_CLIENT = kis
+        except Exception:
+            pass
+        return kis
+    except Exception as e:
+        logger.warning("[PERF_TRACKING] KIS client init failed: %s", e)
+        return None
+
+
+def _close_price_on_date(df: Any, yyyymmdd: str) -> Optional[float]:
+    if df is None:
+        return None
+    target = str(yyyymmdd).replace("-", "")[:8]
+    try:
+        if hasattr(df, "index") and target in [str(x).replace("-", "")[:8] for x in df.index]:
+            for idx in df.index:
+                if str(idx).replace("-", "")[:8] == target:
+                    if "close" in df.columns:
+                        return _safe_float(df.loc[idx, "close"])
+        date_col = next((c for c in ("date", "stck_bsop_date", "bsop_date") if c in df.columns), None)
+        close_col = next((c for c in ("close", "stck_clpr", "clspr") if c in df.columns), None)
+        if date_col and close_col:
+            for _, row in df.iterrows():
+                if str(row[date_col]).replace("-", "")[:8] == target:
+                    return _safe_float(row[close_col])
+    except Exception as e:
+        logger.debug("종가 조회 실패 date=%s: %s", target, e)
+    return None
+
+
+def _fetch_current_price(ticker: str, kis: Any, cache: Dict[str, Tuple[Optional[float], str]]) -> Tuple[Optional[float], str]:
+    ticker = _norm_ticker(ticker)
+    if ticker in cache:
+        return cache[ticker]
+    try:
+        from kis_rate_limit import call_with_rate_limit_retry, is_rate_limit_message, rate_limit_wait
+
+        result: Dict[str, Any] = {"price": None, "status": "fetch_failed"}
+
+        def _do() -> Any:
+            rate_limit_wait()
+            return kis.inquire_price("J", ticker)
+
+        def _is_rl(res: Any) -> Tuple[bool, str]:
+            if res is None:
+                return False, ""
+            if hasattr(res, "empty") and res.empty:
+                return False, ""
+            return False, ""
+
+        df = call_with_rate_limit_retry(_do, api="inquire_price", ticker=ticker, is_rate_limited=_is_rl)
+        if df is not None and not df.empty and "stck_prpr" in df.columns:
+            result["price"] = _safe_float(df["stck_prpr"].iloc[0])
+            result["status"] = "ok"
+            cache[ticker] = (result["price"], "ok")
+            return cache[ticker]
+    except Exception as e:
+        status = "rate_limited" if "EGW00201" in str(e) or "초당 거래건수" in str(e) else "fetch_failed"
+        cache[ticker] = (None, status)
+        return cache[ticker]
+    cache[ticker] = (None, "fetch_failed")
+    return cache[ticker]
+
+
+def _fetch_tracking_ohlcv(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    kis: Any,
+    cache: Dict[str, Tuple[Any, str]],
+) -> Tuple[Any, str]:
+    ticker = _norm_ticker(ticker)
+    cache_key = f"{ticker}:{start_date}:{end_date}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    try:
+        from kis_rate_limit import cache_get, cache_put, call_with_rate_limit_retry, is_rate_limit_message, rate_limit_wait
+    except ImportError:
+        rate_limit_wait = lambda: None  # type: ignore
+        cache_get = cache_put = None  # type: ignore
+        call_with_rate_limit_retry = None  # type: ignore
+        is_rate_limit_message = lambda **kwargs: False  # type: ignore
+
+    if cache_get:
+        cached = cache_get("tracking_ohlcv", ticker, cache_key)
+        if cached is not None and hasattr(cached, "empty") and not cached.empty:
+            cache[cache_key] = (cached, "ok")
+            return cache[cache_key]
+
+    holder: Dict[str, Any] = {"df": None, "status": "fetch_failed", "rate_limited": False}
+
+    def _do_daily() -> Any:
+        rate_limit_wait()
+        df = kis.inquire_daily_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
+        if df is not None and not df.empty:
+            try:
+                from screener_core import _normalize_kis_period_df
+
+                df = _normalize_kis_period_df(df)
+            except Exception:
+                pass
+            holder["df"] = df
+            holder["status"] = "ok"
+        return df
+
+    def _is_rl_daily(res: Any) -> Tuple[bool, str]:
+        if holder["status"] == "ok":
+            return False, ""
+        return False, ""
+
+    try:
+        if call_with_rate_limit_retry:
+            call_with_rate_limit_retry(_do_daily, api="inquire_daily_price", ticker=ticker, is_rate_limited=_is_rl_daily)
+        else:
+            _do_daily()
+    except Exception as e:
+        if is_rate_limit_message(text=str(e)):
+            holder["status"] = "rate_limited"
+        else:
+            holder["status"] = "fetch_failed"
+
+    if holder["df"] is None or (hasattr(holder["df"], "empty") and holder["df"].empty):
+        try:
+            from screener_core import get_historical_prices
+
+            rate_limit_wait()
+            df = get_historical_prices(ticker, start_date, end_date, kis=kis)
+            if df is not None and not df.empty:
+                holder["df"] = df
+                holder["status"] = "ok"
+        except Exception as e:
+            if is_rate_limit_message(text=str(e)):
+                holder["status"] = "rate_limited"
+            else:
+                holder["status"] = "fetch_failed"
+
+    if holder["status"] == "ok" and cache_put and holder["df"] is not None:
+        try:
+            cache_put("tracking_ohlcv", ticker, holder["df"], cache_key)
+        except Exception:
+            pass
+
+    cache[cache_key] = (holder["df"], holder["status"])
+    return cache[cache_key]
+
+
 def _fetch_price(ticker: str, price_cache: Dict[str, Optional[float]]) -> Optional[float]:
     if ticker in price_cache:
         return price_cache[ticker]
+    kis = _init_kis_tracking_client()
+    if kis is None:
+        price_cache[ticker] = None
+        return None
+    cur_cache: Dict[str, Tuple[Optional[float], str]] = {}
+    price, _ = _fetch_current_price(ticker, kis, cur_cache)
+    price_cache[ticker] = price
+    return price
+
+
+def _merge_tracking_snapshot(rows: List[Dict[str, Any]], path: Path) -> None:
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        return
+    old_rows = data.get("candidates") or data.get("rows") or []
+    if not isinstance(old_rows, list):
+        return
+    old_by_ticker = {_norm_ticker(r.get("ticker")): r for r in old_rows if isinstance(r, dict)}
+    track_fields = []
+    for h in TRACK_HORIZONS:
+        track_fields.extend([
+            f"track_{h}d_price",
+            f"track_{h}d_date",
+            f"return_{h}d",
+            f"return_{h}d_status",
+        ])
+    for row in rows:
+        ticker = _norm_ticker(row.get("ticker"))
+        old = old_by_ticker.get(ticker)
+        if not old:
+            continue
+        for key in track_fields:
+            if row.get(key) is None and old.get(key) is not None:
+                row[key] = old[key]
+
+
+def _fmt_tracking_cell(row: Dict[str, Any], horizon: int) -> str:
+    ret = row.get(f"return_{horizon}d")
+    status = row.get(f"return_{horizon}d_status")
+    if ret is not None:
+        return f"{float(ret) * 100:+.2f}%"
+    if status in ("fetch_failed", "rate_limited"):
+        return status
+    return "-"
+
+
+def _avg_horizon(rows: List[Dict[str, Any]], filter_fn, horizon: int) -> Optional[float]:
+    vals = [
+        _safe_float(r.get(f"return_{horizon}d"))
+        for r in rows
+        if filter_fn(r) and r.get(f"return_{horizon}d") is not None
+    ]
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 6) if vals else None
+
+
+def _build_tracking_group_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _by_action(action: str):
+        return lambda r: str(r.get("gpt_action") or "").upper() == action
+
+    def _by_rank(lo: int, hi: int):
+        return lambda r: lo <= _safe_int(r.get("screener_rank")) <= hi
+
+    def _avg_group(filter_fn) -> Dict[str, Optional[float]]:
+        return {f"{h}d": _avg_horizon(rows, filter_fn, h) for h in TRACK_DISPLAY_HORIZONS}
+
+    by_action = {
+        "BUY": _avg_group(_by_action("BUY")),
+        "HOLD": _avg_group(_by_action("HOLD")),
+        "REJECT": _avg_group(_by_action("REJECT")),
+    }
+    by_rank = {
+        "rank_1_5": _avg_group(_by_rank(1, 5)),
+        "rank_6_10": _avg_group(_by_rank(6, 10)),
+        "rank_11_17": _avg_group(_by_rank(11, 17)),
+    }
+
+    def _pick_horizon_val(avgs: Dict[str, Optional[float]]) -> Tuple[Optional[int], Optional[float]]:
+        for h in TRACK_DISPLAY_HORIZONS:
+            v = avgs.get(f"{h}d")
+            if v is not None:
+                return h, v
+        return None, None
+
+    judgments: List[str] = []
+    _, buy_v = _pick_horizon_val(by_action["BUY"])
+    _, hold_v = _pick_horizon_val(by_action["HOLD"])
+    _, reject_v = _pick_horizon_val(by_action["REJECT"])
+
+    if buy_v is not None and hold_v is not None and reject_v is not None:
+        if buy_v > hold_v and buy_v > reject_v:
+            judgments.append("GPT BUY 판단 양호")
+        if hold_v > buy_v:
+            judgments.append("GPT가 보수적이었을 가능성")
+
+    reject_top = _avg_group(lambda r: _by_action("REJECT")(r) and _by_rank(1, 5)(r))
+    _, reject_top_v = _pick_horizon_val(reject_top)
+    if reject_top_v is not None and buy_v is not None and reject_top_v > buy_v:
+        judgments.append("GPT 리스크 필터 과도 가능성")
+
+    return {
+        "by_action": by_action,
+        "by_rank": by_rank,
+        "judgments": judgments,
+        "as_of_date": datetime.now(KST).date().strftime("%Y%m%d"),
+    }
+
+
+def _fmt_summary_avg(val: Optional[float]) -> str:
+    if val is None:
+        return "-"
+    return f"{float(val) * 100:+.2f}%"
+
+
+def _enrich_candidate_tracking_returns(
+    rows: List[Dict[str, Any]],
+    base_date_str: str,
+    *,
+    as_of_date: Optional[date] = None,
+    fetch_prices: bool = True,
+    existing_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    stats = {"enriched": 0, "fetch_failed": 0, "rate_limited": 0, "skipped_future": 0}
+    if not rows:
+        return stats
+
     try:
-        from api.kis_auth import KIS
-        env = getattr(settings, "_config", {}).get("trading_environment", "prod")
-        kis = KIS(env=env if env in ("prod", "vps", "kis_paper") else "prod")
-        df = kis.inquire_price("J", ticker)
-        if df is not None and not df.empty:
-            val = _safe_float(df["stck_prpr"].iloc[0])
-            price_cache[ticker] = val
-            return val
-    except Exception as e:
-        logger.debug("가격 조회 실패 %s: %s", ticker, e)
-    price_cache[ticker] = None
-    return None
+        base_dt = _normalize_trading_day(datetime.strptime(base_date_str, "%Y%m%d").date())
+    except ValueError:
+        return stats
+
+    as_of = _normalize_trading_day(as_of_date or datetime.now(KST).date())
+    horizon_dates = _tracking_horizon_dates(base_dt)
+
+    if existing_path and existing_path.is_file():
+        _merge_tracking_snapshot(rows, existing_path)
+
+    kis = None
+    ohlcv_cache: Dict[str, Tuple[Any, str]] = {}
+    current_cache: Dict[str, Tuple[Optional[float], str]] = {}
+    if fetch_prices:
+        kis = _init_kis_tracking_client()
+
+    tickers_to_fetch: set = set()
+    for row in rows:
+        ticker = _norm_ticker(row.get("ticker"))
+        if not ticker or not _safe_float(row.get("base_price")):
+            continue
+        for h in TRACK_HORIZONS:
+            target_dt = horizon_dates[h]
+            row[f"track_{h}d_date"] = target_dt.strftime("%Y%m%d")
+            if as_of < target_dt:
+                stats["skipped_future"] += 1
+                continue
+            if row.get(f"return_{h}d") is not None and row.get(f"return_{h}d_status") == "ok":
+                continue
+            prev_status = row.get(f"return_{h}d_status")
+            if prev_status not in ("fetch_failed", "rate_limited") and row.get(f"return_{h}d") is not None:
+                continue
+            if fetch_prices:
+                tickers_to_fetch.add(ticker)
+
+    bars_by_ticker: Dict[str, Tuple[Any, str]] = {}
+    if fetch_prices and kis:
+        start_date = base_date_str
+        end_date = as_of.strftime("%Y%m%d")
+        for ticker in sorted(tickers_to_fetch):
+            df, status = _fetch_tracking_ohlcv(ticker, start_date, end_date, kis, ohlcv_cache)
+            bars_by_ticker[ticker] = (df, status)
+            if status == "fetch_failed":
+                stats["fetch_failed"] += 1
+            elif status == "rate_limited":
+                stats["rate_limited"] += 1
+
+    today = datetime.now(KST).date()
+    for row in rows:
+        ticker = _norm_ticker(row.get("ticker"))
+        base_price = _safe_float(row.get("base_price"))
+        if not ticker or not base_price:
+            continue
+        df, fetch_status = bars_by_ticker.get(ticker, (None, None))
+
+        for h in TRACK_HORIZONS:
+            target_dt = horizon_dates[h]
+            target_str = target_dt.strftime("%Y%m%d")
+            price_key = f"track_{h}d_price"
+            ret_key = f"return_{h}d"
+            status_key = f"return_{h}d_status"
+
+            if as_of < target_dt:
+                continue
+            if row.get(ret_key) is not None and row.get(status_key) == "ok":
+                continue
+            if not fetch_prices:
+                continue
+            if kis is None:
+                row[status_key] = "fetch_failed"
+                continue
+
+            if fetch_status in ("fetch_failed", "rate_limited"):
+                row[status_key] = fetch_status
+                continue
+
+            close = _close_price_on_date(df, target_str)
+            if close is None and target_dt == today and kis is not None:
+                cur_price, cur_status = _fetch_current_price(ticker, kis, current_cache)
+                if cur_price is not None:
+                    close = cur_price
+                elif cur_status in ("fetch_failed", "rate_limited"):
+                    row[status_key] = cur_status
+                    continue
+
+            if close is None:
+                row[status_key] = "fetch_failed"
+                continue
+
+            row[price_key] = close
+            row[ret_key] = round((float(close) - base_price) / base_price, 6)
+            row[status_key] = "ok"
+            stats["enriched"] += 1
+
+    logger.info(
+        "[PERF_TRACKING_ENRICH] base=%s as_of=%s enriched=%s fetch_failed=%s rate_limited=%s skipped_future=%s",
+        base_date_str,
+        as_of.strftime("%Y%m%d"),
+        stats["enriched"],
+        stats["fetch_failed"],
+        stats["rate_limited"],
+        stats["skipped_future"],
+    )
+    return stats
+
+
+def _refresh_other_tracking_snapshots(
+    current_base_date: str,
+    market: str,
+    *,
+    as_of_date: Optional[date] = None,
+    fetch_prices: bool = True,
+) -> int:
+    updated = 0
+    as_of = as_of_date or datetime.now(KST).date()
+    for path in sorted(OUTPUT_DIR.glob(f"candidate_tracking_*_{market}.json")):
+        data = _load_json(path)
+        if not isinstance(data, dict):
+            continue
+        base_date = str(data.get("base_date") or "")
+        if base_date == current_base_date or len(base_date) != 8:
+            continue
+        rows = data.get("candidates") or data.get("rows") or []
+        if not isinstance(rows, list) or not rows:
+            continue
+        _enrich_candidate_tracking_returns(
+            rows,
+            base_date,
+            as_of_date=as_of,
+            fetch_prices=fetch_prices,
+            existing_path=path,
+        )
+        data["candidates"] = rows
+        data["last_return_update"] = datetime.now(KST).isoformat()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        updated += 1
+    return updated
+
+
+def _update_tracking_returns(review_date_str: str, market: str, fetch_prices: bool = True) -> int:
+    """과거 candidate_tracking JSON의 D+N 수익률 갱신 (현재 base_date 제외)."""
+    return _refresh_other_tracking_snapshots(
+        current_base_date=review_date_str,
+        market=market,
+        fetch_prices=fetch_prices,
+    )
 
 
 def _build_candidate_tracking_snapshot(
@@ -2025,10 +2474,18 @@ def _build_candidate_tracking_snapshot(
             "track_3d_price": None,
             "track_5d_price": None,
             "track_10d_price": None,
+            "track_1d_date": None,
+            "track_3d_date": None,
+            "track_5d_date": None,
+            "track_10d_date": None,
             "return_1d": None,
             "return_3d": None,
             "return_5d": None,
             "return_10d": None,
+            "return_1d_status": None,
+            "return_3d_status": None,
+            "return_5d_status": None,
+            "return_10d_status": None,
             **_sell_fields(ticker),
         })
 
@@ -2055,10 +2512,18 @@ def _build_candidate_tracking_snapshot(
             "track_3d_price": None,
             "track_5d_price": None,
             "track_10d_price": None,
+            "track_1d_date": None,
+            "track_3d_date": None,
+            "track_5d_date": None,
+            "track_10d_date": None,
             "return_1d": None,
             "return_3d": None,
             "return_5d": None,
             "return_10d": None,
+            "return_1d_status": None,
+            "return_3d_status": None,
+            "return_5d_status": None,
+            "return_10d_status": None,
             **_sell_fields(ticker),
         })
 
@@ -2074,58 +2539,6 @@ def _build_candidate_tracking_snapshot(
         reject_n,
     )
     return out
-
-
-def _update_tracking_returns(review_date_str: str, market: str, fetch_prices: bool = True) -> int:
-    updated_files = 0
-    review_dt = datetime.strptime(review_date_str, "%Y%m%d").date()
-    price_cache: Dict[str, Optional[float]] = {}
-
-    for path in sorted(OUTPUT_DIR.glob(f"candidate_tracking_*_{market}.json")):
-        data = _load_json(path)
-        if not isinstance(data, dict):
-            continue
-        base_date = str(data.get("base_date") or "")
-        if len(base_date) != 8:
-            continue
-        try:
-            base_dt = datetime.strptime(base_date, "%Y%m%d").date()
-        except ValueError:
-            continue
-        days = (review_dt - base_dt).days
-        if days <= 0 or days not in TRACK_HORIZONS:
-            continue
-
-        rows = data.get("candidates") or data.get("rows") or []
-        if not isinstance(rows, list):
-            continue
-        changed = False
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            price_key = f"track_{days}d_price"
-            ret_key = f"return_{days}d"
-            if row.get(price_key) is not None:
-                continue
-            ticker = _norm_ticker(row.get("ticker"))
-            base_price = _safe_float(row.get("base_price"))
-            if not ticker or not base_price:
-                continue
-            current = row.get("base_close_price")
-            if fetch_prices:
-                current = _fetch_price(ticker, price_cache) or current
-            if current is None:
-                continue
-            row[price_key] = current
-            row[ret_key] = round((float(current) - base_price) / base_price, 6)
-            changed = True
-        if changed:
-            data["candidates"] = rows
-            data["last_return_update"] = review_date_str
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            updated_files += 1
-    return updated_files
 
 
 def _build_summary(
@@ -2359,6 +2772,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     execution = report.get("execution_performance") or {}
     system = report.get("system_performance") or {}
     tracking = report.get("candidate_tracking") or []
+    tracking_summary = report.get("candidate_tracking_summary") or {}
     warnings = report.get("warnings") or []
     historical_warnings = report.get("historical_warnings") or []
     aggregates = gpt.get("aggregates") or {}
@@ -2489,6 +2903,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "",
         "## 7. Candidate Tracking",
         "",
+        f"- As-of: {tracking_summary.get('as_of_date', '-')}",
+        "",
         "| Ticker | Name | Rank | GPT | Base | 1D | 3D | 5D | Sell | Reason |",
         "|--------|------|-----:|-----|-----:|---:|---:|---:|------|--------|",
     ])
@@ -2499,9 +2915,41 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         lines.append(
             f"| {row.get('ticker')} | {row.get('name', '')} | {row.get('screener_rank', '-')} | "
             f"{row.get('gpt_action', '-')} | {row.get('base_price', '-')} | "
-            f"{row.get('return_1d', '-')} | {row.get('return_3d', '-')} | {row.get('return_5d', '-')} | "
+            f"{_fmt_tracking_cell(row, 1)} | {_fmt_tracking_cell(row, 3)} | {_fmt_tracking_cell(row, 5)} | "
             f"{sell_status} | {row.get('sell_reason') or '-'} |"
         )
+
+    by_action = tracking_summary.get("by_action") or {}
+    by_rank = tracking_summary.get("by_rank") or {}
+    if by_action or by_rank:
+        lines.extend([
+            "",
+            "### Candidate Tracking Summary",
+            "",
+            "| Group | 1D | 3D | 5D |",
+            "|-------|---:|---:|---:|",
+        ])
+        for label, key in (("BUY", "BUY"), ("HOLD", "HOLD"), ("REJECT", "REJECT")):
+            avgs = by_action.get(key) or {}
+            lines.append(
+                f"| {label} avg | {_fmt_summary_avg(avgs.get('1d'))} | "
+                f"{_fmt_summary_avg(avgs.get('3d'))} | {_fmt_summary_avg(avgs.get('5d'))} |"
+            )
+        for label, key in (
+            ("Rank 1-5", "rank_1_5"),
+            ("Rank 6-10", "rank_6_10"),
+            ("Rank 11-17", "rank_11_17"),
+        ):
+            avgs = by_rank.get(key) or {}
+            lines.append(
+                f"| {label} avg | {_fmt_summary_avg(avgs.get('1d'))} | "
+                f"{_fmt_summary_avg(avgs.get('3d'))} | {_fmt_summary_avg(avgs.get('5d'))} |"
+            )
+        judgments = tracking_summary.get("judgments") or []
+        if judgments:
+            lines.extend(["", "### 리뷰 판단", ""])
+            for j in judgments:
+                lines.append(f"- {j}")
 
     lines.extend([
         "",
@@ -2663,7 +3111,19 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
     )
 
     if fetch_tracking_prices:
+        tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
+        _enrich_candidate_tracking_returns(
+            candidate_tracking,
+            date_str,
+            fetch_prices=True,
+            existing_path=tracking_path,
+        )
         _update_tracking_returns(date_str, market, fetch_prices=True)
+    else:
+        tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
+        _merge_tracking_snapshot(candidate_tracking, tracking_path)
+
+    tracking_summary = _build_tracking_group_summary(candidate_tracking)
 
     tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
     tracking_doc = {
@@ -2671,6 +3131,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "market": market,
         "generated_at": datetime.now(KST).isoformat(),
         "candidates": candidate_tracking,
+        "summary": tracking_summary,
     }
     with open(tracking_path, "w", encoding="utf-8") as f:
         json.dump(tracking_doc, f, ensure_ascii=False, indent=2)
@@ -2689,6 +3150,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "execution_performance": execution_performance,
         "system_performance": system_performance,
         "candidate_tracking": candidate_tracking,
+        "candidate_tracking_summary": tracking_summary,
         "warnings": warnings,
         "historical_warnings": historical_warnings,
         "warnings_detail": warnings_detail,
@@ -3014,6 +3476,26 @@ def _smoke_test_accuracy_fixes() -> None:
         assert scoped2["historical_egw00201_count"] == 2
     finally:
         bracket_path.unlink(missing_ok=True)
+
+    base = date(2026, 7, 1)
+    assert _nth_trading_day_after(base, 1) == date(2026, 7, 2)
+    assert _nth_trading_day_after(base, 3) == date(2026, 7, 6)
+    assert _nth_trading_day_after(base, 5) == date(2026, 7, 8)
+
+    row_ok = {"return_1d": 0.0312, "return_1d_status": "ok"}
+    assert _fmt_tracking_cell(row_ok, 1) == "+3.12%"
+    row_fail = {"return_1d": None, "return_1d_status": "fetch_failed"}
+    assert _fmt_tracking_cell(row_fail, 1) == "fetch_failed"
+
+    sample_rows = [
+        {"gpt_action": "BUY", "screener_rank": 1, "return_1d": 0.05, "return_3d": 0.03},
+        {"gpt_action": "BUY", "screener_rank": 2, "return_1d": 0.01, "return_3d": 0.02},
+        {"gpt_action": "HOLD", "screener_rank": 3, "return_1d": 0.02, "return_3d": 0.01},
+        {"gpt_action": "REJECT", "screener_rank": 4, "return_1d": -0.01, "return_3d": -0.02},
+    ]
+    ts = _build_tracking_group_summary(sample_rows)
+    assert ts["by_action"]["BUY"]["1d"] == 0.03
+    assert "GPT BUY 판단 양호" in ts["judgments"]
 
     print("smoke_test_accuracy_fixes: OK")
 
