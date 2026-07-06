@@ -12,23 +12,28 @@ Usage:
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --order-status failed
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --verify-account-match
   PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --show-position-ledger
+  PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --repair-candidates
+  PYTHONPATH=/app/src python /app/scripts/check_trade_db.py --apply-repair-candidates
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils import KST, OUTPUT_DIR, setup_logging, get_account_snapshot_cached
 from stale_sell_pending import find_stale_sell_pending_candidates, get_stale_pending_sell_hours
 from position_ledger import (
     analyze_account_db_match,
+    apply_repair_candidates_to_db,
     build_position_ledger,
     compute_open_positions,
     compute_paper_open_positions,
+    filter_repair_candidates_for_output,
     format_repair_candidate_line,
     load_all_trade_rows,
     norm_ticker,
@@ -93,6 +98,137 @@ def _get_account_qty_by_ticker() -> Tuple[Dict[str, int], str]:
     return qty_map, source
 
 
+def _load_repair_analysis(
+    *,
+    include_paper_executed: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
+    """account snapshot + repair analysis. account 없으면 (None, None)."""
+    if not DB_PATH.is_file():
+        print(f"DB not found: {DB_PATH}")
+        return None, None
+    rows = load_all_trade_rows(str(DB_PATH))
+    account_positions, _ = _get_account_qty_by_ticker()
+    if not account_positions:
+        print(
+            "[POSITION_REPAIR] status=skip reason=no_balance_snapshot "
+            "(KIS account.py 실행 또는 balance_*.json 필요)"
+        )
+        return None, None
+    analysis = analyze_account_db_match(
+        rows,
+        account_positions,
+        include_paper_executed=include_paper_executed,
+    )
+    return analysis, account_positions
+
+
+def _print_repair_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    title: str = "position repair candidates (dry-run",
+) -> None:
+    print(f"\n=== {title}, {len(candidates)}건) ===")
+    if not candidates:
+        print("(none)")
+        return
+    for c in candidates:
+        print(format_repair_candidate_line(c))
+
+
+def _repair_candidates(*, include_paper_executed: bool = False) -> int:
+    analysis, _ = _load_repair_analysis(include_paper_executed=include_paper_executed)
+    if analysis is None:
+        return 1
+    candidates = filter_repair_candidates_for_output(
+        analysis.get("repair_candidates") or [],
+        include_paper_executed=include_paper_executed,
+    )
+    _print_repair_candidates(candidates)
+    return 0
+
+
+def _backup_db_before_repair() -> Optional[str]:
+    if not DB_PATH.is_file():
+        print(f"DB not found: {DB_PATH}")
+        return None
+    ts = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
+    backup_path = OUTPUT_DIR / f"trading_data_before_position_repair_{ts}.db"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DB_PATH, backup_path)
+    print(f"[POSITION_REPAIR] backup_created={backup_path}")
+    return str(backup_path)
+
+
+def _apply_repair_candidates(*, include_paper_executed: bool = False) -> int:
+    analysis, account_positions = _load_repair_analysis(
+        include_paper_executed=include_paper_executed,
+    )
+    if analysis is None or account_positions is None:
+        return 1
+
+    candidates = filter_repair_candidates_for_output(
+        analysis.get("repair_candidates") or [],
+        include_paper_executed=include_paper_executed,
+    )
+    applicable = [
+        c for c in candidates
+        if str(c.get("action") or "") in ("mark_failed_sell_executed", "mark_empty_order_buy_failed")
+    ]
+
+    if not applicable:
+        print("[POSITION_REPAIR] no repair candidates applied")
+        return 0
+
+    print(f"[POSITION_REPAIR] apply_count={len(applicable)} (dry-run preview)")
+    _print_repair_candidates(applicable, title="position repair candidates to apply")
+
+    backup = _backup_db_before_repair()
+    if not backup:
+        return 1
+
+    result = apply_repair_candidates_to_db(str(DB_PATH), applicable)
+    applied = result.get("applied") or []
+    if not applied:
+        print("[POSITION_REPAIR] no repair candidates applied")
+        return 0
+
+    print(f"\n=== position repair applied ({len(applied)}건) ===")
+    for item in applied:
+        before = item.get("before") or {}
+        after = item.get("after") or {}
+        print(
+            f"[POSITION_REPAIR_APPLIED] id={item.get('id')} ticker={item.get('ticker')} "
+            f"action={item.get('action')} "
+            f"before_status={before.get('order_status')} before_executed_qty={before.get('executed_qty')} "
+            f"after_status={after.get('order_status')} after_executed_qty={after.get('executed_qty')}"
+        )
+
+    skipped = result.get("skipped") or []
+    if skipped:
+        print(f"[POSITION_REPAIR] skipped={len(skipped)} (validation failed or already fixed)")
+
+    print("\n=== post-repair account match ===")
+    post_analysis, _ = _load_repair_analysis(include_paper_executed=include_paper_executed)
+    if post_analysis is None:
+        return 1
+    mismatch_count = post_analysis.get("mismatch_count", 0)
+    print(f"[POSITION_REPAIR] final_mismatch_count={mismatch_count}")
+    for m in post_analysis.get("mismatches") or []:
+        print(
+            f"[ACCOUNT_DB_MATCH] ticker={m.get('ticker')} db_qty={m.get('db_qty')} "
+            f"account_qty={m.get('account_qty')} status=mismatch "
+            f"reason={m.get('mismatch_reason')} related_ids={m.get('related_trade_ids')}"
+        )
+    if mismatch_count == 0:
+        open_positions = post_analysis.get("open_positions") or {}
+        for ticker in sorted(set(open_positions) | set(account_positions)):
+            print(
+                f"[ACCOUNT_DB_MATCH] ticker={ticker} db_qty={open_positions.get(ticker, 0)} "
+                f"account_qty={account_positions.get(ticker, 0)} status=ok"
+            )
+    return 1 if mismatch_count else 0
+
+
 def _verify_account_match(*, include_paper_executed: bool = False) -> int:
     rows = load_all_trade_rows(str(DB_PATH))
     account_positions, source = _get_account_qty_by_ticker()
@@ -151,11 +287,12 @@ def _verify_account_match(*, include_paper_executed: bool = False) -> int:
         for ticker, qty in sorted(paper_positions.items()):
             print(f"  ticker={ticker} paper_qty={qty}")
 
-    repair_candidates = analysis.get("repair_candidates") or []
+    repair_candidates = filter_repair_candidates_for_output(
+        analysis.get("repair_candidates") or [],
+        include_paper_executed=include_paper_executed,
+    )
     if repair_candidates:
-        print(f"\n=== position repair candidates (dry-run, {len(repair_candidates)}건) ===")
-        for c in repair_candidates:
-            print(format_repair_candidate_line(c))
+        _print_repair_candidates(repair_candidates)
 
     pending_rows = analysis.get("pending_rows") or []
     if pending_rows:
@@ -234,8 +371,24 @@ def main() -> int:
         action="store_true",
         help="open position 계산에 paper_executed 포함",
     )
+    parser.add_argument(
+        "--repair-candidates",
+        action="store_true",
+        help="DB 수정 없이 position repair 후보만 출력",
+    )
+    parser.add_argument(
+        "--apply-repair-candidates",
+        action="store_true",
+        help="repair 후보를 DB에 적용 (실행 전 자동 백업)",
+    )
     parser.add_argument("--limit", type=int, default=100, help="최대 조회 건수")
     args = parser.parse_args()
+
+    if args.repair_candidates:
+        return _repair_candidates(include_paper_executed=args.include_paper_executed)
+
+    if args.apply_repair_candidates:
+        return _apply_repair_candidates(include_paper_executed=args.include_paper_executed)
 
     if args.verify_account_match:
         return _verify_account_match(include_paper_executed=args.include_paper_executed)

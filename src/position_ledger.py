@@ -403,3 +403,167 @@ def format_repair_candidate_line(candidate: Dict[str, Any]) -> str:
         f"action={candidate.get('action')} id={candidate.get('id')} "
         f"qty={candidate.get('qty')} reason={candidate.get('detail') or candidate.get('reason')}"
     )
+
+
+REPAIR_TAG_SELL_EXECUTED = "REPAIRED_BY_ACCOUNT_ABSENCE_SELL_EXECUTED"
+REPAIR_TAG_BUY_FAILED = "REPAIRED_ACCOUNT_ABSENCE_NO_ORDER_ID_BUY_MARK_FAILED"
+
+_APPLY_ACTIONS = frozenset({"mark_failed_sell_executed", "mark_empty_order_buy_failed"})
+
+
+def filter_repair_candidates_for_output(
+    candidates: List[Dict[str, Any]],
+    *,
+    include_paper_executed: bool = False,
+) -> List[Dict[str, Any]]:
+    """출력/적용 대상 repair 후보 (paper duplicate는 --include-paper-executed일 때만)."""
+    out: List[Dict[str, Any]] = []
+    for c in candidates:
+        action = str(c.get("action") or "")
+        if action == "exclude_paper_executed":
+            if include_paper_executed:
+                out.append(c)
+            continue
+        if action in _APPLY_ACTIONS:
+            out.append(c)
+    return out
+
+
+def filter_repair_candidates_for_apply(
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """DB apply 대상 (paper_executed 제외 — open position에서 이미 제외됨)."""
+    return [c for c in candidates if str(c.get("action") or "") in _APPLY_ACTIONS]
+
+
+def append_reason_code(existing: str, code: str) -> str:
+    existing = str(existing or "").strip()
+    code = str(code or "").strip()
+    if not code:
+        return existing
+    if not existing:
+        return code
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if code in parts:
+        return existing
+    parts.append(code)
+    return ",".join(parts)
+
+
+def _fetch_row_by_id(conn: sqlite3.Connection, row_id: int) -> Optional[Dict[str, Any]]:
+    cur = conn.execute(
+        """
+        SELECT id, ticker, action, quantity, requested_qty, executed_qty,
+               order_status, order_id, reason_code
+        FROM trade_records WHERE id = ?
+        """,
+        (int(row_id),),
+    )
+    r = cur.fetchone()
+    if not r:
+        return None
+    return dict(r)
+
+
+def apply_single_repair(
+    conn: sqlite3.Connection,
+    candidate: Dict[str, Any],
+    *,
+    now_iso: str,
+) -> Optional[Dict[str, Any]]:
+    """단일 repair 후보 적용. 반환: before/after 요약 또는 None(스킵)."""
+    row_id = candidate.get("id")
+    if row_id is None:
+        return None
+    before = _fetch_row_by_id(conn, int(row_id))
+    if not before:
+        return None
+
+    action = str(candidate.get("action") or "")
+    ticker = norm_ticker(before.get("ticker"))
+    qty = row_executed_qty(before)
+
+    if action == "mark_failed_sell_executed":
+        if not action_is_sell(before):
+            return None
+        if str(before.get("order_status") or "").lower() != "failed":
+            return None
+        target_qty = safe_int(before.get("quantity") or before.get("requested_qty") or qty)
+        new_reason = append_reason_code(before.get("reason_code") or "", REPAIR_TAG_SELL_EXECUTED)
+        conn.execute(
+            """
+            UPDATE trade_records
+            SET order_status = 'executed',
+                executed_qty = ?,
+                reason_code = ?,
+                last_status_update_ts = ?
+            WHERE id = ?
+            """,
+            (target_qty, new_reason, now_iso, int(row_id)),
+        )
+        after = {
+            **before,
+            "order_status": "executed",
+            "executed_qty": target_qty,
+            "reason_code": new_reason,
+        }
+        return {"id": row_id, "ticker": ticker, "action": action, "before": before, "after": after}
+
+    if action == "mark_empty_order_buy_failed":
+        if not action_is_buy(before):
+            return None
+        if str(before.get("order_status") or "").lower() not in OPEN_POSITION_STATUSES:
+            return None
+        if str(before.get("order_id") or "").strip():
+            return None
+        new_reason = append_reason_code(before.get("reason_code") or "", REPAIR_TAG_BUY_FAILED)
+        conn.execute(
+            """
+            UPDATE trade_records
+            SET order_status = 'failed',
+                executed_qty = 0,
+                reason_code = ?,
+                last_status_update_ts = ?
+            WHERE id = ?
+            """,
+            (new_reason, now_iso, int(row_id)),
+        )
+        after = {
+            **before,
+            "order_status": "failed",
+            "executed_qty": 0,
+            "reason_code": new_reason,
+        }
+        return {"id": row_id, "ticker": ticker, "action": action, "before": before, "after": after}
+
+    return None
+
+
+def apply_repair_candidates_to_db(
+    db_path: str,
+    candidates: List[Dict[str, Any]],
+    *,
+    now_iso: Optional[str] = None,
+) -> Dict[str, Any]:
+    """repair 후보를 DB에 적용. paper_executed duplicate는 적용하지 않음."""
+    from datetime import datetime
+    from utils import KST
+
+    applicable = filter_repair_candidates_for_apply(candidates)
+    now_iso = now_iso or datetime.now(KST).isoformat()
+    applied: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    if not applicable:
+        return {"applied": applied, "skipped": skipped, "applied_count": 0}
+
+    with sqlite3.connect(db_path) as conn:
+        for candidate in applicable:
+            result = apply_single_repair(conn, candidate, now_iso=now_iso)
+            if result:
+                applied.append(result)
+            else:
+                skipped.append(candidate)
+        conn.commit()
+
+    return {"applied": applied, "skipped": skipped, "applied_count": len(applied)}
