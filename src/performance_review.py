@@ -1976,26 +1976,55 @@ def _tracking_horizon_dates(base_dt: date) -> Dict[int, date]:
     return {h: _nth_trading_day_after(base, h) for h in TRACK_HORIZONS}
 
 
-def _init_kis_tracking_client():
+def _settings_config() -> Dict[str, Any]:
+    cfg = getattr(settings, "_config", None)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _resolve_trading_env() -> str:
+    """config trading_environment (기본: kis_paper)."""
+    env = str(_settings_config().get("trading_environment") or "kis_paper").strip().lower()
+    if env not in ("prod", "vps", "kis_paper"):
+        return "kis_paper"
+    return env
+
+
+def _init_kis_tracking_client() -> Tuple[Optional[Any], Dict[str, Any]]:
+    """KIS 추적 클라이언트 초기화.
+
+    Returns:
+        (kis_or_None, meta) — meta: trading_env, error, tracking_status
+    """
+    trading_env = _resolve_trading_env()
+    meta: Dict[str, Any] = {
+        "trading_env": trading_env,
+        "error": None,
+        "tracking_status": "ok",
+    }
     try:
         from api.kis_auth import KIS
         from kis_rate_limit import init_kis_rate_limits
 
-        env = getattr(settings, "_config", {}).get("trading_environment", "prod")
-        if env not in ("prod", "vps", "kis_paper"):
-            env = "prod"
-        init_kis_rate_limits(env)
-        kis = KIS(env=env)
+        cfg = _settings_config()
+        # init_kis_rate_limits(settings, trading_env) — settings dict + env 필수
+        init_kis_rate_limits(cfg, trading_env)
+        kis = KIS(config={}, env=trading_env)
         try:
             import screener_core as sc
 
             sc._KIS_PRICE_CLIENT = kis
         except Exception:
             pass
-        return kis
+        return kis, meta
     except Exception as e:
-        logger.warning("[PERF_TRACKING] KIS client init failed: %s", e)
-        return None
+        meta["error"] = str(e)
+        meta["tracking_status"] = "price_fetch_failed"
+        logger.warning(
+            "[PERF_TRACKING_KIS_INIT_FAILED] trading_env=%s error=%s",
+            trading_env,
+            e,
+        )
+        return None, meta
 
 
 def _close_price_on_date(df: Any, yyyymmdd: str) -> Optional[float]:
@@ -2139,7 +2168,7 @@ def _fetch_tracking_ohlcv(
 def _fetch_price(ticker: str, price_cache: Dict[str, Optional[float]]) -> Optional[float]:
     if ticker in price_cache:
         return price_cache[ticker]
-    kis = _init_kis_tracking_client()
+    kis, _meta = _init_kis_tracking_client()
     if kis is None:
         price_cache[ticker] = None
         return None
@@ -2147,6 +2176,90 @@ def _fetch_price(ticker: str, price_cache: Dict[str, Optional[float]]) -> Option
     price, _ = _fetch_current_price(ticker, kis, cur_cache)
     price_cache[ticker] = price
     return price
+
+
+def _index_close_on_date(df: Any, yyyymmdd: str) -> Optional[float]:
+    """업종/지수 일봉 DF에서 특정일 종가 추출."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    target = str(yyyymmdd).replace("-", "")[:8]
+    date_col = next(
+        (c for c in ("stck_bsop_date", "bsop_date", "date", "Date") if c in df.columns),
+        None,
+    )
+    close_col = next(
+        (
+            c
+            for c in ("bstp_nmix_prpr", "stck_clpr", "clspr", "close", "Close", "종가")
+            if c in df.columns
+        ),
+        None,
+    )
+    if not date_col or not close_col:
+        return None
+    try:
+        for _, row in df.iterrows():
+            if str(row[date_col]).replace("-", "")[:8] == target:
+                return _safe_float(row[close_col])
+    except Exception as e:
+        logger.debug("지수 종가 조회 실패 date=%s: %s", target, e)
+    return None
+
+
+def _fetch_market_horizon_return(
+    kis: Any,
+    base_date_str: str,
+    target_date_str: str,
+    market: str = "KOSPI",
+) -> Optional[float]:
+    """기준일→목표일 시장(지수) 수익률. 실패 시 None."""
+    if kis is None:
+        return None
+    idx_code = "0001" if str(market or "KOSPI").upper() == "KOSPI" else "1001"
+    proxy = "069500" if str(market or "KOSPI").upper() == "KOSPI" else "229200"
+    try:
+        from kis_rate_limit import rate_limit_wait
+
+        rate_limit_wait()
+        df = kis.inquire_industry_period_price(
+            fid_input_iscd=idx_code,
+            fid_input_date_1=base_date_str,
+            fid_input_date_2=target_date_str,
+            fid_period_div_code="D",
+        )
+        base_px = _index_close_on_date(df, base_date_str)
+        tgt_px = _index_close_on_date(df, target_date_str)
+        if base_px is None or tgt_px is None or base_px == 0:
+            rate_limit_wait()
+            df = kis.inquire_period_price(
+                fid_cond_mrkt_div_code="J",
+                fid_input_iscd=proxy,
+                fid_input_date_1=base_date_str,
+                fid_input_date_2=target_date_str,
+                fid_period_div_code="D",
+                fid_org_adj_prc="0",
+            )
+            try:
+                from screener_core import _normalize_kis_period_df
+
+                if df is not None and not getattr(df, "empty", True):
+                    df = _normalize_kis_period_df(df)
+            except Exception:
+                pass
+            base_px = _close_price_on_date(df, base_date_str) or _index_close_on_date(df, base_date_str)
+            tgt_px = _close_price_on_date(df, target_date_str) or _index_close_on_date(df, target_date_str)
+        if base_px is None or tgt_px is None or base_px == 0:
+            return None
+        return round((float(tgt_px) - float(base_px)) / float(base_px), 6)
+    except Exception as e:
+        logger.debug(
+            "시장 수익률 조회 실패 market=%s %s→%s: %s",
+            market,
+            base_date_str,
+            target_date_str,
+            e,
+        )
+        return None
 
 
 def _merge_tracking_snapshot(rows: List[Dict[str, Any]], path: Path) -> None:
@@ -2180,7 +2293,7 @@ def _fmt_tracking_cell(row: Dict[str, Any], horizon: int) -> str:
     status = row.get(f"return_{horizon}d_status")
     if ret is not None:
         return f"{float(ret) * 100:+.2f}%"
-    if status in ("fetch_failed", "rate_limited"):
+    if status in ("fetch_failed", "rate_limited", "skipped_future"):
         return status
     return "-"
 
@@ -2195,7 +2308,12 @@ def _avg_horizon(rows: List[Dict[str, Any]], filter_fn, horizon: int) -> Optiona
     return round(sum(vals) / len(vals), 6) if vals else None
 
 
-def _build_tracking_group_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_tracking_group_summary(
+    rows: List[Dict[str, Any]],
+    *,
+    market_5d: Optional[float] = None,
+    market: str = "KOSPI",
+) -> Dict[str, Any]:
     def _by_action(action: str):
         return lambda r: str(r.get("gpt_action") or "").upper() == action
 
@@ -2239,11 +2357,46 @@ def _build_tracking_group_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if reject_top_v is not None and buy_v is not None and reject_top_v > buy_v:
         judgments.append("GPT 리스크 필터 과도 가능성")
 
+    hold_rows = [r for r in rows if str(r.get("gpt_action") or "").upper() == "HOLD"]
+    reject_rows = sorted(
+        [r for r in rows if str(r.get("gpt_action") or "").upper() == "REJECT"],
+        key=lambda r: _safe_int(r.get("screener_rank")) or 9999,
+    )
+    reject_top5_rows = reject_rows[:5]
+    hold_avg_5d = _avg_horizon(hold_rows, lambda _r: True, 5)
+    reject_top5_avg_5d = _avg_horizon(reject_top5_rows, lambda _r: True, 5)
+
+    def _excess(group_avg: Optional[float]) -> Optional[float]:
+        if group_avg is None or market_5d is None:
+            return None
+        return round(float(group_avg) - float(market_5d), 6)
+
+    conservatism = {
+        "hold_count": len(hold_rows),
+        "hold_tickers": [_norm_ticker(r.get("ticker")) for r in hold_rows],
+        "hold_avg_5d": hold_avg_5d,
+        "hold_excess_vs_market_5d": _excess(hold_avg_5d),
+        "reject_top5_count": len(reject_top5_rows),
+        "reject_top5_tickers": [_norm_ticker(r.get("ticker")) for r in reject_top5_rows],
+        "reject_top5_avg_5d": reject_top5_avg_5d,
+        "reject_top5_excess_vs_market_5d": _excess(reject_top5_avg_5d),
+        "market": str(market or "KOSPI").upper(),
+        "market_5d": market_5d,
+    }
+    if hold_avg_5d is not None and market_5d is not None:
+        if hold_avg_5d > market_5d:
+            judgments.append("HOLD 그룹이 시장 대비 초과수익 (보수적 기회비용 가능)")
+        elif hold_avg_5d < market_5d:
+            judgments.append("HOLD 그룹이 시장 대비 저조")
+    if reject_top5_avg_5d is not None and market_5d is not None and reject_top5_avg_5d > market_5d:
+        judgments.append("REJECT top5가 시장 대비 초과수익 (필터 과도 가능)")
+
     return {
         "by_action": by_action,
         "by_rank": by_rank,
         "judgments": judgments,
         "as_of_date": datetime.now(KST).date().strftime("%Y%m%d"),
+        "conservatism": conservatism,
     }
 
 
@@ -2260,8 +2413,18 @@ def _enrich_candidate_tracking_returns(
     as_of_date: Optional[date] = None,
     fetch_prices: bool = True,
     existing_path: Optional[Path] = None,
+    market: str = "KOSPI",
 ) -> Dict[str, Any]:
-    stats = {"enriched": 0, "fetch_failed": 0, "rate_limited": 0, "skipped_future": 0}
+    stats: Dict[str, Any] = {
+        "enriched": 0,
+        "fetch_failed": 0,
+        "rate_limited": 0,
+        "skipped_future": 0,
+        "tracking_status": "ok",
+        "skip_reason": None,
+        "market_5d": None,
+        "trading_env": None,
+    }
     if not rows:
         return stats
 
@@ -2270,17 +2433,51 @@ def _enrich_candidate_tracking_returns(
     except ValueError:
         return stats
 
-    as_of = _normalize_trading_day(as_of_date or datetime.now(KST).date())
+    # as_of는 달력일 그대로 사용 (과거 목표일을 미래로 오판하지 않도록 normalize 하지 않음)
+    as_of = as_of_date or datetime.now(KST).date()
     horizon_dates = _tracking_horizon_dates(base_dt)
 
     if existing_path and existing_path.is_file():
         _merge_tracking_snapshot(rows, existing_path)
 
     kis = None
+    kis_meta: Dict[str, Any] = {}
     ohlcv_cache: Dict[str, Tuple[Any, str]] = {}
     current_cache: Dict[str, Tuple[Optional[float], str]] = {}
     if fetch_prices:
-        kis = _init_kis_tracking_client()
+        kis, kis_meta = _init_kis_tracking_client()
+        stats["trading_env"] = kis_meta.get("trading_env")
+        if kis is None:
+            skip_reason = (
+                f"kis_init_failed trading_env={kis_meta.get('trading_env')} "
+                f"error={kis_meta.get('error')}"
+            )
+            stats["tracking_status"] = "price_fetch_failed"
+            stats["skip_reason"] = skip_reason
+            for row in rows:
+                row["tracking_status"] = "price_fetch_failed"
+                row["skip_reason"] = skip_reason
+                for h in TRACK_HORIZONS:
+                    target_dt = horizon_dates[h]
+                    row[f"track_{h}d_date"] = target_dt.strftime("%Y%m%d")
+                    if as_of < target_dt:
+                        stats["skipped_future"] += 1
+                        row[f"return_{h}d_status"] = row.get(f"return_{h}d_status") or "skipped_future"
+                    elif row.get(f"return_{h}d") is None:
+                        row[f"return_{h}d_status"] = "fetch_failed"
+            logger.info(
+                "[PERF_TRACKING_ENRICH] base=%s as_of=%s enriched=%s fetch_failed=%s "
+                "rate_limited=%s skipped_future=%s tracking_status=%s skip_reason=%s",
+                base_date_str,
+                as_of.strftime("%Y%m%d"),
+                stats["enriched"],
+                stats["fetch_failed"],
+                stats["rate_limited"],
+                stats["skipped_future"],
+                stats["tracking_status"],
+                stats["skip_reason"],
+            )
+            return stats
 
     tickers_to_fetch: set = set()
     for row in rows:
@@ -2290,13 +2487,15 @@ def _enrich_candidate_tracking_returns(
         for h in TRACK_HORIZONS:
             target_dt = horizon_dates[h]
             row[f"track_{h}d_date"] = target_dt.strftime("%Y%m%d")
+            # base=20260717, D+5=20260724, as_of=20260727 → fetch 대상 (skipped_future 아님)
             if as_of < target_dt:
                 stats["skipped_future"] += 1
+                row[f"return_{h}d_status"] = row.get(f"return_{h}d_status") or "skipped_future"
                 continue
             if row.get(f"return_{h}d") is not None and row.get(f"return_{h}d_status") == "ok":
                 continue
             prev_status = row.get(f"return_{h}d_status")
-            if prev_status not in ("fetch_failed", "rate_limited") and row.get(f"return_{h}d") is not None:
+            if prev_status not in ("fetch_failed", "rate_limited", None, "skipped_future") and row.get(f"return_{h}d") is not None:
                 continue
             if fetch_prices:
                 tickers_to_fetch.add(ticker)
@@ -2336,6 +2535,7 @@ def _enrich_candidate_tracking_returns(
                 continue
             if kis is None:
                 row[status_key] = "fetch_failed"
+                row["tracking_status"] = "price_fetch_failed"
                 continue
 
             if fetch_status in ("fetch_failed", "rate_limited"):
@@ -2360,14 +2560,27 @@ def _enrich_candidate_tracking_returns(
             row[status_key] = "ok"
             stats["enriched"] += 1
 
+    # 시장(KOSPI 등) 5D 수익률 — GPT Conservatism Review용
+    if fetch_prices and kis is not None and 5 in horizon_dates:
+        d5 = horizon_dates[5]
+        if as_of >= d5:
+            stats["market_5d"] = _fetch_market_horizon_return(
+                kis,
+                base_date_str,
+                d5.strftime("%Y%m%d"),
+                market=market,
+            )
+
     logger.info(
-        "[PERF_TRACKING_ENRICH] base=%s as_of=%s enriched=%s fetch_failed=%s rate_limited=%s skipped_future=%s",
+        "[PERF_TRACKING_ENRICH] base=%s as_of=%s enriched=%s fetch_failed=%s "
+        "rate_limited=%s skipped_future=%s market_5d=%s",
         base_date_str,
         as_of.strftime("%Y%m%d"),
         stats["enriched"],
         stats["fetch_failed"],
         stats["rate_limited"],
         stats["skipped_future"],
+        stats.get("market_5d"),
     )
     return stats
 
@@ -2397,6 +2610,7 @@ def _refresh_other_tracking_snapshots(
             as_of_date=as_of,
             fetch_prices=fetch_prices,
             existing_path=path,
+            market=market,
         )
         data["candidates"] = rows
         data["last_return_update"] = datetime.now(KST).isoformat()
@@ -2951,6 +3165,39 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             for j in judgments:
                 lines.append(f"- {j}")
 
+    cons = tracking_summary.get("conservatism") or {}
+    mkt_label = cons.get("market") or market or "KOSPI"
+    lines.extend([
+        "",
+        "### GPT Conservatism Review",
+        "",
+        f"- As-of: {tracking_summary.get('as_of_date', '-')}",
+        f"- Tracking status: {tracking_summary.get('tracking_status') or 'ok'}",
+    ])
+    if tracking_summary.get("skip_reason"):
+        lines.append(f"- Skip reason: {tracking_summary.get('skip_reason')}")
+    lines.extend([
+        "",
+        "| Group | Count | Tickers | 5D | vs Market |",
+        "|-------|------:|---------|---:|----------:|",
+        (
+            f"| HOLD | {cons.get('hold_count', 0)} | "
+            f"{', '.join(cons.get('hold_tickers') or []) or '-'} | "
+            f"{_fmt_summary_avg(cons.get('hold_avg_5d'))} | "
+            f"{_fmt_summary_avg(cons.get('hold_excess_vs_market_5d'))} |"
+        ),
+        (
+            f"| REJECT top5 | {cons.get('reject_top5_count', 0)} | "
+            f"{', '.join(cons.get('reject_top5_tickers') or []) or '-'} | "
+            f"{_fmt_summary_avg(cons.get('reject_top5_avg_5d'))} | "
+            f"{_fmt_summary_avg(cons.get('reject_top5_excess_vs_market_5d'))} |"
+        ),
+        (
+            f"| {mkt_label} | - | - | "
+            f"{_fmt_summary_avg(cons.get('market_5d'))} | - |"
+        ),
+    ])
+
     lines.extend([
         "",
         "## 8. System Performance",
@@ -3110,20 +3357,29 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         auto_sell_policy,
     )
 
+    enrich_stats: Dict[str, Any] = {}
     if fetch_tracking_prices:
         tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
-        _enrich_candidate_tracking_returns(
+        enrich_stats = _enrich_candidate_tracking_returns(
             candidate_tracking,
             date_str,
             fetch_prices=True,
             existing_path=tracking_path,
+            market=market,
         )
         _update_tracking_returns(date_str, market, fetch_prices=True)
     else:
         tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
         _merge_tracking_snapshot(candidate_tracking, tracking_path)
 
-    tracking_summary = _build_tracking_group_summary(candidate_tracking)
+    tracking_summary = _build_tracking_group_summary(
+        candidate_tracking,
+        market_5d=enrich_stats.get("market_5d"),
+        market=market,
+    )
+    if enrich_stats.get("tracking_status") == "price_fetch_failed":
+        tracking_summary["tracking_status"] = "price_fetch_failed"
+        tracking_summary["skip_reason"] = enrich_stats.get("skip_reason")
 
     tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
     tracking_doc = {
@@ -3482,20 +3738,38 @@ def _smoke_test_accuracy_fixes() -> None:
     assert _nth_trading_day_after(base, 3) == date(2026, 7, 6)
     assert _nth_trading_day_after(base, 5) == date(2026, 7, 8)
 
+    # 20260717 기준 D+1/3/5 및 as_of=20260727 → D+5는 fetch 대상
+    base_717 = date(2026, 7, 17)
+    horizons_717 = _tracking_horizon_dates(base_717)
+    assert horizons_717[1] == date(2026, 7, 20)
+    assert horizons_717[3] == date(2026, 7, 22)
+    assert horizons_717[5] == date(2026, 7, 24)
+    as_of_727 = date(2026, 7, 27)
+    assert not (as_of_727 < horizons_717[5]), "D+5=20260724 must not be skipped_future when as_of=20260727"
+    assert as_of_727 < horizons_717[10], "D+10 may still be future vs as_of=20260727"
+
     row_ok = {"return_1d": 0.0312, "return_1d_status": "ok"}
     assert _fmt_tracking_cell(row_ok, 1) == "+3.12%"
     row_fail = {"return_1d": None, "return_1d_status": "fetch_failed"}
     assert _fmt_tracking_cell(row_fail, 1) == "fetch_failed"
 
     sample_rows = [
-        {"gpt_action": "BUY", "screener_rank": 1, "return_1d": 0.05, "return_3d": 0.03},
-        {"gpt_action": "BUY", "screener_rank": 2, "return_1d": 0.01, "return_3d": 0.02},
-        {"gpt_action": "HOLD", "screener_rank": 3, "return_1d": 0.02, "return_3d": 0.01},
-        {"gpt_action": "REJECT", "screener_rank": 4, "return_1d": -0.01, "return_3d": -0.02},
+        {"gpt_action": "BUY", "screener_rank": 1, "ticker": "000001", "return_1d": 0.05, "return_3d": 0.03, "return_5d": 0.04},
+        {"gpt_action": "BUY", "screener_rank": 2, "ticker": "000002", "return_1d": 0.01, "return_3d": 0.02, "return_5d": 0.01},
+        {"gpt_action": "HOLD", "screener_rank": 3, "ticker": "161390", "return_1d": 0.02, "return_3d": 0.01, "return_5d": 0.03},
+        {"gpt_action": "HOLD", "screener_rank": 6, "ticker": "078930", "return_1d": 0.01, "return_3d": 0.02, "return_5d": 0.05},
+        {"gpt_action": "REJECT", "screener_rank": 4, "ticker": "021240", "return_1d": -0.01, "return_3d": -0.02, "return_5d": 0.06},
+        {"gpt_action": "REJECT", "screener_rank": 5, "ticker": "010950", "return_1d": 0.0, "return_3d": 0.01, "return_5d": 0.02},
     ]
-    ts = _build_tracking_group_summary(sample_rows)
+    ts = _build_tracking_group_summary(sample_rows, market_5d=0.01, market="KOSPI")
     assert ts["by_action"]["BUY"]["1d"] == 0.03
     assert "GPT BUY 판단 양호" in ts["judgments"]
+    cons = ts["conservatism"]
+    assert cons["hold_count"] == 2
+    assert cons["hold_avg_5d"] == 0.04
+    assert cons["reject_top5_avg_5d"] == 0.04
+    assert cons["market_5d"] == 0.01
+    assert cons["hold_excess_vs_market_5d"] == 0.03
 
     print("smoke_test_accuracy_fixes: OK")
 
