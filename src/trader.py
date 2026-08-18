@@ -100,6 +100,7 @@ from gpt_analyzer import (
 
 from weekly_signal import (
     complete_weekly_execution,
+    find_latest_gpt_trades_file,
     get_weekly_trader_params,
     handle_trader_trading_day_gate,
     is_weekly_rebalance_mode,
@@ -5057,7 +5058,6 @@ class Trader:
             exec_date = datetime.now(KST).strftime("%Y%m%d")
             signal_date = self._weekly_signal_date
             if not signal_date and isinstance(trade_plan_file, Path):
-                from weekly_signal import parse_gpt_trades_signal_date
                 signal_date = parse_gpt_trades_signal_date(trade_plan_file)
             max_td = int(get_weekly_trader_params(self.settings).get("weekly_signal_max_trading_days", 2))
             if signal_date and is_weekly_signal_expired(signal_date, exec_date, max_td):
@@ -6607,7 +6607,6 @@ if __name__ == "__main__":
             complete_weekly_execution(status="expired", execution_date=today_str)
             pending_state = None
         elif pending_state:
-            from weekly_signal import find_latest_gpt_trades_file, parse_gpt_trades_signal_date
             latest_sig = parse_gpt_trades_signal_date(find_latest_gpt_trades_file(market))
             if (
                 latest_sig == today_str
