@@ -78,8 +78,8 @@
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + orphan `order_id` backfill. KIS 주문조회 miss 시 **계좌 잔고 holding fallback**(`[RECONCILE_BY_HOLDING]`). 체결가 `pchs_avg_pric` 반영 시 `amount` 동기화·`structured_context`에 `original_order_price` 보존. 이미 `executed` 행은 idempotent skip
 - **거래 기록 분류** — `paper_executed`(order_id 없음) = `paper_db_only` 테스트 기록 vs `kis_paper` 실주문(`order_id` 있는 `executed`). `[TRADE_RECORD_CLASSIFY]` 로그. 일일 요약 BUY 집계에서 `paper_db_only` 제외
 - **조건부 Rebuy** — 보유 중 추가매수는 금지(`max_legs_per_ticker=1`). 전량 청산 후에만 신규 GPT BUY + 거래일 cooldown + 매도사유·가격 회복 조건을 통과하면 **최대 1회** 재진입. `rebuy` 설정이 없으면 레거시 `allow_rebuy` 유지
-- **주간 신호 이월** — 월요 휴장 시 `gpt_trades`를 버리지 않고 `weekly_trader_state.json`에 defer. 다음 거래일에 gap/리스크/Rebuy 조건을 재검증 후 주문 (`weekly_signal_max_trading_days`, 기본 2거래일 초과 시 expire)
-- **매수 관측성** — `[STOCK_BUDGET_USAGE]`, `[BUY_ENTRY_CLASSIFY]`, `[REBUY_EVALUATION]`/`[REBUY_APPROVED]`/`[REBUY_SKIP_*]`, `[BUY_SELECTION_SUMMARY]`(blocked_rebuy 포함)
+- **주간 신호 이월** — 월요 휴장 시 `gpt_trades`를 버리지 않고 `weekly_trader_state.json`에 defer. 다음 거래일에 gap/리스크/Rebuy 조건을 재검증 후 주문 (`weekly_signal_max_trading_days`, 기본 2거래일 초과 시 expire). **`--deferred-weekly --dry-run`은 validation만 수행하고 `weekly_trader_state.json`을 변경하지 않음** (pending 유지 → 이후 실제 실행 가능)
+- **매수 관측성** — `[STOCK_BUDGET_USAGE]`, `[BUY_ENTRY_CLASSIFY]`, `[REBUY_EVALUATION]`/`[REBUY_APPROVED]`/`[REBUY_SKIP_*]`, `[BUY_SELECTION_SUMMARY]`(blocked_rebuy 포함). dry-run 시 `unused_reason=dry_run_no_order_execution`, deferred dry-run 종료 시 `[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED]`
 - **연속 손실 집계** — `is_countable_loss_sell()` / `count_consecutive_losses()`로 **체결 확정·order_id 있는 손실만** 카운트 (`stop_trading_on_consecutive_losses`, 기본 3회). pending/failed·중복 SELL row 제외
 - **중복 SELL 방지** — `risk_manager` direct_execute 후 `trader.run_sell_logic`이 동일 종목을 재매도·재기록하지 않도록 pending 주문 skip + `order_id` 없는 SELL 중복 INSERT 차단
 - **매수 오기록 방지** — `trader._check_delayed_execution`은 **ODNO·매수/매도 구분** 필수. `split_buy.enabled=false` 시 분할 분기 미진입. `order_id` 없는 체결 BUY/SELL은 `recorder`에서 INSERT 차단
@@ -849,11 +849,29 @@ Rebuy도 일반 BUY와 동일하게 stock budget · 현금 · `max_positions` ·
 
 **주간 신호 이월과 함께:** deferred BUY는 gap-up(`max_deferred_entry_gap_pct`)·리스크·allocation을 먼저 재검증한 뒤, Rebuy 후보면 cooldown/signal/recovery를 **다시** 확인합니다. Rebuy라고 이월 검증을 건너뛰지 않습니다.
 
-**주요 로그:** `[BUY_ENTRY_CLASSIFY]` · `[REBUY_EVALUATION]` · `[REBUY_NEW_SIGNAL_CHECK]` · `[REBUY_COUNT]` · `[REBUY_SKIP_*]` · `[REBUY_APPROVED]` · `[REBUY_ORDER_SUBMITTED]`
+**deferred weekly dry-run (`--deferred-weekly --dry-run`):**
+
+| 항목 | dry-run | 실제 실행 |
+|------|---------|-----------|
+| gap/ATR/stop/holding/pending/allocation 검증 | ✅ 동일 | ✅ |
+| BUY/SELL 주문 | ❌ | ✅ |
+| `trade_records` INSERT/UPDATE | ❌ | ✅ |
+| `weekly_trader_state.json` | **읽기만** (pending 유지) | executed/expired로 소비 |
+| 종료 로그 | `[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED]` | `[WEEKLY_SIGNAL_EXECUTED]` |
+| expire 판정 | 로그만 (`reason=expired_dry_run`), state 불변 | `status=expired` |
+
+dry-run 후에도 pending 상태이므로, 이후 `--deferred-weekly`(non-dry-run)로 실제 실행 가능합니다. 이미 `executed=true`인 signal은 중복 실행이 차단됩니다.
+
+**주요 로그:** `[BUY_ENTRY_CLASSIFY]` · `[REBUY_EVALUATION]` · `[REBUY_NEW_SIGNAL_CHECK]` · `[REBUY_COUNT]` · `[REBUY_SKIP_*]` · `[REBUY_APPROVED]` · `[REBUY_ORDER_SUBMITTED]` · `[DEFERRED_WEEKLY_TRADER_RESUME]` · `[DEFERRED_BUY_REVALIDATE]` · `[DEFERRED_BUY_SKIP_GAP_UP]` · `[DEFERRED_BUY_SKIP_HOLDING]` · `[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED]`
 
 ```bash
 # 주문 없이 Rebuy eligibility만 검증
 docker compose exec integrated_manager python /app/src/trader.py --dry-run
+
+# 이월된 주간 signal validation만 (state·DB·주문 변경 없음)
+docker compose exec integrated_manager python -u /app/src/trader.py \
+  --deferred-weekly --dry-run \
+  --gpt-file /app/output/gpt_trades_YYYYMMDD_KOSPI.json
 
 # 판정 엔진 단위 테스트 (DB 수정 없음)
 docker compose exec integrated_manager python /app/src/rebuy_policy.py
@@ -1048,7 +1066,12 @@ docker compose exec integrated_manager python -u /app/src/trader.py
 # Rebuy eligibility dry-run (주문·매도 없음)
 docker compose exec integrated_manager python -u /app/src/trader.py --dry-run
 
-# 이월된 주간 GPT signal 재실행 (보통 스케줄이 호출)
+# 이월된 주간 GPT signal validation만 (weekly_trader_state.json pending 유지)
+docker compose exec integrated_manager python -u /app/src/trader.py \
+  --deferred-weekly --dry-run \
+  --gpt-file /app/output/gpt_trades_YYYYMMDD_KOSPI.json
+
+# 이월된 주간 GPT signal 실제 실행 (보통 스케줄이 호출)
 docker compose exec integrated_manager python -u /app/src/trader.py --deferred-weekly
 docker compose exec integrated_manager python /app/src/rebuy_policy.py
 docker compose exec integrated_manager python /app/src/weekly_signal.py
@@ -1093,7 +1116,7 @@ docker compose exec integrated_manager python -u /app/src/order_reconciler.py --
 
 # 리컨실·분류·예산 로그 확인
 docker compose exec integrated_manager python -u /app/src/trader.py 2>&1 | tee output/trader_run.log
-grep -E 'STOCK_BUDGET_USAGE|BUY_ENTRY_CLASSIFY|REBUY_|BUY_SELECTION_SUMMARY|TRADE_RECORD_CLASSIFY|RECONCILE_BY_HOLDING|WEEKLY_SIGNAL_' output/trader_run.log
+grep -E 'STOCK_BUDGET_USAGE|BUY_ENTRY_CLASSIFY|REBUY_|BUY_SELECTION_SUMMARY|TRADE_RECORD_CLASSIFY|RECONCILE_BY_HOLDING|WEEKLY_SIGNAL_|DEFERRED_' output/trader_run.log
 
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --limit 800
 

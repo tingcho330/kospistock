@@ -4527,6 +4527,10 @@ class Trader:
                 if "insufficient_gpt_buy_candidates" not in reasons:
                     reasons.add("insufficient_gpt_buy_candidates")
 
+        if self._dry_run and s["final_buy_count"] == 0 and s["gpt_buy_count"] > 0:
+            reasons.discard("insufficient_gpt_buy_candidates")
+            reasons.add("dry_run_no_order_execution")
+
         if allocation and allocation.enabled:
             total_assets = allocation.total_asset
             current_stock_value = allocation.stock_value
@@ -5065,7 +5069,14 @@ class Trader:
                     "[WEEKLY_SIGNAL_EXPIRED] signal_date=%s execution_date=%s",
                     signal_date, exec_date,
                 )
-                complete_weekly_execution(status="expired", execution_date=exec_date)
+                if self._dry_run:
+                    logger.info(
+                        "[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED] signal_date=%s execution_date=%s "
+                        "state_status=pending reason=expired_dry_run",
+                        signal_date, exec_date,
+                    )
+                else:
+                    complete_weekly_execution(status="expired", execution_date=exec_date)
                 self._weekly_signal_terminal = True
                 self._buy_session_add_reason("weekly_signal_expired")
                 self._emit_buy_session_summary(allocation, holdings=holdings)
@@ -6594,6 +6605,7 @@ if __name__ == "__main__":
         env_deferred = str(os.getenv("WEEKLY_TRADER_DEFERRED_RESUME", "")).strip().lower() in (
             "1", "true", "yes",
         )
+        _is_dry_run = bool(args.dry_run)
         today_str = datetime.now(KST).strftime("%Y%m%d")
         max_td = int(get_weekly_trader_params().get("weekly_signal_max_trading_days", 2))
         if pending_state and is_weekly_signal_expired(
@@ -6604,8 +6616,16 @@ if __name__ == "__main__":
                 pending_state.get("signal_date"),
                 today_str,
             )
-            complete_weekly_execution(status="expired", execution_date=today_str)
-            pending_state = None
+            if _is_dry_run:
+                logger.info(
+                    "[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED] signal_date=%s execution_date=%s "
+                    "state_status=pending reason=expired_dry_run",
+                    pending_state.get("signal_date"),
+                    today_str,
+                )
+            else:
+                complete_weekly_execution(status="expired", execution_date=today_str)
+                pending_state = None
         elif pending_state:
             latest_sig = parse_gpt_trades_signal_date(find_latest_gpt_trades_file(market))
             if (
@@ -6617,8 +6637,16 @@ if __name__ == "__main__":
                     pending_state.get("signal_date"),
                     today_str,
                 )
-                complete_weekly_execution(status="expired", execution_date=today_str)
-                pending_state = None
+                if _is_dry_run:
+                    logger.info(
+                        "[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED] signal_date=%s execution_date=%s "
+                        "state_status=pending reason=expired_dry_run",
+                        pending_state.get("signal_date"),
+                        today_str,
+                    )
+                else:
+                    complete_weekly_execution(status="expired", execution_date=today_str)
+                    pending_state = None
 
         explicit_resume = bool(args.deferred_weekly or env_deferred)
         if explicit_resume and not pending_state:
@@ -6774,10 +6802,18 @@ if __name__ == "__main__":
         trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
 
         if trader._deferred_weekly and not trader._weekly_signal_terminal:
-            complete_weekly_execution(
-                status="executed",
-                execution_date=datetime.now(KST).strftime("%Y%m%d"),
-            )
+            if trader._dry_run:
+                logger.info(
+                    "[WEEKLY_SIGNAL_DRY_RUN_NOT_CONSUMED] signal_date=%s execution_date=%s "
+                    "state_status=pending reason=dry_run",
+                    trader._weekly_signal_date,
+                    datetime.now(KST).strftime("%Y%m%d"),
+                )
+            else:
+                complete_weekly_execution(
+                    status="executed",
+                    execution_date=datetime.now(KST).strftime("%Y%m%d"),
+                )
 
         # 종료 시점 간단 상태 로그(참고용)
         if trader.kis_order_api_enabled:
