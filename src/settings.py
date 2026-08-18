@@ -100,12 +100,28 @@ class Settings:
         tp.setdefault("allow_rebuy", True)  # Phase 1: False → True
         tp.setdefault("max_positions", self.risk_params.get("max_positions", 4))
         tp.setdefault("max_legs_per_ticker", 1)
+        # rebuy 블록이 있을 때만 내부 기본값 채움 (없으면 레거시 allow_rebuy 유지)
+        if isinstance(tp.get("rebuy"), dict):
+            rb = tp["rebuy"]
+            rb.setdefault("enabled", True)
+            rb.setdefault("require_new_signal", True)
+            rb.setdefault("require_gpt_buy", True)
+            rb.setdefault("cooldown_trading_days", 5)
+            rb.setdefault("max_rebuy_count_per_ticker", 1)
+            rb.setdefault("min_recovery_pct", 0.03)
+            rb.setdefault("after_stop_loss", True)
+            rb.setdefault("after_take_profit", True)
+            rb.setdefault("after_rotation", True)
+            rb.setdefault("after_emergency_drop", False)
+            rb.setdefault("emergency_drop_cooldown_trading_days", 10)
         tp.setdefault("per_ticker_max_weight", 0.20)  # Phase 1: 1.0 → 0.20
         tp.setdefault("min_order_cash", 0)            # 금액 기준 최소 주문
         tp.setdefault("rebuy_atr_k", 0.0)
         tp.setdefault("rebuy_rsi_ceiling", 100.0)
         tp.setdefault("min_cash_reserve", 0)
         tp.setdefault("cash_buffer_ratio", 0.0)       # 가용 현금 버퍼
+        tp.setdefault("max_deferred_entry_gap_pct", 0.03)
+        tp.setdefault("weekly_signal_max_trading_days", 2)
 
         # 분할 매수 설정 (P1 대응)
         split = tp.setdefault("split_buy", {})

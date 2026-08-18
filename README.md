@@ -22,6 +22,7 @@
    - [4.1 회전 매매 (Rotation)](#41-회전-매매-rotation)
    - [4.2 자산 배분 (Asset Allocation)](#42-자산-배분-asset-allocation)
    - [4.3 거래 환경 (trading_environment)](#43-거래-환경-trading_environment)
+   - [4.4 조건부 Rebuy](#44-조건부-rebuy)
 5. [기술 스택](#5-기술-스택)
 6. [파이프라인 사전 준비](#6-파이프라인-사전-준비)
 7. [설치 및 실행](#7-설치-및-실행)
@@ -48,7 +49,7 @@
 | 사후 처리 | SQLite 기록, 주문 정합성, **일별 성능 리뷰**, 월간 GPT 회고·산출물 정리 |
 
 - **운용 시장:** KOSPI (`MARKET=KOSPI`, `screener_params.portfolio.rebalance_frequency: weekly`)
-- **주간 스케줄:** 금요일 15:45 스크리너 → 월요일 09:30 매매 파이프라인
+- **주간 스케줄:** 금요일 15:45 스크리너 → 월요일 09:30 매매 파이프라인 (월요 휴장 시 GPT signal 이월 후 다음 거래일 재검증)
 - **실행 환경:** Docker Compose (`integrated_manager` + `background_risk_manager`)
 - **설정:** `config/config.json`(전략·스케줄) + `config/.env`(비밀값, Git 제외)
 - **모듈 연동:** `output/` 아래 JSON·DB 파일 파이프라인
@@ -76,7 +77,9 @@
 - **KIS API 속도 제한** — `config.kis_limits` 환경별 RPS·동시성·EGW00201 백오프(`kis_rate_limit.py`). 스크리너 워커 자동 축소·시세/OHLCV 캐시
 - **주문 정합성** — `order_reconciler.py`로 DB pending/partial ↔ KIS 체결 동기화 + orphan `order_id` backfill. KIS 주문조회 miss 시 **계좌 잔고 holding fallback**(`[RECONCILE_BY_HOLDING]`). 체결가 `pchs_avg_pric` 반영 시 `amount` 동기화·`structured_context`에 `original_order_price` 보존. 이미 `executed` 행은 idempotent skip
 - **거래 기록 분류** — `paper_executed`(order_id 없음) = `paper_db_only` 테스트 기록 vs `kis_paper` 실주문(`order_id` 있는 `executed`). `[TRADE_RECORD_CLASSIFY]` 로그. 일일 요약 BUY 집계에서 `paper_db_only` 제외
-- **매수 관측성** — `[STOCK_BUDGET_USAGE]`(예산·GPT 후보·실행 금액·미사용 사유), `[REBUY_GUARD]`(보유 종목 재매수 차단), `[BUY_SELECTION_SUMMARY]`(blocked_rebuy 포함)
+- **조건부 Rebuy** — 보유 중 추가매수는 금지(`max_legs_per_ticker=1`). 전량 청산 후에만 신규 GPT BUY + 거래일 cooldown + 매도사유·가격 회복 조건을 통과하면 **최대 1회** 재진입. `rebuy` 설정이 없으면 레거시 `allow_rebuy` 유지
+- **주간 신호 이월** — 월요 휴장 시 `gpt_trades`를 버리지 않고 `weekly_trader_state.json`에 defer. 다음 거래일에 gap/리스크/Rebuy 조건을 재검증 후 주문 (`weekly_signal_max_trading_days`, 기본 2거래일 초과 시 expire)
+- **매수 관측성** — `[STOCK_BUDGET_USAGE]`, `[BUY_ENTRY_CLASSIFY]`, `[REBUY_EVALUATION]`/`[REBUY_APPROVED]`/`[REBUY_SKIP_*]`, `[BUY_SELECTION_SUMMARY]`(blocked_rebuy 포함)
 - **연속 손실 집계** — `is_countable_loss_sell()` / `count_consecutive_losses()`로 **체결 확정·order_id 있는 손실만** 카운트 (`stop_trading_on_consecutive_losses`, 기본 3회). pending/failed·중복 SELL row 제외
 - **중복 SELL 방지** — `risk_manager` direct_execute 후 `trader.run_sell_logic`이 동일 종목을 재매도·재기록하지 않도록 pending 주문 skip + `order_id` 없는 SELL 중복 INSERT 차단
 - **매수 오기록 방지** — `trader._check_delayed_execution`은 **ODNO·매수/매도 구분** 필수. `split_buy.enabled=false` 시 분할 분기 미진입. `order_id` 없는 체결 BUY/SELL은 `recorder`에서 INSERT 차단
@@ -128,13 +131,15 @@
 | 09:00 | 평일 | 장시작 잔액 스냅샷 | `capture_balance_snapshot("open")` |
 | **15:45** | **금요** | **스크리너** | `screener.py` → 후보·`target_weight` 산출 |
 | **09:30** | **월요** | **주간 매매 파이프라인** | `health_check` → `news` → `gpt` → `trader` → `performance_review` |
+| **09:30** | **화~금** | **이월 trader (있을 때만)** | `run_deferred_weekly_trader_if_needed` → `trader.py --deferred-weekly` |
 | 11:00 · 14:00 | 평일 | 장중 경량 리컨실 | `order_reconciler` |
 | 15:20 | 평일 | 일괄 체결 확인 | `trader.py --batch-check-only` |
 | 15:22 | 평일 | 주문 정합성 | `order_reconciler.py` |
 | 15:30 | 평일 | 장종료 잔액 스냅샷 | `capture_balance_snapshot("close")` |
 | 15:35 | 평일 | 일일 요약 | Discord (`daily_summary.summary_send_time` 변경 가능) |
 
-- 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day`)
+- 휴장일: 스크리너·정규 파이프라인은 스킵 (`is_krx_trading_day` / `is_market_open_day`). **주간 GPT BUY는 defer** — 다음 거래일 09:30에 `trader.py --deferred-weekly`로 1회 재개 ([4.4](#44-조건부-rebuy) 재검증 포함)
+- 화~금 09:30: 정규 리밸런스 요일이 아니면 `run_deferred_weekly_trader_if_needed`만 실행
 - `intraday_trading_enabled: false` 시 주간 모드에서 **화~목 일간 파이프라인·09:10 스크리너는 비활성**
 - **월간 유지보수:** 매월 1일 — `reviewer.py` → `cleanup_output.py` (기본 16:00)
 
@@ -180,7 +185,7 @@ screener.py                            health_check.py
   → market_state_*.json                        ├─ target_weight 사이징
          └──────────────────────────────────────┤
                                                 ├─ [asset_allocation] stock_buy_budget
-                                                ├─ 주식 매수 (REBUY / 신규 / 리밸런스)
+                                                ├─ 주식 매수 (NORMAL_BUY / 조건부 REBUY / 리밸런스)
                                                 ├─ [POST_STOCK] 459580 매수 (enabled 시)
                                                 ├─ recorder → trading_data.db
                                                 └─ performance_review.py (성공 시 자동)
@@ -403,7 +408,7 @@ screener timeout 후 `screener_candidates_*.json`이 있으면 `news`부터 `--u
 
 | 파일 | 내용 |
 |------|------|
-| `performance_review_YYYYMMDD_MARKET.json` | `summary`, `screener_funnel`, `gpt_decision`, `budget_usage`, `execution_performance`, `system_performance`, `warnings` |
+| `performance_review_YYYYMMDD_MARKET.json` | `summary`, `screener_funnel`, `gpt_decision`, `budget_usage`, `execution_performance`, `rebuy_performance`, `system_performance`, `warnings` |
 | `performance_review_YYYYMMDD_MARKET.csv` | 종목 단위 행 |
 | `performance_review_YYYYMMDD_MARKET.md` | Markdown 리포트 |
 | `candidate_tracking_YYYYMMDD_MARKET.json` | 후보·GPT·체결 스냅샷 (1D/3D/5D/10D 수익률 추적용) |
@@ -419,6 +424,8 @@ screener timeout 후 `screener_candidates_*.json`이 있으면 `news`부터 `--u
 [PERF_TRACKING_SNAPSHOT]— candidate_tracking 저장
 [PERF_LOG_GROUP_*]      — daily_pipeline / latest_execution 로그 묶음 탐지
 ```
+
+Markdown에 **`## Rebuy Performance`** 섹션이 포함됩니다 (Candidates / Approved / Skipped Cooldown·Recovery / Executed, NORMAL BUY vs REBUY 평균 수익률).
 
 **System Performance (Markdown) 구조:**
 
@@ -454,6 +461,7 @@ ls -lh output/performance_review_20260625_KOSPI.*
 | `trading_data.db` | `recorder.py` (SQLite `trade_records`, `positions`) |
 | `debug/db_record_debug.log` | `db_debug.py` (`DB_RECORD_DEBUG=1` 시) |
 | `pipeline_state.json`, `monthly_maintenance_state.json` | `integrated_manager.py` |
+| `weekly_trader_state.json` | `weekly_signal.py` (주간 GPT signal 이월 상태) |
 | `performance_review_*`, `candidate_tracking_*` | `performance_review.py` (일별 전략·시스템 성능 리포트) |
 | `cache/kis_token.json`, `cache/kis_token.lock` | KIS OAuth 토큰·발급 락 |
 | `cache/` (`.mst`, `.pkl` 등) | KIS·스크리너 |
@@ -537,7 +545,9 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `health_check.py` | KIS 헬스체크 — `chk-server` + 삼성전자 시세, `EGW00121`/`EGW00123` 자동 재인증 |
 | `news_collector.py` | 네이버 뉴스 수집 |
 | `gpt_analyzer.py` | GPT/휴리스틱 2단계 분석 → `gpt_trades_*.json` (`매수`/`보류`/`미진입`), 리밸런싱 GPT 헬퍼, 예산 가드 |
-| `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`asset_allocation` 주문 가드·459580 매수·`[STOCK_BUDGET_USAGE]`·`[REBUY_GUARD]`·`--batch-check-only`·`--sell-only` |
+| `weekly_signal.py` | 주간 GPT signal 이월·만료·갭 스킵 (`weekly_trader_state.json`) |
+| `rebuy_policy.py` | 조건부 Rebuy 판정 (쿨다운·신규 신호·매도사유·recovery·횟수 제한) |
+| `trader.py` | 매수/매도·체결·분할매수·지연체결(ODNO·side 가드)·연속 손실 체크·pending SELL skip·`asset_allocation` 주문 가드·459580 매수·조건부 Rebuy·`[STOCK_BUDGET_USAGE]`·`--batch-check-only`·`--sell-only`·`--deferred-weekly`·`--dry-run` |
 
 ### 기록·정합성·분석
 
@@ -547,7 +557,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 | `order_reconciler.py` | KIS 주문 ↔ DB 상태 정합성 + holding fallback + `amount`/`structured_context` 동기화 + orphan `order_id` backfill |
 | `kis_rate_limit.py` | 환경별 `kis_limits` RPS·동시성·EGW00201 백오프·인메모리 캐시 |
 | `reviewer.py` | 월간 GPT 회고: 승패·매도사유·포트폴리오·gpt_trades 대조 → config 튜닝 |
-| `performance_review.py` | **일별** 스크리너 퍼널·GPT 판단·예산·체결·시스템 성능 리포트 (JSON/CSV/MD) + `candidate_tracking` |
+| `performance_review.py` | **일별** 스크리너 퍼널·GPT 판단·예산·체결·**Rebuy**·시스템 성능 리포트 (JSON/CSV/MD) + `candidate_tracking` |
 | `rotation_policy.py` | 회전 매매 공통 정책(최소 보유일·Δscore·비용·1:1 페어·상한) |
 | `rotation_manager.py` | 현금 부족 시 회전 시도·시장 동적 임계값·실행 |
 | `trader.py` | 슬롯 꽉 참 시 리밸런싱·`run_buy_logic` 회전 한도 관리 |
@@ -560,7 +570,7 @@ REVIEWER_DRY_RUN=1 REVIEWER_ALLOW_PARTIAL=1 docker compose exec integrated_manag
 |------|------|
 | `settings.py` | `config.json` 로드·기본값 |
 | `env_loader.py` | `config/.env` 로드 |
-| `utils.py` | KST, 캐시, `extract_kis_official_summary`, `load_summary_rlz_dict`, 개장일 등 |
+| `utils.py` | KST, 캐시, `extract_kis_official_summary`, `load_summary_rlz_dict`, `is_krx_trading_day` / `count_krx_trading_days_between` 등 |
 | `notifier.py` | Discord 웹훅 |
 | `strategies.py` | 매도 전략 클래스 |
 | `db_debug.py` | DB 디버그 로그 (`DB_RECORD_DEBUG=1`) |
@@ -769,8 +779,84 @@ id=87  ticker=459580 status=executed     order_id=... classification=kis_paper_o
 ```
 [STOCK_BUDGET_USAGE] total_assets=... stock_buy_budget=... gpt_buy_count=... final_buy_count=...
   executed_order_amount=... unused_stock_budget=... unused_reason=insufficient_gpt_buy_candidates_and_per_ticker_weight_limit
-[REBUY_GUARD] ticker=004170 ... decision=skip reason=rebuy_disabled
+[BUY_ENTRY_CLASSIFY] ticker=004170 entry_type=EXISTING_POSITION
+[REBUY_SKIP_CURRENT_HOLDING] ticker=004170
 [BUY_SELECTION_SUMMARY] candidates=... gpt_buy=... blocked_rebuy=... final_buy=... reason=...
+```
+
+### 4.4 조건부 Rebuy
+
+`allow_rebuy=true` + `trading_params.rebuy` 블록이 있으면, Rebuy는 **보유 중 추가매수가 아니라 전량 청산 후 새 포지션 1회 재진입**입니다.  
+`max_legs_per_ticker=1`은 유지합니다. `rebuy` 블록이 없으면 레거시 `allow_rebuy`(보유 중 ATR/RSI 추가매수)를 유지합니다.
+
+```text
+보유 중 추가매수 금지
+        ↓
+전량 매도 완료 (pending/partial SELL 없음)
+        ↓
+Cooldown (KRX 거래일)
+        ↓
+새로운 주간 GPT BUY (signal_date > last_sell_date)
+        ↓
+이전 매도사유 검증
+        ↓
+가격/리스크 재검증 (StopLoss 시 recovery)
+        ↓
+조건 충족 시 최대 1회 Rebuy
+```
+
+| BUY 분류 | 의미 |
+|----------|------|
+| `NORMAL_BUY` | 해당 ticker 매수 이력 없음 |
+| `EXISTING_POSITION` | 계좌 또는 ledger 보유 중 → 추가매수 금지 |
+| `REBUY` | 과거 BUY→SELL 완결 후 재진입 후보 |
+
+**매도 사유별 정책**
+
+| 이전 SELL | Rebuy | cooldown | recovery |
+|-----------|:-----:|----------|----------|
+| Fixed StopLoss (`고정 손절`, `StopLoss`) | 허용 | 5 거래일 | `min_recovery_pct` (기본 3%) |
+| TakeProfit | 허용 | 없음 | 없음 |
+| Rotation (`ROTATION_SWAP` 등) | 허용 | 5 거래일 | 없음 |
+| EmergencyDrop | **금지** (`after_emergency_drop=false`) | (허용 시 10 거래일) | — |
+| unknown / reconcile-only | skip | — | — |
+
+`RECONCILED_BY_HOLDING_FALLBACK_SELL` 같은 `reason_code`만으로는 유형을 판단하지 않고, `sell_reason`을 우선합니다.
+
+**설정 예시 (`config/config.json`):**
+
+```json
+"trading_params": {
+  "allow_rebuy": true,
+  "max_legs_per_ticker": 1,
+  "rebuy": {
+    "enabled": true,
+    "require_new_signal": true,
+    "require_gpt_buy": true,
+    "cooldown_trading_days": 5,
+    "max_rebuy_count_per_ticker": 1,
+    "min_recovery_pct": 0.03,
+    "after_stop_loss": true,
+    "after_take_profit": true,
+    "after_rotation": true,
+    "after_emergency_drop": false,
+    "emergency_drop_cooldown_trading_days": 10
+  }
+}
+```
+
+Rebuy도 일반 BUY와 동일하게 stock budget · 현금 · `max_positions` · `per_ticker_max_weight` · pending · 계좌 보유 검사를 통과해야 합니다. 459580은 Rebuy 대상이 아닙니다.
+
+**주간 신호 이월과 함께:** deferred BUY는 gap-up(`max_deferred_entry_gap_pct`)·리스크·allocation을 먼저 재검증한 뒤, Rebuy 후보면 cooldown/signal/recovery를 **다시** 확인합니다. Rebuy라고 이월 검증을 건너뛰지 않습니다.
+
+**주요 로그:** `[BUY_ENTRY_CLASSIFY]` · `[REBUY_EVALUATION]` · `[REBUY_NEW_SIGNAL_CHECK]` · `[REBUY_COUNT]` · `[REBUY_SKIP_*]` · `[REBUY_APPROVED]` · `[REBUY_ORDER_SUBMITTED]`
+
+```bash
+# 주문 없이 Rebuy eligibility만 검증
+docker compose exec integrated_manager python /app/src/trader.py --dry-run
+
+# 판정 엔진 단위 테스트 (DB 수정 없음)
+docker compose exec integrated_manager python /app/src/rebuy_policy.py
 ```
 
 ---
@@ -959,6 +1045,14 @@ docker compose exec integrated_manager python -u /app/src/news_collector.py
 docker compose exec integrated_manager python -u /app/src/gpt_analyzer.py --market KOSPI --slots 3
 docker compose exec integrated_manager python -u /app/src/trader.py
 
+# Rebuy eligibility dry-run (주문·매도 없음)
+docker compose exec integrated_manager python -u /app/src/trader.py --dry-run
+
+# 이월된 주간 GPT signal 재실행 (보통 스케줄이 호출)
+docker compose exec integrated_manager python -u /app/src/trader.py --deferred-weekly
+docker compose exec integrated_manager python /app/src/rebuy_policy.py
+docker compose exec integrated_manager python /app/src/weekly_signal.py
+
 # 체결 확인·리컨실 (pending/partial 갱신 + orphan order_id backfill)
 docker compose exec integrated_manager python -u /app/src/trader.py --batch-check-only
 
@@ -999,7 +1093,7 @@ docker compose exec integrated_manager python -u /app/src/order_reconciler.py --
 
 # 리컨실·분류·예산 로그 확인
 docker compose exec integrated_manager python -u /app/src/trader.py 2>&1 | tee output/trader_run.log
-grep -E 'STOCK_BUDGET_USAGE|REBUY_GUARD|BUY_SELECTION_SUMMARY|TRADE_RECORD_CLASSIFY|RECONCILE_BY_HOLDING' output/trader_run.log
+grep -E 'STOCK_BUDGET_USAGE|BUY_ENTRY_CLASSIFY|REBUY_|BUY_SELECTION_SUMMARY|TRADE_RECORD_CLASSIFY|RECONCILE_BY_HOLDING|WEEKLY_SIGNAL_' output/trader_run.log
 
 docker compose exec integrated_manager python -u /app/src/order_reconciler.py --since-hours 36 --limit 800
 
@@ -1089,7 +1183,7 @@ python run_integrated_manager.py --once
 env=kis_paper, kis_order_api_enabled=True
 [ASSET_ALLOCATION] … stock_buy_budget: … initial_bond_buy_budget: …
 [STOCK_BUDGET_USAGE] … unused_reason=…
-[REBUY_GUARD] ticker=… decision=skip reason=rebuy_disabled
+[BUY_ENTRY_CLASSIFY] ticker=… entry_type=NORMAL_BUY|REBUY|EXISTING_POSITION
 [BUY_SELECTION_SUMMARY] … blocked_rebuy=… final_buy=…
 [ASSET_ALLOCATION_POST_STOCK_ORDER] … post_stock_cash … final_bond_buy_budget …
 ```
@@ -1119,6 +1213,7 @@ kospistock/
 │   └── kis_devlp.yaml           # 로컬 KIS 기본값 (Git 제외, 선택)
 ├── output/
 │   ├── .gitkeep                 # 런타임 산출물 루트 (Git 제외)
+│   ├── weekly_trader_state.json # 주간 GPT signal 이월 상태 (런타임)
 │   ├── performance_review_*     # 일별 성능 리포트 (json/csv/md, 런타임)
 │   ├── candidate_tracking_*     # 후보 사후 추적 스냅샷 (런타임)
 │   ├── summary_rlz_*.json       # KIS 실현손익 스냅샷 (account.py, 런타임)
@@ -1137,6 +1232,8 @@ kospistock/
 │   ├── screener.py / screener_core.py / kis_master.py
 │   ├── health_check.py / news_collector.py / gpt_analyzer.py / trader.py
 │   ├── performance_review.py      # 일별 전략·시스템 성능 리포트
+│   ├── weekly_signal.py           # 주간 GPT signal 이월
+│   ├── rebuy_policy.py            # 조건부 Rebuy 판정
 │   ├── recorder.py / order_reconciler.py / reviewer.py
 │   ├── rotation_policy.py / rotation_manager.py
 │   ├── account.py / strategies.py

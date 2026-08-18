@@ -27,6 +27,7 @@ from collections import defaultdict
 import uuid
 import re
 import pandas as pd
+from pathlib import Path
 
 # ── 공통 유틸리티 / 설정 ──────────────────────────────────────────────
 from utils import (
@@ -43,6 +44,7 @@ from utils import (
     check_min_holding_period,        # Phase 1: 최소 보유기간 체크 통합 함수
     check_min_holding_hours,         # Phase 1: 최소 보유시간 체크 (당일 매도 방지)
     extract_broker_order_id,
+    is_krx_trading_day,
 )
 from api.kis_auth import KIS
 from risk_manager import RiskManager
@@ -94,6 +96,26 @@ from gpt_analyzer import (
     parse_gpt_rebalance_decisions,
     get_gpt_enhanced_rebalance_candidates,
     fallback_rebalance_logic
+)
+
+from weekly_signal import (
+    complete_weekly_execution,
+    get_weekly_trader_params,
+    handle_trader_trading_day_gate,
+    is_weekly_rebalance_mode,
+    is_weekly_signal_expired,
+    pending_weekly_execution,
+    should_skip_gap_up,
+    parse_gpt_trades_signal_date,
+)
+from rebuy_policy import (
+    ENTRY_EXISTING,
+    ENTRY_NORMAL,
+    load_rebuy_config,
+    evaluate_rebuy,
+    log_rebuy_evaluation,
+    log_rebuy_order_submitted,
+    trade_record_to_row,
 )
 
 from screener_core import _compute_levels
@@ -264,6 +286,11 @@ class Trader:
 
         # REBUY 파라미터
         self.allow_rebuy = bool(self.trading_params.get("allow_rebuy", False))
+        self.rebuy_cfg = load_rebuy_config(self.trading_params)
+        self._use_conditional_rebuy = bool(self.rebuy_cfg.policy_enabled)
+        self._dry_run = False
+        self._current_buy_entry_meta: Dict[str, Any] = {}
+        self._buy_signal_date: Optional[str] = None
         self.max_positions = int(self.trading_params.get("max_positions", self.risk_params.get("max_positions", 5)))
         self.max_legs_per_ticker = int(self.trading_params.get("max_legs_per_ticker", 1))
         self.per_ticker_max_weight = float(self.trading_params.get("per_ticker_max_weight", 1.0))
@@ -272,6 +299,14 @@ class Trader:
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
         self.cash_buffer_ratio = float(self.trading_params.get("cash_buffer_ratio", 0.0))
+        logger.info(
+            "[REBUY_POLICY] allow_rebuy=%s policy_enabled=%s cooldown_td=%s max_rebuy=%s min_recovery=%.3f",
+            self.allow_rebuy,
+            self._use_conditional_rebuy,
+            self.rebuy_cfg.cooldown_trading_days,
+            self.rebuy_cfg.max_rebuy_count_per_ticker,
+            self.rebuy_cfg.min_recovery_pct,
+        )
 
         # ⬇️ 신규 주입 파라미터
         self.fee_buffer_pct = float(self.trading_params.get("fee_buffer_pct", 0.0))
@@ -340,6 +375,12 @@ class Trader:
 
         # 런타임 ID
         self.run_id = os.getenv("RUN_ID") or (datetime.now(KST).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
+
+        # 주간 signal 이월 재실행 (기본: 비활성, CLI/env에서 설정)
+        self._deferred_weekly = False
+        self._forced_gpt_file: Optional[str] = None
+        self._weekly_signal_date: Optional[str] = None
+        self._weekly_signal_terminal = False  # expired/executed 처리 완료
 
         # 알림 레이트 리밋
         notif_cfg = self.settings.get("notifications", {}) or {}
@@ -651,6 +692,12 @@ class Trader:
 
     # ── account.py 트리거 ────────────────────────────────────────────
     def _update_account_info(self, force: bool = False):
+        if not is_krx_trading_day():
+            logger.info(
+                "[TRADER_NON_TRADING_DAY] date=%s action=skip_account_api next_trading_day=true",
+                datetime.now(KST).strftime("%Y%m%d"),
+            )
+            return
         now = time.time()
         # 회전 핵심 지점에서는 force=True로 강제 갱신 허용
         # 성능 최적화: 기본 간격을 30초로 늘림 (기존 20초)
@@ -788,6 +835,84 @@ class Trader:
             return False, f"RSI 상한 초과({rsi:.1f}>{self.rebuy_rsi_ceiling})"
 
         return True, "OK"
+
+    def _account_qty_for_ticker(self, holdings: List[Dict], ticker: str) -> int:
+        t = str(ticker).zfill(6)
+        total = 0
+        for h in holdings or []:
+            if str(h.get("pdno", "")).zfill(6) == t:
+                total += _to_int(h.get("hldg_qty", 0))
+        return int(total)
+
+    def _ticker_trade_rows(self, ticker: str) -> List[Dict[str, Any]]:
+        t = str(ticker).zfill(6)
+        rows: List[Dict[str, Any]] = []
+        try:
+            rec = get_recorder()
+            for tr in rec.get_trade_records(ticker=t) or []:
+                rows.append(trade_record_to_row(tr))
+        except Exception as e:
+            logger.debug("rebuy trade_records 조회 실패 ticker=%s err=%s", t, e)
+        try:
+            rec = get_recorder()
+            for row in rec.get_open_orders(limit=800) or []:
+                if str(row.get("ticker") or "").zfill(6) != t:
+                    continue
+                rows.append(trade_record_to_row(row))
+        except Exception as e:
+            logger.debug("rebuy open_orders 조회 실패 ticker=%s err=%s", t, e)
+        return rows
+
+    def _current_price_for_rebuy(self, ticker: str, info: Dict[str, Any]) -> float:
+        px = _to_float(info.get("Price"), 0.0)
+        if px <= 0:
+            px = _to_float((self.all_stock_data.get(ticker) or {}).get("Price"), 0.0)
+        return float(px or 0.0)
+
+    def _evaluate_rebuy_for_plan(
+        self,
+        plan: Dict[str, Any],
+        holdings: List[Dict],
+        *,
+        signal_date: Optional[str],
+        as_of=None,
+    ):
+        info = plan.get("stock_info", {}) or {}
+        ticker = str(info.get("Ticker", "")).zfill(6)
+        decision = str(plan.get("결정") or plan.get("decision") or "BUY")
+        bond = is_bond_etf(ticker, self.settings)
+        return evaluate_rebuy(
+            ticker=ticker,
+            cfg=self.rebuy_cfg,
+            account_qty=self._account_qty_for_ticker(holdings, ticker),
+            trades=self._ticker_trade_rows(ticker),
+            signal_date=signal_date,
+            gpt_decision=decision,
+            current_price=self._current_price_for_rebuy(ticker, info),
+            as_of=as_of,
+            is_bond_etf=bond,
+            include_paper_executed=True,
+        )
+
+    def _apply_buy_entry_meta(self, plan: Dict[str, Any], batch_name: str, ticker: str) -> None:
+        entry_type = str(plan.get("_entry_type") or "").strip().lower()
+        if not entry_type:
+            entry_type = "rebuy" if str(batch_name).upper() == "REBUY" else "normal"
+        reason_code = str(plan.get("_rebuy_reason_code") or "")
+        self._current_buy_entry_meta = {
+            "entry_type": entry_type,
+            "reason_code": reason_code,
+        }
+
+    def _log_rebuy_order_if_needed(self, ticker: str, batch_name: str) -> None:
+        meta = getattr(self, "_current_buy_entry_meta", None) or {}
+        if str(meta.get("entry_type") or "").lower() == "rebuy":
+            log_rebuy_order_submitted(
+                ticker,
+                logger,
+                batch=batch_name,
+                reason_code=meta.get("reason_code") or "REBUY",
+            )
 
     # ── 계좌 파일에서 가용 현금/보유 종목 로드 ─────────────────────────
     def get_account_info_from_files(self) -> Tuple[int, List[Dict], Dict[str, int]]:
@@ -1606,6 +1731,19 @@ class Trader:
             "executed_qty": exe,
         }
         payload.update(extra)
+        meta = getattr(self, "_current_buy_entry_meta", None) or {}
+        if str(side).lower() in ("buy", "매수") and meta:
+            details = payload.get("strategy_details")
+            if not isinstance(details, dict):
+                details = {}
+            entry_type = meta.get("entry_type")
+            reason_code = meta.get("reason_code")
+            if entry_type:
+                details.setdefault("entry_type", entry_type)
+            if reason_code:
+                details.setdefault("reason_code", reason_code)
+                payload.setdefault("reason_code", reason_code)
+            payload["strategy_details"] = details
         return payload
 
     def _finalize_buy_result(self, *,
@@ -4658,6 +4796,155 @@ class Trader:
                 "[BUY_SELECTION_SUMMARY] candidates=0 gpt_buy=0 final_buy=0 reason=no_gpt_trades_file"
             )
 
+    def _resolve_gpt_trades_file(self) -> Optional[Path]:
+        if self._forced_gpt_file:
+            p = Path(self._forced_gpt_file)
+            if p.exists():
+                return p
+            logger.warning("지정 gpt_file 없음 → latest 탐색: %s", self._forced_gpt_file)
+        found = find_latest_file("gpt_trades_*.json")
+        return Path(found) if found else None
+
+    def _pending_buy_tickers(self) -> Dict[str, int]:
+        pending: Dict[str, int] = {}
+        try:
+            rec = get_recorder()
+            for row in rec.get_open_orders(limit=800) or []:
+                action = str(row.get("action") or "").upper()
+                if action not in ("BUY", "매수"):
+                    continue
+                ticker = str(row.get("ticker") or "").zfill(6)
+                if not ticker or ticker == "000000":
+                    continue
+                qty = _to_int(row.get("quantity") or row.get("requested_qty") or 0)
+                pending[ticker] = pending.get(ticker, 0) + max(qty, 0)
+        except Exception as e:
+            logger.debug("pending 주문 조회 실패: %s", e)
+        return pending
+
+    def _revalidate_deferred_buy_plans(
+        self,
+        buy_plans: List[Dict],
+        holdings: List[Dict],
+        available_cash: int,
+        allocation: AllocationResult,
+    ) -> List[Dict]:
+        """이월된 weekly BUY를 현재가/리스크 기준으로 재검증. 통과한 plan만 반환."""
+        params = get_weekly_trader_params(self.settings)
+        max_gap = float(params.get("max_deferred_entry_gap_pct", 0.03))
+        holding_qty = {
+            str(h.get("pdno", "")).zfill(6): _to_int(h.get("hldg_qty", 0))
+            for h in (holdings or [])
+            if _to_int(h.get("hldg_qty", 0)) > 0
+        }
+        snap = self._portfolio_snapshot(holdings or [])
+        pv = float(snap.get("portfolio_value") or 0.0)
+        pending_map = self._pending_buy_tickers()
+        daily_ok, daily_msg = self._check_daily_loss_limit()
+        consec_ok, consec_msg = self._check_consecutive_losses()
+        risk_ok = bool(daily_ok and consec_ok)
+        risk_note = "ok" if risk_ok else (daily_msg or consec_msg or "risk_block")
+        stock_w = float(getattr(allocation, "stock_weight", 0.0) or 0.0)
+        can_buy_stock = bool(getattr(allocation, "can_buy_stock", True))
+
+        kept: List[Dict] = []
+        for plan in buy_plans:
+            info = plan.get("stock_info", {}) or {}
+            for k, dv in SCHEMA_DEFAULTS.items():
+                info.setdefault(k, dv)
+            ticker = str(info.get("Ticker", "")).zfill(6)
+            signal_price = _to_float(info.get("Price"), 0.0)
+            current_price = 0
+            price_info = self._get_realtime_price_with_quotes(ticker)
+            if price_info:
+                current_price = _to_int(price_info.get("current_price", 0))
+            if current_price <= 0:
+                current_price = _to_int((self.all_stock_data.get(ticker) or {}).get("Price", 0))
+
+            skip_gap, gap_pct = should_skip_gap_up(signal_price, current_price, max_gap)
+            gap_log = f"{gap_pct:.4f}" if gap_pct is not None else "na"
+            held_qty = int(holding_qty.get(ticker, 0))
+            pending_qty = int(pending_map.get(ticker, 0))
+            tv = float(snap.get("by_ticker_value", {}).get(ticker, 0.0) or 0.0)
+            ticker_weight = (tv / pv) if pv > 0 else 0.0
+            screener_row = self.all_stock_data.get(ticker) or {}
+            current_atr = _to_float(screener_row.get("ATR"), 0.0) or _to_float(info.get("ATR"), 0.0)
+            stop_loss = _to_float(info.get("손절가") or info.get("stop_price"), 0.0)
+
+            if current_price > 0 and (
+                (gap_pct is not None and gap_pct <= 0) or current_price < signal_price
+            ):
+                try:
+                    lv = self._compute_levels_from_entry(ticker, float(current_price))
+                    if lv:
+                        stop_loss = _to_float(lv.get("손절가"), stop_loss)
+                        info["손절가"] = stop_loss
+                        info["stop_price"] = int(stop_loss) if stop_loss else info.get("stop_price")
+                        tgt = _to_float(lv.get("목표가"), 0.0)
+                        if tgt > 0:
+                            info["목표가"] = tgt
+                            info["target_price"] = int(tgt)
+                        info["levels_source"] = lv.get("source") or info.get("levels_source")
+                except Exception as e:
+                    logger.debug("deferred stop 재계산 실패 %s: %s", ticker, e)
+
+            logger.info(
+                "[DEFERRED_BUY_REVALIDATE] ticker=%s signal_price=%s current_price=%s gap_pct=%s "
+                "atr=%s stop_loss=%s holding_qty=%s pending_qty=%s per_ticker_max_weight=%.4f "
+                "ticker_weight=%.4f stock_alloc=%.4f available_cash=%s risk=%s",
+                ticker,
+                int(signal_price) if signal_price else 0,
+                int(current_price) if current_price else 0,
+                gap_log,
+                f"{current_atr:.4f}" if current_atr else "na",
+                int(stop_loss) if stop_loss else 0,
+                held_qty,
+                pending_qty,
+                self.per_ticker_max_weight,
+                ticker_weight,
+                stock_w,
+                int(available_cash),
+                risk_note,
+            )
+
+            if not risk_ok:
+                logger.info("[DEFERRED_BUY_SKIP_RISK] ticker=%s reason=%s", ticker, risk_note)
+                continue
+            if not can_buy_stock:
+                logger.info("[DEFERRED_BUY_SKIP_ALLOC] ticker=%s reason=stock_overweight", ticker)
+                continue
+            if available_cash < max(self.min_order_cash, 0):
+                logger.info("[DEFERRED_BUY_SKIP_CASH] ticker=%s available_cash=%s", ticker, available_cash)
+                continue
+            if current_price <= 0 or signal_price <= 0:
+                logger.info("[DEFERRED_BUY_SKIP_NO_PRICE] ticker=%s signal_price=%s current_price=%s",
+                            ticker, signal_price, current_price)
+                continue
+            if skip_gap:
+                logger.info(
+                    "[DEFERRED_BUY_SKIP_GAP_UP] ticker=%s signal_price=%s current_price=%s gap_pct=%s",
+                    ticker, int(signal_price), int(current_price), gap_log,
+                )
+                continue
+            if held_qty > 0 and (self._use_conditional_rebuy or not self.allow_rebuy):
+                logger.info("[DEFERRED_BUY_SKIP_HOLDING] ticker=%s holding_qty=%s", ticker, held_qty)
+                continue
+            if pending_qty > 0:
+                logger.info("[DEFERRED_BUY_SKIP_PENDING] ticker=%s pending_qty=%s", ticker, pending_qty)
+                continue
+            if pv > 0 and ticker_weight >= self.per_ticker_max_weight:
+                logger.info(
+                    "[DEFERRED_BUY_SKIP_WEIGHT] ticker=%s ticker_weight=%.4f max=%.4f",
+                    ticker, ticker_weight, self.per_ticker_max_weight,
+                )
+                continue
+
+            if current_price > 0:
+                info["Price"] = current_price
+            plan["stock_info"] = info
+            kept.append(plan)
+        return kept
+
     def run_buy_logic(self, available_cash: int, holdings: List[Dict]):
         # [NEW] 매수 로직 활성화 여부 체크
         if not self.trading_params.get("buy_enabled", True):
@@ -4707,13 +4994,14 @@ class Trader:
             return
 
         # 통합된 시간대 체크
-        if not self._check_trading_hours("buy"):
+        if not self._dry_run and not self._check_trading_hours("buy"):
             self._buy_session_add_reason("buy_time_window_closed")
             self._emit_buy_session_summary(allocation, holdings=holdings)
             return
 
         # 기존 미체결 주문 확인 및 취소
-        self._check_and_cancel_pending_orders()
+        if not self._dry_run:
+            self._check_and_cancel_pending_orders()
 
         # 포트폴리오 집중도 체크
         concentration_check = self._check_portfolio_concentration(holdings, available_cash)
@@ -4731,7 +5019,7 @@ class Trader:
             effective_slots = self.max_positions
 
         # GPT 추천 계획 로드
-        trade_plan_file = find_latest_file("gpt_trades_*.json")
+        trade_plan_file = self._resolve_gpt_trades_file()
         buy_plans = []
         trade_plans: List[Dict] = []
         if not trade_plan_file:
@@ -4765,6 +5053,34 @@ class Trader:
                 for k, dv in SCHEMA_DEFAULTS.items():
                     p["stock_info"].setdefault(k, dv)
 
+        if self._deferred_weekly:
+            exec_date = datetime.now(KST).strftime("%Y%m%d")
+            signal_date = self._weekly_signal_date
+            if not signal_date and isinstance(trade_plan_file, Path):
+                from weekly_signal import parse_gpt_trades_signal_date
+                signal_date = parse_gpt_trades_signal_date(trade_plan_file)
+            max_td = int(get_weekly_trader_params(self.settings).get("weekly_signal_max_trading_days", 2))
+            if signal_date and is_weekly_signal_expired(signal_date, exec_date, max_td):
+                logger.info(
+                    "[WEEKLY_SIGNAL_EXPIRED] signal_date=%s execution_date=%s",
+                    signal_date, exec_date,
+                )
+                complete_weekly_execution(status="expired", execution_date=exec_date)
+                self._weekly_signal_terminal = True
+                self._buy_session_add_reason("weekly_signal_expired")
+                self._emit_buy_session_summary(allocation, holdings=holdings)
+                return
+            if buy_plans:
+                buy_plans = self._revalidate_deferred_buy_plans(
+                    buy_plans, holdings, buy_cash, allocation,
+                )
+                self._buy_session["gpt_buy_count"] = len(buy_plans)
+
+        buy_signal_date = self._weekly_signal_date
+        if not buy_signal_date and isinstance(trade_plan_file, Path):
+            buy_signal_date = parse_gpt_trades_signal_date(trade_plan_file)
+        self._buy_signal_date = buy_signal_date
+
         candidates_all = list(self.all_stock_data.values())
         self._log_gpt_trades_and_buy_selection(
             trade_plans, buy_plans, trade_plan_file, buy_cash, candidates_all,
@@ -4779,7 +5095,7 @@ class Trader:
         # 통계 로그(참고용) — 필터에는 min_order_cash를 사용하지 않음
         log_affordability_stats(buy_cash, buffer, candidates_all, min_order_cash=min_order)
 
-        if self.screener_params.get("affordability_filter", False) and not affordable:
+        if (not self._dry_run) and self.screener_params.get("affordability_filter", False) and not affordable:
             # LOW_FUNDS 전에 회전 시도. 단, rotation.enabled=false이면 회전 매매를 절대 실행하지 않음
             if not self._is_rotation_enabled():
                 cheapest = min((_to_int(c.get("Price", 0)) for c in candidates_all), default=0)
@@ -4815,7 +5131,7 @@ class Trader:
             if _to_int(h.get("hldg_qty", 0)) > 0 and not is_bond_etf(str(h.get("pdno", "")), self.settings)
         }
 
-        # 후보 분리: 신규 / 추가매수 (gpt 계획이 있을 경우에만 사용)
+        # 후보 분리: 신규 / 조건부 Rebuy / 레거시 추가매수
         new_targets = []
         rebuy_candidates = []
         if buy_plans:
@@ -4823,6 +5139,36 @@ class Trader:
                 info = plan["stock_info"]
                 ticker = str(info.get("Ticker", "")).zfill(6)
                 name = info.get("Name", "N/A")
+                if is_bond_etf(ticker, self.settings):
+                    logger.info("[BUY_ENTRY_CLASSIFY] ticker=%s entry_type=NORMAL_BUY reason=bond_etf", ticker)
+                    if self._is_in_cooldown(ticker):
+                        logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
+                        continue
+                    plan["_entry_type"] = "normal"
+                    new_targets.append(plan)
+                    continue
+
+                if self._use_conditional_rebuy:
+                    result = self._evaluate_rebuy_for_plan(
+                        plan, holdings, signal_date=getattr(self, "_buy_signal_date", None),
+                    )
+                    log_rebuy_evaluation(result, logger)
+                    if result.entry_type == ENTRY_EXISTING:
+                        self._buy_session["blocked_rebuy"] += 1
+                        continue
+                    if result.entry_type == ENTRY_NORMAL:
+                        if self._is_in_cooldown(ticker):
+                            logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
+                            continue
+                        plan["_entry_type"] = "normal"
+                        new_targets.append(plan)
+                        continue
+                    if not result.eligible:
+                        continue
+                    plan["_entry_type"] = "rebuy"
+                    plan["_rebuy_reason_code"] = result.reason_code
+                    new_targets.append(plan)
+                    continue
 
                 if ticker in holding_tickers:
                     if not self.allow_rebuy:
@@ -4836,6 +5182,7 @@ class Trader:
                             "existing_executed_qty=%s decision=skip reason=rebuy_disabled",
                             ticker, name, existing_qty,
                         )
+                        logger.info("[BUY_ENTRY_CLASSIFY] ticker=%s entry_type=EXISTING_POSITION", ticker)
                         self._buy_session["blocked_rebuy"] += 1
                         continue
                     if self._is_in_cooldown(ticker):
@@ -4846,14 +5193,25 @@ class Trader:
                         logger.info(f"[REBUY-블록] {name}({ticker}) 제외: {why}")
                         continue
                     logger.info(f"[REBUY] {name}({ticker}) 추가매수 후보 등록 ({why})")
+                    logger.info("[BUY_ENTRY_CLASSIFY] ticker=%s entry_type=EXISTING_POSITION", ticker)
+                    plan["_entry_type"] = "rebuy"
                     rebuy_candidates.append(plan)
                 else:
                     if self._is_in_cooldown(ticker):
                         logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
                         continue
+                    logger.info("[BUY_ENTRY_CLASSIFY] ticker=%s entry_type=NORMAL_BUY", ticker)
+                    plan["_entry_type"] = "normal"
                     new_targets.append(plan)
         remaining_cash = buy_cash
         any_order_placed = False
+        if self._dry_run:
+            logger.info(
+                "[REBUY_DRY_RUN] new_targets=%s legacy_rebuy_candidates=%s (주문 미실행)",
+                len(new_targets), len(rebuy_candidates),
+            )
+            self._emit_buy_session_summary(allocation, holdings=holdings)
+            return
         def _execute_buy_batch(plans: List[Dict], batch_name: str):
             nonlocal remaining_cash, any_order_placed, effective_slots
             if not plans:
@@ -4871,6 +5229,7 @@ class Trader:
                 for k, dv in SCHEMA_DEFAULTS.items():  # 안전 디폴트
                     info.setdefault(k, dv)
                 ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
+                self._apply_buy_entry_meta(plan, batch_name, ticker)
                 slots_left = len(plans) - i
 
                 # 중복 주문 방지 체크
@@ -4959,6 +5318,7 @@ class Trader:
                 pre_qty = 0  # 신규/리밸런스에서는 0 기준
                 logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,.0f}원 [{batch_name}]")
                 self._track_buy_order_planned(quantity * order_price)
+                self._log_rebuy_order_if_needed(ticker, batch_name)
 
                 # ① 분할 매수 먼저 시도
                 split_ok, spent_est = self._place_split_buy(name, ticker, quantity, order_price, batch_name)
@@ -5496,6 +5856,7 @@ class Trader:
                 for k, dv in SCHEMA_DEFAULTS.items():
                     info.setdefault(k, dv)
                 ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
+                self._apply_buy_entry_meta(plan, "NEW", ticker)
                 
                 # 개선된 포지션 사이징 로직 (회전 매매용)
                 slots_left = len(round_targets) - i
@@ -5608,6 +5969,7 @@ class Trader:
             
             logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,}원 [라운드{round_num}]")
             self._track_buy_order_planned(quantity * order_price)
+            self._log_rebuy_order_if_needed(ticker, "NEW")
 
             split_cfg = self.trading_params.get("split_buy") or {}
             split_enabled = bool(split_cfg.get("enabled"))
@@ -6211,12 +6573,74 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="자동매매 트레이더")
     parser.add_argument("--batch-check-only", action="store_true", help="15시 20분 일괄 체결 확인만 실행")
     parser.add_argument("--sell-only", action="store_true", help="매도 로직만 실행 (risk_manager fallback용)")
+    parser.add_argument("--deferred-weekly", action="store_true", help="이월된 주간 GPT signal 재실행")
+    parser.add_argument("--gpt-file", default=None, help="사용할 gpt_trades JSON 경로")
+    parser.add_argument("--dry-run", action="store_true", help="주문 없이 BUY/Rebuy eligibility만 검증")
     args = parser.parse_args()
     
     start_ts = time.time()
     try:
+        weekly_mode = is_weekly_rebalance_mode()
+        market = (os.getenv("MARKET") or "KOSPI").upper()
+        skip_defer = bool(args.sell_only or args.batch_check_only)
+        if handle_trader_trading_day_gate(
+            weekly_mode=weekly_mode,
+            market=market,
+            skip_defer=skip_defer,
+        ):
+            sys.exit(0)
+
+        pending_state = pending_weekly_execution()
+        env_deferred = str(os.getenv("WEEKLY_TRADER_DEFERRED_RESUME", "")).strip().lower() in (
+            "1", "true", "yes",
+        )
+        today_str = datetime.now(KST).strftime("%Y%m%d")
+        max_td = int(get_weekly_trader_params().get("weekly_signal_max_trading_days", 2))
+        if pending_state and is_weekly_signal_expired(
+            pending_state.get("signal_date"), today_str, max_td
+        ):
+            logger.info(
+                "[WEEKLY_SIGNAL_EXPIRED] signal_date=%s execution_date=%s",
+                pending_state.get("signal_date"),
+                today_str,
+            )
+            complete_weekly_execution(status="expired", execution_date=today_str)
+            pending_state = None
+        elif pending_state:
+            from weekly_signal import find_latest_gpt_trades_file, parse_gpt_trades_signal_date
+            latest_sig = parse_gpt_trades_signal_date(find_latest_gpt_trades_file(market))
+            if (
+                latest_sig == today_str
+                and str(pending_state.get("signal_date") or "") != today_str
+            ):
+                logger.info(
+                    "[WEEKLY_SIGNAL_EXPIRED] signal_date=%s execution_date=%s reason=new_weekly_signal",
+                    pending_state.get("signal_date"),
+                    today_str,
+                )
+                complete_weekly_execution(status="expired", execution_date=today_str)
+                pending_state = None
+
+        explicit_resume = bool(args.deferred_weekly or env_deferred)
+        if explicit_resume and not pending_state:
+            logger.info(
+                "[WEEKLY_SIGNAL_EXECUTED] skip_duplicate signal_date=- execution_date=%s reason=no_pending",
+                today_str,
+            )
+            sys.exit(0)
+
+        deferred_weekly = bool(pending_state)
+        forced_gpt = args.gpt_file or os.getenv("WEEKLY_TRADER_GPT_FILE") or ""
+        if not forced_gpt and pending_state:
+            forced_gpt = str(pending_state.get("gpt_file") or "")
+
         trader = Trader(settings)
-        
+        trader._deferred_weekly = deferred_weekly and weekly_mode
+        trader._forced_gpt_file = forced_gpt or None
+        trader._dry_run = bool(args.dry_run)
+        if pending_state:
+            trader._weekly_signal_date = str(pending_state.get("signal_date") or "") or None
+
         # 15시 20분 일괄 체결 확인만 실행하는 경우
         if args.batch_check_only:
             logger.info("15시 20분 일괄 체결 확인 모드로 실행")
@@ -6239,6 +6663,13 @@ if __name__ == "__main__":
             trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
             sys.exit(0)
 
+        if trader._deferred_weekly and pending_state:
+            logger.info(
+                "[DEFERRED_WEEKLY_TRADER_RESUME] signal_date=%s execution_date=%s",
+                pending_state.get("signal_date"),
+                datetime.now(KST).strftime("%Y%m%d"),
+            )
+
         # 새로운 실행 시작 시 처리된 주문 목록 초기화
         trader._clear_processed_orders()
 
@@ -6259,9 +6690,14 @@ if __name__ == "__main__":
             trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
             sys.exit(0)
 
+        if trader._dry_run:
+            logger.info("[REBUY_DRY_RUN] eligibility only — skip sell/order execution")
+
         # 매도 로직 실행
         executed_sells = False
-        if holdings0:
+        if trader._dry_run:
+            logger.info("[REBUY_DRY_RUN] skip sell logic")
+        elif holdings0:
             executed_sells = trader.run_sell_logic(holdings0)
         else:
             logger.info("보유 종목이 없어 매도 로직을 건너뜁니다.")
@@ -6337,6 +6773,12 @@ if __name__ == "__main__":
 
         # 최종 요약
         trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
+
+        if trader._deferred_weekly and not trader._weekly_signal_terminal:
+            complete_weekly_execution(
+                status="executed",
+                execution_date=datetime.now(KST).strftime("%Y%m%d"),
+            )
 
         # 종료 시점 간단 상태 로그(참고용)
         if trader.kis_order_api_enabled:

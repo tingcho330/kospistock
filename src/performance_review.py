@@ -2406,6 +2406,194 @@ def _fmt_summary_avg(val: Optional[float]) -> str:
     return f"{float(val) * 100:+.2f}%"
 
 
+_REBUY_EVAL_RE = re.compile(
+    r"\[REBUY_EVALUATION\]\s+ticker=(\S+)\s+eligible=(true|false)\s+reason=(\S+)",
+    re.I,
+)
+_REBUY_APPROVED_RE = re.compile(
+    r"\[REBUY_APPROVED\]\s+ticker=(\S+).*?last_sell_date=(\S+).*?last_sell_reason=(.*?)\s+cooldown_days=",
+    re.I,
+)
+_REBUY_SUBMITTED_RE = re.compile(r"\[REBUY_ORDER_SUBMITTED\]\s+ticker=(\S+)", re.I)
+_REBUY_SKIP_TAG_RE = re.compile(r"\[(REBUY_SKIP_[A-Z0-9_]+)\]")
+
+
+def _parse_rebuy_log_stats(log_text: str) -> Dict[str, Any]:
+    text = log_text or ""
+    evals = []
+    for m in _REBUY_EVAL_RE.finditer(text):
+        evals.append({
+            "ticker": _norm_ticker(m.group(1)),
+            "eligible": str(m.group(2)).lower() == "true",
+            "reason": str(m.group(3) or "").lower(),
+        })
+    approved = []
+    for m in _REBUY_APPROVED_RE.finditer(text):
+        approved.append({
+            "ticker": _norm_ticker(m.group(1)),
+            "last_sell_date": m.group(2),
+            "last_sell_reason": (m.group(3) or "").strip(),
+        })
+    submitted = [_norm_ticker(m.group(1)) for m in _REBUY_SUBMITTED_RE.finditer(text)]
+    skip_counts: Dict[str, int] = defaultdict(int)
+    for m in _REBUY_SKIP_TAG_RE.finditer(text):
+        skip_counts[m.group(1)] += 1
+    return {
+        "candidates": len(evals),
+        "approved": sum(1 for e in evals if e["eligible"]) or len(approved),
+        "skipped_cooldown": skip_counts.get("REBUY_SKIP_COOLDOWN", 0),
+        "skipped_recovery": skip_counts.get("REBUY_SKIP_INSUFFICIENT_RECOVERY", 0),
+        "skipped_old_signal": skip_counts.get("REBUY_SKIP_OLD_SIGNAL", 0),
+        "skipped_emergency": skip_counts.get("REBUY_SKIP_PREVIOUS_EMERGENCY_DROP", 0),
+        "skipped_max_count": skip_counts.get("REBUY_SKIP_MAX_COUNT", 0),
+        "skipped_pending": skip_counts.get("REBUY_SKIP_OPEN_OR_PENDING_POSITION", 0),
+        "executed": len(submitted),
+        "skip_counts": dict(skip_counts),
+        "evals": evals,
+        "approved_rows": approved,
+        "submitted_tickers": submitted,
+    }
+
+
+def _trade_entry_type(row: Dict[str, Any]) -> str:
+    ctx = _parse_structured_context(row.get("structured_context"))
+    et = str(ctx.get("entry_type") or "").strip().lower()
+    if et in ("rebuy", "normal"):
+        return et
+    rc = str(row.get("reason_code") or ctx.get("reason_code") or "")
+    if rc.startswith("REBUY_AFTER") or rc == "REBUY":
+        return "rebuy"
+    return "normal"
+
+
+def _avg_returns(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {}
+    for h in TRACK_DISPLAY_HORIZONS:
+        vals = [r.get(f"return_{h}d") for r in rows if r.get(f"return_{h}d") is not None]
+        vals_f = [float(v) for v in vals if isinstance(v, (int, float))]
+        out[f"{h}d"] = round(sum(vals_f) / len(vals_f), 6) if vals_f else None
+    return out
+
+
+def _build_rebuy_performance(
+    log_text: str,
+    kis_trade_rows: List[Dict[str, Any]],
+    candidate_tracking: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    stats = _parse_rebuy_log_stats(log_text)
+    track_by = {
+        _norm_ticker(r.get("ticker")): r
+        for r in (candidate_tracking or [])
+        if isinstance(r, dict)
+    }
+    buy_rows = [
+        r for r in (kis_trade_rows or [])
+        if str(r.get("action") or "").upper() == "BUY"
+        and str(r.get("order_status") or "").lower() in ("executed", "partial", "completed", "paper_executed")
+    ]
+    rebuy_buys = [r for r in buy_rows if _trade_entry_type(r) == "rebuy"]
+    normal_buys = [r for r in buy_rows if _trade_entry_type(r) != "rebuy"]
+
+    table_rows: List[Dict[str, Any]] = []
+    seen = set()
+    for ticker in stats.get("submitted_tickers") or []:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        tr = track_by.get(ticker) or {}
+        prev = ""
+        for ap in stats.get("approved_rows") or []:
+            if ap.get("ticker") == ticker:
+                prev = ap.get("last_sell_reason") or ""
+                break
+        buy = next((r for r in rebuy_buys if _norm_ticker(r.get("ticker")) == ticker), None)
+        table_rows.append({
+            "ticker": ticker,
+            "previous_exit": prev or tr.get("sell_reason") or "-",
+            "rebuy_date": (buy or {}).get("timestamp") or "",
+            "rebuy_price": _safe_int((buy or {}).get("price")),
+            "return_1d": tr.get("return_1d"),
+            "return_3d": tr.get("return_3d"),
+            "return_5d": tr.get("return_5d"),
+        })
+    if not table_rows:
+        for r in rebuy_buys:
+            tk = _norm_ticker(r.get("ticker"))
+            tr = track_by.get(tk) or {}
+            table_rows.append({
+                "ticker": tk,
+                "previous_exit": tr.get("sell_reason") or "-",
+                "rebuy_date": r.get("timestamp") or "",
+                "rebuy_price": _safe_int(r.get("price")),
+                "return_1d": tr.get("return_1d"),
+                "return_3d": tr.get("return_3d"),
+                "return_5d": tr.get("return_5d"),
+            })
+
+    normal_track = [track_by.get(_norm_ticker(r.get("ticker"))) for r in normal_buys]
+    rebuy_track = [track_by.get(_norm_ticker(r.get("ticker"))) for r in rebuy_buys]
+    normal_track = [x for x in normal_track if x]
+    rebuy_track = [x for x in rebuy_track if x]
+
+    executed = stats.get("executed") or len(rebuy_buys)
+    return {
+        "candidates": stats.get("candidates") or 0,
+        "approved": stats.get("approved") or 0,
+        "skipped_cooldown": stats.get("skipped_cooldown") or 0,
+        "skipped_recovery": stats.get("skipped_recovery") or 0,
+        "skipped_old_signal": stats.get("skipped_old_signal") or 0,
+        "skipped_emergency": stats.get("skipped_emergency") or 0,
+        "skipped_max_count": stats.get("skipped_max_count") or 0,
+        "executed": executed,
+        "skip_counts": stats.get("skip_counts") or {},
+        "rows": table_rows,
+        "normal_buy_avg_return": _avg_returns(normal_track),
+        "rebuy_avg_return": _avg_returns(rebuy_track or table_rows),
+        "normal_buy_count": len(normal_buys),
+        "rebuy_buy_count": len(rebuy_buys) or len(table_rows),
+    }
+
+
+def _render_rebuy_markdown(rebuy: Dict[str, Any]) -> List[str]:
+    lines = [
+        "",
+        "## Rebuy Performance",
+        "",
+        f"Rebuy Candidates: {rebuy.get('candidates', 0)}",
+        f"Approved: {rebuy.get('approved', 0)}",
+        f"Skipped Cooldown: {rebuy.get('skipped_cooldown', 0)}",
+        f"Skipped Recovery: {rebuy.get('skipped_recovery', 0)}",
+        f"Executed: {rebuy.get('executed', 0)}",
+        "",
+        "| Ticker | Previous Exit | Rebuy Date | Rebuy Price | 1D | 3D | 5D |",
+        "|--------|---------------|------------|------------:|---:|---:|---:|",
+    ]
+    rows = rebuy.get("rows") or []
+    if not rows:
+        lines.append("| - | - | - | - | - | - | - |")
+    else:
+        for r in rows:
+            lines.append(
+                f"| {r.get('ticker')} | {r.get('previous_exit') or '-'} | "
+                f"{str(r.get('rebuy_date') or '-')[:10]} | "
+                f"{int(r.get('rebuy_price') or 0):,} | "
+                f"{_fmt_summary_avg(r.get('return_1d'))} | "
+                f"{_fmt_summary_avg(r.get('return_3d'))} | "
+                f"{_fmt_summary_avg(r.get('return_5d'))} |"
+            )
+    n = rebuy.get("normal_buy_avg_return") or {}
+    rb = rebuy.get("rebuy_avg_return") or {}
+    lines.extend([
+        "",
+        f"NORMAL BUY 평균 수익률 (n={rebuy.get('normal_buy_count', 0)}): "
+        f"1D {_fmt_summary_avg(n.get('1d'))} / 3D {_fmt_summary_avg(n.get('3d'))} / 5D {_fmt_summary_avg(n.get('5d'))}",
+        f"REBUY 평균 수익률 (n={rebuy.get('rebuy_buy_count', 0)}): "
+        f"1D {_fmt_summary_avg(rb.get('1d'))} / 3D {_fmt_summary_avg(rb.get('3d'))} / 5D {_fmt_summary_avg(rb.get('5d'))}",
+        "",
+    ])
+    return lines
+
+
 def _enrich_candidate_tracking_returns(
     rows: List[Dict[str, Any]],
     base_date_str: str,
@@ -3197,6 +3385,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             f"{_fmt_summary_avg(cons.get('market_5d'))} | - |"
         ),
     ])
+    rebuy = report.get("rebuy_performance") or {}
+    lines.extend(_render_rebuy_markdown(rebuy))
 
     lines.extend([
         "",
@@ -3381,6 +3571,8 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         tracking_summary["tracking_status"] = "price_fetch_failed"
         tracking_summary["skip_reason"] = enrich_stats.get("skip_reason")
 
+    rebuy_performance = _build_rebuy_performance(log_text, kis_trade_rows, candidate_tracking)
+
     tracking_path = OUTPUT_DIR / f"candidate_tracking_{date_str}_{market}.json"
     tracking_doc = {
         "base_date": date_str,
@@ -3407,6 +3599,7 @@ def build_performance_review(date_str: str, market: str, *, fetch_tracking_price
         "system_performance": system_performance,
         "candidate_tracking": candidate_tracking,
         "candidate_tracking_summary": tracking_summary,
+        "rebuy_performance": rebuy_performance,
         "warnings": warnings,
         "historical_warnings": historical_warnings,
         "warnings_detail": warnings_detail,
@@ -3770,6 +3963,25 @@ def _smoke_test_accuracy_fixes() -> None:
     assert cons["reject_top5_avg_5d"] == 0.04
     assert cons["market_5d"] == 0.01
     assert cons["hold_excess_vs_market_5d"] == 0.03
+
+    rebuy_log = (
+        "[REBUY_EVALUATION] ticker=259960 eligible=false reason=cooldown\n"
+        "[REBUY_SKIP_COOLDOWN] ticker=259960 last_sell_date=20260805 elapsed_trading_days=2 required_trading_days=5\n"
+        "[REBUY_EVALUATION] ticker=005930 eligible=false reason=insufficient_recovery\n"
+        "[REBUY_SKIP_INSUFFICIENT_RECOVERY] ticker=005930 last_sell_price=70000 current_price=71000 recovery_pct=0.0143 required_pct=0.03\n"
+        "[REBUY_EVALUATION] ticker=000660 eligible=true reason=approved\n"
+        "[REBUY_APPROVED] ticker=000660 signal_date=20260812 last_sell_date=20260805 last_sell_reason=TakeProfit cooldown_days=5 recovery_pct=na rebuy_count=0\n"
+        "[REBUY_ORDER_SUBMITTED] ticker=000660 batch=NEW reason_code=REBUY_AFTER_TAKEPROFIT\n"
+    )
+    rp = _build_rebuy_performance(rebuy_log, [], [])
+    assert rp["candidates"] == 3, rp
+    assert rp["approved"] == 1, rp
+    assert rp["skipped_cooldown"] == 1, rp
+    assert rp["skipped_recovery"] == 1, rp
+    assert rp["executed"] == 1, rp
+    md_rebuy = "\n".join(_render_rebuy_markdown(rp))
+    assert "## Rebuy Performance" in md_rebuy
+    assert "Skipped Cooldown: 1" in md_rebuy
 
     print("smoke_test_accuracy_fixes: OK")
 

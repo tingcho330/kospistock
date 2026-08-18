@@ -33,6 +33,7 @@ from utils import (
     in_time_windows,
     get_account_snapshot_cached,
     is_market_open_day,
+    is_krx_trading_day,
 )
 
 # 디스코드 노티파이어
@@ -48,6 +49,13 @@ from risk_manager import RiskManager, SellRules
 
 # 설정
 from settings import settings
+
+from weekly_signal import (
+    complete_weekly_execution,
+    get_weekly_trader_params,
+    is_weekly_signal_expired,
+    pending_weekly_execution,
+)
 
 # ───────────────── 로깅 초기화 ─────────────────
 print("=== integrated_manager.py 모듈 로드됨 ===")
@@ -1032,16 +1040,17 @@ def run_script(
     stage: Optional[str] = None,
     date_str: Optional[str] = None,
     market: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
 ) -> Tuple[bool, bool, float]:
     """주어진 파이썬 스크립트를 실행 (자동 복구 포함)"""
     stage_name = stage or _script_stage(script_name) or "unknown"
     timeout_sec = get_stage_timeout(stage_name) if stage_name in DEFAULT_STAGE_TIMEOUT_SEC else SCRIPT_TIMEOUT_SEC
 
-    args = []
-    if script_name == "screener.py":
-        args = ["--market", MARKET]
-    elif script_name == "gpt_analyzer.py":
-        args = ["--market", MARKET, "--slots", SLOTS]
+    args = list(extra_args or [])
+    if script_name == "screener.py" and "--market" not in args:
+        args = ["--market", MARKET] + args
+    elif script_name == "gpt_analyzer.py" and "--market" not in args:
+        args = ["--market", MARKET, "--slots", SLOTS] + args
 
     command = ["python", f"/app/src/{script_name}"] + args
     cmd_str = " ".join(command)
@@ -1074,6 +1083,23 @@ def run_script(
         stdout_tail = _tail(result.stdout, 12)
         logger.info(f"[{run_id}] ✅ STEP OK: {script_name} | {dur:.1f}s")
         logger.debug(f"[{run_id}] --- {script_name} tail ---\n{stdout_tail}")
+        if script_name == "trader.py":
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            for line in combined.splitlines():
+                if any(
+                    tag in line
+                    for tag in (
+                        "[TRADER_TRADING_DAY_CHECK]",
+                        "[TRADER_NON_TRADING_DAY]",
+                        "[WEEKLY_SIGNAL_DEFERRED]",
+                        "[DEFERRED_WEEKLY_TRADER_RESUME]",
+                        "[DEFERRED_BUY_REVALIDATE]",
+                        "[DEFERRED_BUY_SKIP_GAP_UP]",
+                        "[WEEKLY_SIGNAL_EXPIRED]",
+                        "[WEEKLY_SIGNAL_EXECUTED]",
+                    )
+                ):
+                    logger.info(line)
 
         if dur > SLOW_STEP_SEC:
             warned = True
@@ -1290,15 +1316,28 @@ def run_monthly_maintenance_if_due():
 def run_trading_pipeline():
     """전체 파이프라인 실행 (상태 관리 및 의존성 기반 재시작 포함)"""
     try:
-        if not is_market_open_day():
+        now = datetime.now(KST)
+        if now.weekday() >= 5:
             msg = "오늘은 휴장일이므로 자동매매 파이프라인을 실행하지 않습니다."
             logger.info(msg)
             _notify(msg=f"ℹ️ {msg}", key="holiday", cooldown_sec=600)
             return
 
-        if not _should_run_trading_pipeline_today():
-            msg = "주간 리밸런싱 모드: 오늘은 매매 파이프라인 실행일이 아닙니다."
+        weekly_mode = _is_weekly_rebalance_mode()
+        krx_open = is_krx_trading_day()
+        if weekly_mode:
+            if not _should_run_trading_pipeline_today():
+                msg = "주간 리밸런싱 모드: 오늘은 매매 파이프라인 실행일이 아닙니다."
+                logger.info(msg)
+                return
+            if not krx_open:
+                logger.info(
+                    "주간 리밸런싱일이지만 휴장 → GPT 생성 후 trader는 다음 거래일로 이월합니다."
+                )
+        elif not krx_open:
+            msg = "오늘은 휴장일이므로 자동매매 파이프라인을 실행하지 않습니다."
             logger.info(msg)
+            _notify(msg=f"ℹ️ {msg}", key="holiday", cooldown_sec=600)
             return
 
         run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
@@ -1427,6 +1466,71 @@ def run_trading_pipeline():
 
     except Exception as e:
         logger.error(f"파이프라인 실행 중 오류: {e}")
+
+def run_deferred_weekly_trader_if_needed():
+    """휴장으로 이월된 주간 trader를 다음 거래일에 1회 재개."""
+    try:
+        if not _is_weekly_rebalance_mode():
+            return
+        if _should_run_trading_pipeline_today():
+            return
+        if datetime.now(KST).weekday() >= 5:
+            return
+        if not is_krx_trading_day():
+            logger.info(
+                "[TRADER_NON_TRADING_DAY] date=%s action=defer next_trading_day=true",
+                datetime.now(KST).strftime("%Y%m%d"),
+            )
+            return
+
+        pending = pending_weekly_execution()
+        if not pending:
+            return
+
+        exec_date = datetime.now(KST).strftime("%Y%m%d")
+        signal_date = str(pending.get("signal_date") or "")
+        max_td = int(get_weekly_trader_params().get("weekly_signal_max_trading_days", 2))
+        if signal_date and is_weekly_signal_expired(signal_date, exec_date, max_td):
+            logger.info(
+                "[WEEKLY_SIGNAL_EXPIRED] signal_date=%s execution_date=%s",
+                signal_date,
+                exec_date,
+            )
+            complete_weekly_execution(status="expired", execution_date=exec_date)
+            return
+
+        gpt_file = str(pending.get("gpt_file") or "")
+        logger.info(
+            "[DEFERRED_WEEKLY_TRADER_RESUME] signal_date=%s execution_date=%s",
+            signal_date,
+            exec_date,
+        )
+        run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
+        os.environ["RUN_ID"] = run_id
+        os.environ["RUN_STARTED_AT"] = str(time.time())
+        os.environ["WEEKLY_TRADER_DEFERRED_RESUME"] = "1"
+        extra = ["--deferred-weekly"]
+        if gpt_file:
+            extra.extend(["--gpt-file", gpt_file])
+            os.environ["WEEKLY_TRADER_GPT_FILE"] = gpt_file
+        ok, _, dur = run_script("trader.py", run_id, stage="trader", extra_args=extra)
+        logger.info(
+            "[DEFERRED_WEEKLY_TRADER_RESUME] done ok=%s elapsed_sec=%.1f signal_date=%s",
+            str(ok).lower(),
+            dur,
+            signal_date,
+        )
+        if not ok:
+            _notify(
+                f"⚠️ 이월 주간 trader 재개 실패 (signal_date={signal_date})",
+                key="deferred_weekly_trader_fail",
+                cooldown_sec=300,
+            )
+    except Exception as e:
+        logger.error("이월 주간 trader 재개 중 오류: %s", e, exc_info=True)
+    finally:
+        os.environ.pop("WEEKLY_TRADER_DEFERRED_RESUME", None)
+        os.environ.pop("WEEKLY_TRADER_GPT_FILE", None)
 
 # ───────────────── 스케줄 설정 ─────────────────
 # 스케줄 시간 설정 (config.json에서 오버라이드 가능)
@@ -1558,14 +1662,22 @@ def register_jobs():
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["daily_summary"]).do(send_daily_trading_summary)
 
     # 주간 리밸런싱 모드: 금요 스크리너(당일 수급) + 리밸런싱 요일 파이프라인
+    # + 휴장 이월 시 다음 평일에 trader 1회 재개
     if weekly_mode:
         schedule.every().friday.at(SCHEDULE_TIMES["screener_friday"]).do(run_screener_job)
         if rebalance_day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
             getattr(schedule.every(), rebalance_day).at(SCHEDULE_TIMES["weekly_rebalance"]).do(run_trading_pipeline)
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+            if day == rebalance_day:
+                continue
+            getattr(schedule.every(), day).at(SCHEDULE_TIMES["weekly_rebalance"]).do(
+                run_deferred_weekly_trader_if_needed
+            )
         logger.info(
-            "[SCHEDULE] 주간 리밸런싱: 금 %s 스크리너, %s %s 파이프라인",
+            "[SCHEDULE] 주간 리밸런싱: 금 %s 스크리너, %s %s 파이프라인, 이외 평일 %s deferred trader",
             SCHEDULE_TIMES["screener_friday"],
             rebalance_day,
+            SCHEDULE_TIMES["weekly_rebalance"],
             SCHEDULE_TIMES["weekly_rebalance"],
         )
 

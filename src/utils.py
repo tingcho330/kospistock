@@ -6,7 +6,7 @@ import logging
 import math
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Union
-from datetime import datetime, time as dt_time, date  # ← datetime.time 별칭
+from datetime import datetime, time as dt_time, date, timedelta  # ← datetime.time 별칭
 from zoneinfo import ZoneInfo
 import threading
 import re
@@ -30,6 +30,9 @@ __all__ = [
     "is_newly_listed",
     "in_time_windows",
     "is_market_open_day",
+    "is_krx_trading_day",
+    "next_krx_trading_day",
+    "count_krx_trading_days_between",
     "find_latest_file",
     "cache_save",
     "cache_load",
@@ -272,12 +275,163 @@ def in_time_windows(
     return False
 
 # ────────────────────────────────
-# 장 개장일 체크 (간단: 주말 제외)
+# 한국 거래소(KRX) 개장일 체크
+# 주말 + 법정공휴일(대체공휴일 포함)
 # ────────────────────────────────
+# 설날/추석 당일(음력 1/1, 8/15). 전날·다음날은 코드에서 붙인다.
+_KR_LUNAR_CORE = {
+    2024: {"seollal": date(2024, 2, 10), "buddha": date(2024, 5, 15), "chuseok": date(2024, 9, 17)},
+    2025: {"seollal": date(2025, 1, 29), "buddha": date(2025, 5, 5), "chuseok": date(2025, 10, 6)},
+    2026: {"seollal": date(2026, 2, 17), "buddha": date(2026, 5, 24), "chuseok": date(2026, 9, 25)},
+    2027: {"seollal": date(2027, 2, 6), "buddha": date(2027, 5, 13), "chuseok": date(2027, 9, 15)},
+    2028: {"seollal": date(2028, 1, 26), "buddha": date(2028, 5, 2), "chuseok": date(2028, 10, 3)},
+    2029: {"seollal": date(2029, 2, 13), "buddha": date(2029, 5, 20), "chuseok": date(2029, 9, 22)},
+    2030: {"seollal": date(2030, 2, 3), "buddha": date(2030, 5, 9), "chuseok": date(2030, 9, 12)},
+    2031: {"seollal": date(2031, 1, 23), "buddha": date(2031, 5, 28), "chuseok": date(2031, 9, 21)},
+    2032: {"seollal": date(2032, 2, 11), "buddha": date(2032, 5, 16), "chuseok": date(2032, 9, 8)},
+}
+
+# 선거일 등 임시공휴일
+_KR_EXTRA_HOLIDAYS = {
+    date(2024, 4, 10): "제22대 국회의원선거",
+    date(2025, 6, 3): "제21대 대통령선거",
+    date(2026, 6, 3): "제9회 전국동시지방선거",
+}
+
+_KR_SUBSTITUTE_ELIGIBLE_PREFIXES = (
+    "삼일절",
+    "어린이날",
+    "부처님오신날",
+    "광복절",
+    "개천절",
+    "한글날",
+    "성탄절",
+    "설날",
+    "추석",
+)
+
+_KR_HOLIDAY_CACHE: Dict[int, Dict[date, str]] = {}
+
+
+def _kr_holiday_eligible_for_substitute(name: str) -> bool:
+    return any(name.startswith(p) for p in _KR_SUBSTITUTE_ELIGIBLE_PREFIXES)
+
+
+def _kr_holidays_for_year(year: int) -> Dict[date, str]:
+    cached = _KR_HOLIDAY_CACHE.get(year)
+    if cached is not None:
+        return cached
+
+    names: Dict[date, List[str]] = {}
+
+    def _add(d: date, name: str) -> None:
+        names.setdefault(d, [])
+        if name not in names[d]:
+            names[d].append(name)
+
+    _add(date(year, 1, 1), "신정")
+    _add(date(year, 3, 1), "삼일절")
+    _add(date(year, 5, 5), "어린이날")
+    _add(date(year, 6, 6), "현충일")
+    _add(date(year, 8, 15), "광복절")
+    _add(date(year, 10, 3), "개천절")
+    _add(date(year, 10, 9), "한글날")
+    _add(date(year, 12, 25), "성탄절")
+
+    lunar = _KR_LUNAR_CORE.get(year)
+    if lunar:
+        seollal = lunar["seollal"]
+        _add(seollal - timedelta(days=1), "설날 전날")
+        _add(seollal, "설날")
+        _add(seollal + timedelta(days=1), "설날 다음날")
+        _add(lunar["buddha"], "부처님오신날")
+        chuseok = lunar["chuseok"]
+        _add(chuseok - timedelta(days=1), "추석 전날")
+        _add(chuseok, "추석")
+        _add(chuseok + timedelta(days=1), "추석 다음날")
+
+    for extra_dt, extra_name in _KR_EXTRA_HOLIDAYS.items():
+        if extra_dt.year == year:
+            _add(extra_dt, extra_name)
+
+    # 대체공휴일은 로컬 기본 달력으로 먼저 계산한다.
+    # holidays 패키지를 먼저 합치면 대체일이 occupied가 되어 다음 평일로 밀릴 수 있다.
+    occupied = set(names.keys())
+    extras: Dict[date, str] = {}
+    pending: List[Tuple[date, str]] = []
+    for d, nm_list in names.items():
+        if not any(_kr_holiday_eligible_for_substitute(n) for n in nm_list):
+            continue
+        if d.weekday() >= 5 or len(nm_list) > 1:
+            pending.append((d, nm_list[0]))
+    for src_day, primary in pending:
+        n = src_day + timedelta(days=1)
+        for _ in range(10):
+            if n.weekday() < 5 and n not in occupied and n not in extras:
+                extras[n] = f"{primary} 대체공휴일"
+                occupied.add(n)
+                break
+            n += timedelta(days=1)
+
+    out: Dict[date, str] = {d: nm_list[0] for d, nm_list in names.items()}
+    out.update(extras)
+    try:
+        import holidays as _holidays  # optional; docker image has it
+        kr_pkg = _holidays.country_holidays("KR", years=year)
+        for dt, pkg_name in kr_pkg.items():
+            if dt.year == year:
+                out.setdefault(dt, str(pkg_name))
+    except Exception:
+        pass
+    _KR_HOLIDAY_CACHE[year] = out
+    return out
+
+
+def is_krx_trading_day(d: Optional[date] = None) -> bool:
+    """KRX 정규장 거래일 여부 (주말·법정공휴일·대체공휴일 제외)."""
+    if d is None:
+        d = datetime.now(KST).date()
+    if isinstance(d, datetime):
+        d = d.date()
+    if d.weekday() >= 5:
+        return False
+    return d not in _kr_holidays_for_year(d.year)
+
+
+def next_krx_trading_day(d: Optional[date] = None) -> date:
+    """주어진 날짜 다음 KRX 거래일."""
+    if d is None:
+        d = datetime.now(KST).date()
+    if isinstance(d, datetime):
+        d = d.date()
+    cur = d + timedelta(days=1)
+    for _ in range(30):
+        if is_krx_trading_day(cur):
+            return cur
+        cur += timedelta(days=1)
+    return cur
+
+
+def count_krx_trading_days_between(start: date, end: date) -> int:
+    """(start, end] 구간의 KRX 거래일 수. start==end 이면 0."""
+    if isinstance(start, datetime):
+        start = start.date()
+    if isinstance(end, datetime):
+        end = end.date()
+    if end <= start:
+        return 0
+    n = 0
+    cur = start + timedelta(days=1)
+    while cur <= end:
+        if is_krx_trading_day(cur):
+            n += 1
+        cur += timedelta(days=1)
+    return n
+
+
 def is_market_open_day(date: Optional[date] = None) -> bool:
-    if date is None:
-        date = datetime.now(KST).date()
-    return date.weekday() < 5
+    """거래일 여부. 주말 및 한국 공휴일(대체공휴일 포함)은 False."""
+    return is_krx_trading_day(date)
 
 # ────────────────────────────────
 # 내부: 파일명에서 날짜/시장/런ID 추출
